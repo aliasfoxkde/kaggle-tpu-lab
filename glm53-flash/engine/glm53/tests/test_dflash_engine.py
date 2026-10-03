@@ -1,0 +1,136 @@
+"""DFlash 2 in the engine (ResidentLayerEngine, tiny model, 8 CPU devices, interpret-mode Pallas, a random tiny
+drafter whose target layers sit in the middle and at the end of the 3-layer decode groups): the features the verify
+captures equal the prefill path's; greedy DFlash decoding reproduces plain greedy decoding token for token (random
+drafts: the rollback path; oracle drafts with errors: partial acceptance, several features per ring write; blocks
+of 8 and 4; the acceptance on the chips, the next draft queued before the host reads the tokens); the ring after
+those steps equals the ring a fresh prefill of the same committed tokens builds; the ring survives a compact snapshot
+round trip."""
+import numpy as np
+import pytest
+
+jax = pytest.importorskip("jax")
+import jax.numpy as jnp  # noqa: E402
+
+from glm53 import dflash as D  # noqa: E402
+from glm53.tests.test_spec_decode import build, greedy  # noqa: E402
+
+jax.config.update("jax_default_matmul_precision", "highest")
+
+
+def random_drafter(rng, hidden, vocab, layers=(1, 2, 4)):
+    cfg = D.DCfg(hidden=hidden, heads=16, kv_heads=8, hd=16, inter=256, n_layers=2, eps=1e-5, theta=10000.0, window=16,
+                 block=8, mask_id=vocab - 1, target_layers=layers, vocab=vocab, sel_rank=8, sel_topk=4, conv_k=2,
+                 conv_group=16)
+
+    def lin(i, o):
+        return (rng.standard_normal((i, o)) / i ** 0.5).astype(np.float32)
+
+    def norm(n):
+        return (1 + 0.1 * rng.standard_normal(n)).astype(np.float32)
+
+    def conv():
+        return {"base": (0.5 * rng.standard_normal((2, 2, hidden))).astype(np.float32),
+                "proj": lin(hidden, 4 * hidden // cfg.conv_group)}
+    qd, kvd = cfg.heads * cfg.hd, cfg.kv_heads * cfg.hd
+    layer = lambda: {"ln1": norm(hidden), "ln2": norm(hidden), "q": lin(hidden, qd), "k": lin(hidden, kvd),  # noqa: E731
+                     "v": lin(hidden, kvd), "o": lin(qd, hidden), "q_norm": norm(cfg.hd), "k_norm": norm(cfg.hd),
+                     "gate": lin(hidden, cfg.inter), "up": lin(hidden, cfg.inter), "down": lin(cfg.inter, hidden),
+                     "conv_a": conv(), "conv_m": conv()}
+    params = {"fc": lin(len(layers) * hidden, hidden), "hidden_norm": norm(hidden), "norm": norm(hidden),
+              "layers": [layer() for _ in range(cfg.n_layers)],
+              "sel": {"pred": (0.5 * rng.standard_normal((vocab, 8))).astype(np.float32),
+                      "succ": (0.5 * rng.standard_normal((vocab, 8))).astype(np.float32), "h": lin(hidden, 8)}}
+    return cfg, params
+
+
+@pytest.fixture(scope="module")
+def setup():
+    eng, cfg, rng = build(False, mtp=False)
+    dcfg, dp = random_drafter(rng, cfg.hidden_size, cfg.vocab_size)
+    eng.set_dflash(dp, dcfg)
+    ids = rng.integers(0, cfg.vocab_size - 1, size=(1, 45))
+    return eng, cfg, ids, greedy(eng, ids, 14)
+
+
+def run(eng, ids, n, T=None, oracle=None):
+    logits, caches, pos = eng.prefill(ids)
+    out = [int(jnp.argmax(logits[0]))]
+    st = eng.dflash_start(np.array([out[0]]), caches, pos, T=T)
+    accepted, T = 0, st["T"]
+    while len(out) < n:
+        ov = None if oracle is None else (list(oracle[len(out):len(out) + T - 1]) + [0] * T)[:T - 1]
+        emitted, st = eng.dflash_step(st, draft_override=ov)
+        accepted += len(emitted) - 1
+        out.extend(emitted)
+    return out, accepted, st
+
+
+def test_capture_matches_prefill_path(setup):
+    """Layers 1 and 4 are in the middle of the decode groups [0,1,2], [3,4,5] (the program returns their stream mean),
+    layer 2 ends one (the mean of the group's output); prefill runs one layer per program."""
+    eng, cfg, ids, _ = setup
+    n = eng.cfg.n_layers
+    _, caches, pos = eng.prefill(ids[:, :40])
+    ver = eng._run_verify(jnp.asarray(ids[:, 40:45]), eng.copy_caches(caches[:n]), 40, capture=True)[5]
+    padded = np.zeros((1, 32), np.int32)
+    padded[:, :5] = ids[:, 40:45]
+    pre = eng._run(padded, eng.copy_caches(caches[:n]), 40, False, length=5, want_logits=False, capture=True)[2]
+    assert len(ver) == len(pre) == 3
+    for a, b in zip(ver, pre):                     # the verify's features are padded to the drafter's block (8)
+        a, b = np.asarray(a), np.asarray(b)[:, :5]
+        assert a.shape[1] == eng.dflash.cfg.block and not a[:, 5:].any()
+        np.testing.assert_allclose(a[:, :5], b, rtol=1e-4, atol=1e-4 * np.abs(b).max())
+    assert not np.allclose(np.asarray(ver[0]), np.asarray(ver[1]), rtol=0.1)
+
+
+def test_dflash_matches_greedy(setup):
+    eng, cfg, ids, ref = setup
+    for T in (8, 4):
+        out, acc, _ = run(eng, ids, 14, T)                                         # random drafts: rollbacks
+        assert out[:14] == ref, (T, out, ref)
+        oracle = [t if i % 5 != 3 else (t + 1) % (cfg.vocab_size - 1) for i, t in enumerate(ref)]
+        out, acc, st = run(eng, ids, 14, T, oracle=oracle)                          # partial acceptance
+        assert out[:14] == ref and acc > 0, (T, out, ref, acc)
+    # after a step the ring holds every committed position (the queued draft wrote the accepted ones) = the ring a
+    # fresh prefill of the committed tokens builds; the device position = the host's
+    n = eng.cfg.n_layers
+    p = st["pos_h"]
+    assert int(np.asarray(st["pos"])) == p
+    toks = np.concatenate([ids[0], np.asarray(out[:p - ids.shape[1]])])[None]
+    _, fresh, _ = eng.prefill(toks)
+    np.testing.assert_array_equal(np.asarray(st["caches"][n]["p"]), np.asarray(fresh[n]["p"]))
+    for k in ("k", "v"):
+        a, b = np.asarray(st["caches"][n][k]), np.asarray(fresh[n][k])
+        np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-4 * np.abs(b).max())
+
+
+def test_ring_survives_snapshot(setup):
+    eng, cfg, ids, _ = setup
+    logits, caches, pos = eng.prefill(ids[:, :40])
+    snap = eng.snapshot_to_host(eng.snapshot_prefix(caches, pos, rows_bucket=16))
+    restored = eng.restore_prefix(eng.snapshot_from_host(snap))
+    l1, c1, p1 = eng.prefill(ids[:, 40:], caches, pos)
+    l2, c2, p2 = eng.prefill(ids[:, 40:], restored, pos)
+    e1, s1 = eng.dflash_step(eng.dflash_start(np.array([int(jnp.argmax(l1[0]))]), c1, p1))
+    e2, s2 = eng.dflash_step(eng.dflash_start(np.array([int(jnp.argmax(l2[0]))]), c2, p2))
+    assert e1 == e2
+    n = eng.cfg.n_layers
+    np.testing.assert_allclose(np.asarray(s1["caches"][n]["k"]), np.asarray(s2["caches"][n]["k"]), rtol=1e-5, atol=1e-6)
+
+
+def test_stop_token_ends_the_run(setup):
+    """A drafted stop token ends the accepted run on the chips and is emitted unfed: with oracle drafts the output
+    stops exactly at greedy's first stop token, and the position counts only the tokens before it as fed."""
+    eng, cfg, ids, ref = setup
+    stop = ref[6]
+    first = ref.index(stop)
+    logits, caches, pos = eng.prefill(ids)
+    out = [int(jnp.argmax(logits[0]))]
+    st = eng.dflash_start(np.array([out[0]]), caches, pos)
+    while stop not in out:
+        T = st["T"]
+        emitted, st = eng.dflash_step(st, stop_ids=(stop,),
+                                      draft_override=(list(ref[len(out):len(out) + T - 1]) + [0] * T)[:T - 1])
+        out.extend(emitted)
+    assert out == ref[:first + 1], (out, ref)
+    assert st["pos_h"] == ids.shape[1] + first and int(np.asarray(st["pos"])) == st["pos_h"]

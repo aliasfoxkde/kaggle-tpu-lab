@@ -26,6 +26,12 @@ def weight_map(model_dir: str) -> dict[str, str]:
         if os.path.exists(p):
             with open(p) as f:
                 return json.load(f)["weight_map"]
+    for d in model_dir.split(":"):                    # a single-file model (e.g. the DFlash drafter): no index
+        p = os.path.join(d, "model.safetensors")
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                hdr = json.loads(f.read(int.from_bytes(f.read(8), "little")))
+            return {k: "model.safetensors" for k in hdr if k != "__metadata__"}
     raise FileNotFoundError("model.safetensors.index.json not found in " + model_dir)
 
 

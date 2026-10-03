@@ -41,7 +41,7 @@ def kq_tables(rng, E, D, mi):
     return out, {"gate_q": "Q2_K", "up_q": "Q2_K", "down_q": "Q3_K"}
 
 
-def build(seq_shard):
+def build(seq_shard, mtp=True):
     torch.manual_seed(0)
     cfg = tiny_config(index_topk=16)
     cfg.hidden_size = 256; cfg.moe_intermediate_size = 2048; cfg.intermediate_size = 256
@@ -67,6 +67,8 @@ def build(seq_shard):
             packed_params["layers"].append(L)
     fetch = ResidentFetch(qtypes, D, mi // N_DEV, out_dtype=jnp.float32, gather_max_rows=64, chunk=4, interpret=True, tm=8)
     eng = ResidentLayerEngine(jcfg, packed_params, fetch, max_len=128, layers_per_program=3, prefill_piece=32, seq_shard=seq_shard)
+    if not mtp:
+        return eng, cfg, rng
     # the MTP layer: the attention of an MLA+indexer layer, a router, random K-quant experts, random projections
     mla = [i for i in range(jcfg.n_layers) if jcfg.layer_types[i] != "linear_attention" and jcfg.mlp_types[i] == "sparse"][0]
     src = params["layers"][mla]

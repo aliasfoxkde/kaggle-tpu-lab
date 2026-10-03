@@ -62,6 +62,14 @@ DEFAULTS = {
     "keepalive_min": 480,            # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
     "api_key": "",                   # generated if empty
     "ntfy_topic": "",                # optional: publish progress to ntfy.sh/<topic> (launch.py watches it)
+    "dflash": "",                    # DFlash 2 speculative decoding for a stream running alone: the drafter's directory or
+                                     # dataset (config.json + model.safetensors of incoai/GLM-5.3-Flash-DFlash2: CC BY-NC-ND
+                                     # 4.0, research only -> attach it yourself); "" = off
+    "dflash_int8": True,             # the drafter's big matrices as int8 (159 instead of 295 MB per chip, same acceptance)
+    "dflash_cost": {"4": 21.2},      # ms per DFlash step by block size (v6e-8, 2026-10-03) = the block sizes compiled:
+                                     # {"4": 21.2, "8": 27.3} also drafts 8 (math-like text x1.97 instead of x1.64) but its
+                                     # programs cost ~0.23 GB/chip = one of the two 262k streams DFlash leaves
+    "dflash_prior": {"4": 2.8, "8": 3.3},    # tokens per step a new stream assumes until it has measured its own
     "served_model_name": "glm-5.3-flash",
     "tunnel": True,                  # False: no cloudflared (local testing)
     "skip_runtime": False,           # True: no pip installs (local testing)
@@ -332,10 +340,25 @@ if CFG["dump_base"] and not BASE_DIR and "hf_dir" in globals():
     log(f"   base store dumped in {time.time() - t:.0f}s (this run's output can become the serve dataset)")
 del _vp
 
+# ----------------------------------------------------------------------------- 3b. DFlash 2 drafter (optional)
+_d = CFG["dflash"]
+DFLASH_DIR = (_d if os.path.isdir(_d) else (mounts_of([_d]) or [None])[0]) if _d else None
+if _d and not DFLASH_DIR:
+    log(f"   DFlash: {_d} not found -> plain decoding")
+if DFLASH_DIR and getattr(eng, "dflash", None) is None:
+    from glm53 import dflash as DF
+    t = time.time()
+    _dcfg, _dp = DF.load_params(DFLASH_DIR, jnp.bfloat16)
+    eng.set_dflash(_dp, _dcfg, int8=CFG["dflash_int8"])
+    del _dp
+    log(f"   DFlash 2 drafter ({_dcfg.n_layers} layers, block {_dcfg.block}) from {DFLASH_DIR}: "
+        f"{eng.dflash.nbytes_per_chip() / 1e6:.0f} MB per chip in {time.time() - t:.0f}s; HBM chip0 {hbm()[0]:.2f} GB")
+DFLASH_COST = {int(k): float(v) for k, v in CFG["dflash_cost"].items()}
+
 # ----------------------------------------------------------------------------- 4. the server
 from glm53.resident import ResidentLayerEngine as _RLE   # noqa: E402
 from glm53.engine import DeviceSampler                    # noqa: E402
-from glm53.scheduler import Request, Scheduler, SnapStore # noqa: E402
+from glm53.scheduler import DFlashPolicy, Request, Scheduler, SnapStore   # noqa: E402
 from glm53 import vision as VIS                           # noqa: E402
 
 API_KEY = CFG["api_key"]
@@ -509,7 +532,10 @@ for k in _drop:
 SNAPS = SnapStore(eng, int(SNAP_HOST_GB * 1e9), SNAP_ROWS, match_len=_match_len, log=log, state=STATE)
 SCHED = Scheduler(eng, STOP_IDS, MAX_STREAMS, MAX_SETS, feed=sched_feed, match_len=_match_len, system_end=system_end,
                   first_sample=lambda z, t, p: sample(z, t, p, RNG), snaps=SNAPS, log=log, state=STATE,
-                  base_min=BASE_MIN, snap_min=SNAP_MIN, piece=SCHED_PIECE, min_free_gb=MIN_FREE_GB, max_wait_s=MAX_WAIT_S)
+                  base_min=BASE_MIN, snap_min=SNAP_MIN, piece=SCHED_PIECE, min_free_gb=MIN_FREE_GB, max_wait_s=MAX_WAIT_S,
+                  spec=DFlashPolicy(DFLASH_COST, {int(k): float(v) for k, v in CFG["dflash_prior"].items()
+                                                  if int(k) in DFLASH_COST})
+                  if getattr(eng, "dflash", None) is not None else None)
 
 
 class QueueFull(Exception):
@@ -1131,6 +1157,16 @@ for B in range(1, MAX_STREAMS + 1):
     jax.block_until_ready(_ids); del _sets, _lg, _ids, _pos
     log(f"   batched decode B={B}: {time.time() - t:.0f}s")
     publish("compiling", what=f"decode B={B}", secs=int(time.time() - t))
+if getattr(eng, "dflash", None) is not None:          # draft (every block-size pair), verify + capture, head, rollback
+    for T0 in sorted(DFLASH_COST):
+        t = time.time()
+        _lg, _cc, _p = eng.prefill(ids)
+        _st = eng.dflash_start(np.array([0]), _cc, _p, T=T0)
+        for _nt in sorted(DFLASH_COST):
+            _e, _st = eng.dflash_step(_st, DeviceSampler(1.0, 0.95, seed=0), tuple(sorted(STOP_IDS)), next_T=_nt)
+        del _lg, _cc, _st
+        log(f"   DFlash block {T0}: {time.time() - t:.0f}s")
+        publish("compiling", what=f"dflash T={T0}", secs=int(time.time() - t))
 n_shard = max(eng.lcfg.seq_shard, 1)
 for n_tok in range(SNAP_ROWS * n_shard, SNAP_WARM + 1, SNAP_ROWS * n_shard):
     cc = eng.alloc_caches(1)

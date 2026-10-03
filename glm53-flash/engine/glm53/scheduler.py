@@ -6,6 +6,12 @@ One engine thread (`Scheduler.run`) owns every JAX call. Client threads `submit`
 streams' + finished contexts kept LIVE for the next turn (LRU), at most `max_sets` in total; beyond that, finished
 contexts are parked in host memory (`SnapStore`) and resumed when a later prompt extends them. Between steps only the
 sampled ids cross to the host: token ids, positions and the sampler state stay on the device.
+
+DFlash 2 (`spec`, with a drafter installed on the engine: `ResidentLayerEngine.set_dflash`): a stream that runs ALONE
+decodes speculatively (`dflash_start` / `dflash_step`: a block of T-1 drafts verified per step); as soon as a second
+stream is active, every stream is decoded in the batched plain steps again (its DFlash state hands its caches back).
+The block size is picked per stream and step from an EMA of the tokens per step (`DFlashPolicy`). Positions decoded in
+batched steps leave stale slots in that stream's drafter ring (lower acceptance for a while, never a wrong token).
 """
 import collections
 import threading
@@ -68,6 +74,9 @@ class _Stream:
         self.max_new = req.max_new
         self.open = req.budget is not None               # the budgeted block (thinking) is still open
         self.force = []                                  # tokens to feed instead of the sampled ones (budget reached)
+        self.spec = None                                 # DFlash state (engine.dflash_start) while decoding alone
+        self.sampler = None                              # its own device sampler in DFlash mode
+        self.tau = None                                  # DFlashPolicy's per-stream EMAs
 
 
 class SnapStore:
@@ -147,15 +156,47 @@ def _argmax_first(logits_row, temperature, top_p):
     return int(np.argmax(logits_row))
 
 
+class DFlashPolicy:
+    """Block size per DFlash step: `cost` = {T: ms per step} (measured, e.g. v6e 2026-10-03: {4: 21.2, 8: 27.3});
+    the stream's EMA of tokens per step for each T picks the T with the least ms per token. A step of T also tells
+    what a smaller T' would have accepted (min(tokens, T')), and a run cut before T what a larger one would have
+    (the same tokens); only a fully accepted block leaves the larger T unknown — a T without news for `probe` steps
+    is tried once. `prior` = the EMAs' start values."""
+
+    def __init__(self, cost, prior=None, alpha=0.15, probe=32):
+        self.cost = {int(t): float(c) for t, c in cost.items()}
+        self.prior = prior or {t: 1.0 + 0.5 * (t - 1) ** 0.5 for t in self.cost}
+        self.alpha, self.probe = alpha, probe
+
+    def start(self, s):
+        s.tau = {"ema": dict(self.prior), "last": {t: 0 for t in self.cost}, "n": 0}
+
+    def pick(self, s):
+        st = s.tau
+        for t, last in st["last"].items():
+            if st["n"] - last >= self.probe:
+                return t
+        return min(self.cost, key=lambda t: self.cost[t] / st["ema"][t])
+
+    def update(self, s, T, n_tokens):
+        st = s.tau
+        st["n"] += 1
+        for t in self.cost:
+            if t <= T or n_tokens < T:                 # a run cut before T ends there for any larger block too
+                st["ema"][t] += self.alpha * (min(n_tokens, t) - st["ema"][t])
+                st["last"][t] = st["n"]
+
+
 class Scheduler:
     """See the module docstring. `feed(req, a, b) -> (ids [n] int32, embeds or None)` renders req.prompt[a:b] for
     the engine (the server attaches its image data to the request); `match_len(live_ids, pos, prompt, quiet=False) -> (k, fed)`; `system_end(prompt)` = length of
     the system section worth pinning (0 = none); `first_sample(logits_row, temperature, top_p) -> int` samples the
-    first token of a request on the host (the rest come from the device sampler)."""
+    first token of a request on the host (the rest come from the device sampler); `spec` = a `DFlashPolicy` to
+    decode a stream that runs alone with the engine's DFlash drafter (None = never)."""
 
     def __init__(self, eng, stop_ids, max_streams=4, max_sets=None, feed=None, match_len=match_prefix,
                  system_end=None, first_sample=_argmax_first, snaps=None, log=print, state=None,
-                 base_min=512, snap_min=256, piece=None, seed=None, min_free_gb=0.65, max_wait_s=90.0):
+                 base_min=512, snap_min=256, piece=None, seed=None, min_free_gb=0.65, max_wait_s=90.0, spec=None):
         self.eng, self.stop_ids = eng, set(int(t) for t in stop_ids)
         self.max_streams = max(1, int(max_streams))
         self.max_sets = max(self.max_streams, int(max_sets if max_sets is not None else max_streams + 1))
@@ -182,6 +223,8 @@ class Scheduler:
         self._t_step = None
         self.thread = None
         self.steps = 0
+        self.spec = spec if spec is not None and getattr(eng, "dflash", None) is not None else None
+        self.seed = seed
 
     # ---- client side
     def submit(self, req: Request):
@@ -207,6 +250,7 @@ class Scheduler:
         for ctx in self.live.values():
             self._free_set(ctx["caches"])
         for s in self.active:
+            self._spec_end(s)
             self._free_set(s.caches)
         self.live.clear(); self.active.clear(); self._toks = self._pos = None
 
@@ -411,6 +455,7 @@ class Scheduler:
         """The stream's context becomes a live (on-chip) context: ids = everything the engine has seen (the last
         emitted token is never fed), logits = the prediction after them."""
         req = s.req
+        self._spec_end(s)
         if s in self.active:
             self.active.remove(s); self._members = None
         if not keep:
@@ -437,6 +482,10 @@ class Scheduler:
         act = list(self.active)                                         # (streams finishing below leave self.active)
         if not act:
             return
+        if len(act) == 1 and self._spec_ok(act[0]):
+            return self._spec_step(act[0])
+        for s in act:                                                   # batched again: DFlash states hand back
+            self._spec_end(s)
         B = len(act)
         members = tuple(id(s) for s in act)
         if members != self._members:                                    # membership changed: re-place the small state
@@ -475,6 +524,58 @@ class Scheduler:
             s.logits = (logits, r)                                      # sliced only when the stream finishes
         for s in act:
             self._emit(s, s.tok)
+
+    # ---- DFlash (a stream running alone)
+    def _spec_ok(self, s):
+        """DFlash for this stream now: a policy and a drafter, no forced tokens pending, and a whole block of room
+        before the thinking budget, max_new and the context capacity (the tail decodes plainly)."""
+        if self.spec is None or s.force:
+            return False
+        T, req = max(self.spec.cost), s.req
+        if s.open and len(req.out) + T >= req.budget[0]:
+            return False
+        return len(req.out) + T < s.max_new and s.pos + T + 1 < self.eng.max_len
+
+    def _spec_end(self, s):
+        """Leave DFlash mode: the stream takes its caches (the drafter's ring included) and position back; the queued
+        draft is dropped (it only wrote committed positions into the ring)."""
+        if s.spec is None:
+            return
+        s.caches, s.pos, s.spec = s.spec["caches"], s.spec["pos_h"], None
+        self._members = None
+
+    def _spec_step(self, s):
+        req, st = s.req, self.state
+        if s.spec is None:
+            if s.tau is None:
+                self.spec.start(s)
+            if s.sampler is None:
+                s.sampler = DeviceSampler(req.temperature, req.top_p, seed=self.seed)
+            s.spec = self.eng.dflash_start(np.array([s.tok]), s.caches, s.pos, T=self.spec.pick(s))
+            s.caches = None
+            self._members = None
+        T = s.spec["T"]
+        t0 = time.perf_counter()                                        # the next block's T is chosen before this
+        emitted, s.spec = self.eng.dflash_step(s.spec, s.sampler, tuple(sorted(self.stop_ids)),   # step's tokens are
+                                               next_T=self.spec.pick(s))                         # known (it is queued)
+        self.spec.update(s, T, len(emitted))
+        t1 = time.perf_counter()
+        self.steps += 1
+        st["steps"] = self.steps
+        st["step_tokens"] = st.get("step_tokens", 0) + len(emitted)
+        st["spec_steps"] = st.get("spec_steps", 0) + 1
+        st["spec_tokens"] = st.get("spec_tokens", 0) + len(emitted)
+        st["decode_s"] = st.get("decode_s", 0.0) + (t1 - t0)
+        if self._t_step is not None:
+            st["step_s"] = st.get("step_s", 0.0) + (t1 - self._t_step)
+            st["steps_busy"] = st.get("steps_busy", 0) + 1
+        self._t_step = t1
+        s.seen.extend([s.tok] + emitted[:-1])                           # the anchor and the accepted drafts were fed
+        s.tok, s.pos, s.logits = emitted[-1], s.spec["pos_h"], None
+        for tok in emitted:
+            if s not in self.active:                                    # finished mid-block (length / cancelled)
+                break
+            self._emit(s, tok)
 
     # ---- warm-up
     def warmup(self, max_B=None, token=0):

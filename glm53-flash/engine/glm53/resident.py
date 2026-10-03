@@ -14,6 +14,8 @@ Tables live in `params["layers"][i]["mlp"]`; `M.moe_dense` calls `ResidentFetch.
   once, so the cost follows the DISTINCT experts (consecutive tokens share many; independent streams almost none).
 Activations are permuted to the planes' "pm" input order (planes.pm_x / pm_flat); outputs are in natural row order.
 """
+import dataclasses
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -328,9 +330,11 @@ class ResidentLayerEngine(Engine):
             return {"tk_hist": R, "tg_hist": R}
         return None
 
-    def _prog_group(self, layers, B, T, has_cache, use_recurrent, hist=False):
+    def _prog_group(self, layers, B, T, has_cache, use_recurrent, hist=False, capture=()):
+        """capture = positions j in the group whose output's stream mean [B,T,D] is returned as a last output (a
+        list; DFlash features of layers in the middle of a group)."""
         kinds = tuple(self._kind(i) for i in layers)
-        key = ("group", kinds, B, T, has_cache, use_recurrent, hist)
+        key = ("group", kinds, B, T, has_cache, use_recurrent, hist) + ((capture,) if capture else ())
         if key not in self._progs:
             lts = [self.cfg.layer_types[i] for i in layers]
             mts = [self.cfg.mlp_types[i] for i in layers]
@@ -341,7 +345,7 @@ class ResidentLayerEngine(Engine):
             from glm53 import quant8 as Q8
 
             def prog(ps, streams, pos0, length, caches):
-                new, hs = [], []
+                new, hs, feats = [], [], []
                 for j, p in enumerate(ps):
                     p = Q8.dequant_tree(p, self.lcfg.dtype)          # int8 non-expert matrices -> bf16 (fused into dots)
                     fetch = self.expert_fetch if mts[j] == "sparse" else None
@@ -351,11 +355,28 @@ class ResidentLayerEngine(Engine):
                                                   hist=hist)
                     nc, h = M.split_hist(nc)
                     new.append(nc); hs.append(h if hist else None)
-                return (streams, new, hs) if hist else (streams, new)
+                    if j in capture:
+                        feats.append(self._stream_mean(streams))
+                return (streams, new) + ((hs,) if hist else ()) + ((feats,) if capture else ())
             in_specs = ([self.specs["layers"][i] for i in layers], R, R, R, css if has_cache else None)
-            out_specs = (R, css, hss) if hist else (R, css)
+            out_specs = (R, css) + ((hss,) if hist else ()) + (([R] * len(capture),) if capture else ())
             sm = shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
             self._progs[key] = jax.jit(sm, donate_argnums=(4,) if has_cache else ())
+        return self._progs[key]
+
+    def _stream_mean(self, streams):
+        """DFlash feature of a layer: the mean of its 4 output residual streams (SGLang's hc_contract) [B,T,D]; a
+        verify shorter than the drafter's block is padded to the block (zero rows), so the next draft program takes
+        the same shape after a verify of any T (one draft program per block size)."""
+        m = streams.astype(jnp.float32).mean(2).astype(self.lcfg.dtype)
+        T, blk = m.shape[1], self.dflash.cfg.block
+        return jnp.pad(m, ((0, 0), (0, blk - T), (0, 0))) if T < blk else m
+
+    def _prog_stream_mean(self, B, T):
+        key = ("stream_mean", B, T)
+        if key not in self._progs:
+            self._progs[key] = jax.jit(shard_map(self._stream_mean, mesh=self.mesh, in_specs=(R,), out_specs=R,
+                                                 check_vma=False))
         return self._progs[key]
 
     def _prog_hidden(self, B, T):
@@ -403,8 +424,12 @@ class ResidentLayerEngine(Engine):
         return self._progs[key]
 
     mtp = None                       # MTP (NextN) layer params on device, or None (see set_mtp)
+    dflash = None                    # DFlash 2 drafter (glm53.dflash.Drafter), or None (see set_dflash)
 
     def _cache_spec(self, i):
+        if i == self.cfg.n_layers and self.dflash is not None:                 # the drafter's context ring
+            from glm53.dflash import RING_SPECS
+            return dict(RING_SPECS)
         if i == self.cfg.n_layers:                                             # the MTP layer's cache entry
             mla = P(None, AXIS) if self.lcfg.seq_shard > 1 else R
             spec = {"c": mla, "pk": mla, "tk": R, "tg": R, "h": R}
@@ -419,13 +444,17 @@ class ResidentLayerEngine(Engine):
     def alloc_caches(self, B):
         """Zero caches for a new context at the engine's capacity, allocated directly on the chips (+ the MTP
         layer's entry, index n_layers, when an MTP layer is installed: its attention cache and the carried final
-        hidden state "h" [B,1,D] of the last processed position)."""
+        hidden state "h" [B,1,D] of the last processed position; or the DFlash drafter's context ring there)."""
         cfg = self.cfg
         out = []
-        n_entries = cfg.n_layers + (1 if self.mtp is not None else 0)
+        n_entries = cfg.n_layers + (1 if self.mtp is not None or self.dflash is not None else 0)
         for i in range(n_entries):
             spec = self._cache_spec(i)
-            if i == cfg.n_layers:
+            if i == cfg.n_layers and self.dflash is not None:
+                dc = self.dflash.cfg
+                shapes = {k: ((dc.n_layers, B, dc.window, dc.kv_heads, dc.hd), dc.dtype) for k in ("k", "v")}
+                shapes["p"] = ((B, dc.window), jnp.int32)               # slot positions + 1 (0 = empty)
+            elif i == cfg.n_layers:
                 shapes = {k: (sh, M.cache_dtype(cfg, k, cfg.dtype)) for k, sh in M.mla_cache_shapes(cfg, B, self.max_len, True).items()}
                 shapes["h"] = ((B, 1, cfg.hidden), cfg.dtype)
             elif cfg.layer_types[i] == "linear_attention":
@@ -526,8 +555,17 @@ class ResidentLayerEngine(Engine):
         caches = jax.tree.map(lambda h: h.to_device(), hsnap["caches"], is_leaf=lambda x: isinstance(x, _HostShards))
         return {"n_tokens": hsnap["n_tokens"], "rows": hsnap["rows"], "caches": caches}
 
-    def _run_layers(self, tokens, caches, pos0, use_recurrent, length, override=None):
-        """embed + all layer groups -> (final residual streams, new caches). `override` = (vectors [B,T,D],
+    def _capture_plan(self, g, capture):
+        """DFlash feature capture for layer group g: (positions in the middle of the group, whose program returns
+        their stream mean; whether the group's last layer is captured: the mean of the group's output)."""
+        if not capture:
+            return (), False
+        js = [j for j, i in enumerate(g) if i in self.dflash.cfg.target_layers]
+        return tuple(j for j in js if j < len(g) - 1), bool(js) and js[-1] == len(g) - 1
+
+    def _run_layers(self, tokens, caches, pos0, use_recurrent, length, override=None, capture=False):
+        """embed + all layer groups -> (final residual streams, new caches[, DFlash features: the stream mean after
+        each of the drafter's target layers, [B,T,D] each, with capture=True]). `override` = (vectors [B,T,D],
         mask [B,T]) replaces the token embeddings where mask is set."""
         B, T = tokens.shape
         if override is None:
@@ -535,30 +573,41 @@ class ResidentLayerEngine(Engine):
         else:
             streams = self._prog_embed(B, T, True)(self.params["embed"], jnp.asarray(tokens), jnp.asarray(override[0]),
                                                    jnp.asarray(override[1]))
-        new_caches = []
+        new_caches, feats = [], []
         has_cache = caches is not None
         pos0, length = self.scalar(pos0), self.scalar(length)
         for g in self.groups["decode" if use_recurrent else "prefill"]:
-            prog = self._prog_group(g, B, T, has_cache, use_recurrent)
-            streams, ncs = prog([self.params["layers"][i] for i in g], streams, pos0, length,
-                                [caches[i] for i in g] if has_cache else None)
+            mid, last = self._capture_plan(g, capture)
+            prog = self._prog_group(g, B, T, has_cache, use_recurrent, capture=mid)
+            out = prog([self.params["layers"][i] for i in g], streams, pos0, length,
+                       [caches[i] for i in g] if has_cache else None)
+            streams, ncs = out[:2]
             new_caches.extend(ncs)
+            if mid:
+                feats.extend(out[2])
+            if last:
+                feats.append(self._prog_stream_mean(B, T)(streams))
             self.launches += 1
-        return streams, new_caches
+        return (streams, new_caches, feats) if capture else (streams, new_caches)
 
-    def _run(self, tokens, caches, pos0, use_recurrent, length=None, want_logits=True, want_streams=False, override=None):
+    def _run(self, tokens, caches, pos0, use_recurrent, length=None, want_logits=True, want_streams=False, override=None,
+             capture=False):
         B, T = tokens.shape
         length = T if length is None else length
-        streams, new_caches = self._run_layers(tokens, caches, pos0, use_recurrent, length, override)
+        out = self._run_layers(tokens, caches, pos0, use_recurrent, length, override, capture)
+        streams, new_caches = out[:2]
         logits = None
         if want_logits:
             logits = self._prog_head(B, T)(self.params["norm"], self.params["lm_head"], streams, self.scalar(length))
-        return (logits, new_caches, streams) if want_streams else (logits, new_caches)
+        return (logits, new_caches) + ((streams,) if want_streams else ()) + ((out[2],) if capture else ())
 
     def scalar(self, x):
         """A host int as a replicated int32 device scalar. A plain jnp.int32(x) is uncommitted, so every program it is
         passed to reshards it on the host (`cpp_pjit_shard_arg_fallback`, ~0.3 ms per argument and call: ~3.6 ms of a
-        verify step's ~16 ms host time, j69 2026-10-03)."""
+        verify step's ~16 ms host time, j69 2026-10-03). A device array (e.g. a position computed on the chips)
+        passes through."""
+        if isinstance(x, jax.Array):
+            return x
         return jax.device_put(np.int32(x), NamedSharding(self.mesh, P()))
 
     def decode_sample(self, token, caches, pos, sampler: DeviceSampler):
@@ -661,7 +710,9 @@ class ResidentLayerEngine(Engine):
         cache (entry n_layers) is prefilled too: MTP position p takes (token p+1, final hidden p), so a piece
         covers positions [pos0-1, pos0+L-1) (or [0, L-1) for the first piece) and the last hidden is carried.
         `embeds` = (idx [M] int, vec [M, D]) replaces the embeddings of tokens[0, idx] (B = 1; image tokens,
-        glm53.vision) — the MTP layer's own embedding input keeps the table rows (drafts only; verify is exact)."""
+        glm53.vision) — the MTP layer's own embedding input keeps the table rows (drafts only; verify is exact).
+        With a DFlash drafter installed, the pieces that hold the last window-1 positions also capture the target
+        features, and the drafter's ring (entry n_layers) takes their K/V."""
         tokens = np.asarray(tokens)
         B, T = tokens.shape
         assert T >= 1 and pos0 + T <= self.max_len, (pos0, T, self.max_len)
@@ -671,7 +722,9 @@ class ResidentLayerEngine(Engine):
             assert B == 1
             e_idx, e_vec = np.asarray(embeds[0], np.int64), np.asarray(embeds[1])
         logits = None
-        main, mc = (caches[:self.cfg.n_layers], caches[self.cfg.n_layers]) if self.mtp is not None else (caches, None)
+        n = self.cfg.n_layers
+        main, mc = (caches[:n], caches[n]) if self.mtp is not None else (caches[:n], None)
+        ring = caches[n] if self.dflash is not None else None
         for a in range(0, T, self.prefill_piece):
             seg = tokens[:, a:a + self.prefill_piece]
             L = seg.shape[1]
@@ -687,6 +740,15 @@ class ResidentLayerEngine(Engine):
                     vec[0, e_idx[sel] - a] = e_vec[sel]
                     mask[0, e_idx[sel] - a] = True
                     ov = (vec, mask)
+            if ring is not None:
+                cap = a + L > T - self.dflash.cfg.window          # positions a block can still see
+                out = self._run(padded, main, pos0 + a, False, length=L, want_logits=a + L >= T, override=ov,
+                                capture=cap)
+                logits, main = out[:2]
+                if cap:
+                    ring = self.dflash.ingest(ring, out[2], self.device_positions([pos0 + a] * B),
+                                              self.device_positions([L] * B))
+                continue
             if mc is None:
                 logits, main = self._run(padded, main, pos0 + a, False, length=L, want_logits=a + L >= T, override=ov)
                 continue
@@ -707,7 +769,7 @@ class ResidentLayerEngine(Engine):
                 _, _, mcache = self._prog_mtp(B, Tp, True)(self.mtp, self.params["embed"], self.params["lm_head"],
                                                            jnp.asarray(mt), hp, self.scalar(start), self.scalar(length), mcache)
             mc = {**mcache, "h": lax.dynamic_index_in_dim(hidden, L - 1, axis=1, keepdims=True)}
-        return logits, (main + [mc] if mc is not None else main), pos0 + T
+        return logits, main + [e for e in (mc, ring) if e is not None], pos0 + T
 
     # ---- speculative decoding with the MTP (NextN) layer
     def set_mtp(self, params, qtypes, k=1):
@@ -747,25 +809,41 @@ class ResidentLayerEngine(Engine):
             self._progs[key] = jax.jit(sm, donate_argnums=(7,))
         return self._progs[key]
 
-    def _run_verify(self, tokens, caches, pos0, sampler=None):
-        """Recurrent T-token step returning (logits [B,T,V], caches, per-layer histories, hidden [B,T,D], ids):
-        ids = the device-sampled token of every position [B,T] when a DeviceSampler is given, else None."""
+    def _verify_layers(self, tokens, caches, pos0, capture=False):
+        """embed + the decode layer groups of a recurrent T-token step with per-token histories -> (final streams,
+        caches, histories, DFlash features: the stream mean after each drafter target layer, [B,T,D] each, when
+        capture)."""
         B, T = tokens.shape
         streams = self._prog_embed(B, T)(self.params["embed"], jnp.asarray(tokens))
-        new, hists = [], []
+        new, hists, feats = [], [], []
         pos0, length = self.scalar(pos0), self.scalar(T)
         for g in self.groups["decode"]:
-            prog = self._prog_group(g, B, T, True, True, hist=True)
-            streams, ncs, hs = prog([self.params["layers"][i] for i in g], streams, pos0, length, [caches[i] for i in g])
+            mid, last = self._capture_plan(g, capture)
+            prog = self._prog_group(g, B, T, True, True, hist=True, capture=mid)
+            out = prog([self.params["layers"][i] for i in g], streams, pos0, length, [caches[i] for i in g])
+            streams, ncs, hs = out[:3]
             new.extend(ncs); hists.extend(hs)
+            if mid:
+                feats.extend(out[3])
+            if last:
+                feats.append(self._prog_stream_mean(B, T)(streams))
             self.launches += 1
+        return streams, new, hists, feats
+
+    def _run_verify(self, tokens, caches, pos0, sampler=None, capture=False):
+        """Recurrent T-token step returning (logits [B,T,V], caches, per-layer histories, hidden [B,T,D], ids[,
+        DFlash features: list of [B,T,D] per drafter target layer, with capture=True]): ids = the device-sampled token
+        of every position [B,T] when a DeviceSampler is given, else None."""
+        B, T = tokens.shape
+        streams, new, hists, feats = self._verify_layers(tokens, caches, pos0, capture)
+        extra = (feats,) if capture else ()
         if sampler is None:
             logits, hidden = self._prog_head_all(B, T)(self.params["norm"], self.params["lm_head"], streams)
-            return logits, new, hists, hidden, None
+            return (logits, new, hists, hidden, None) + extra
         ids, logits, hidden, nk = self._prog_head_all(B, T, True)(self.params["norm"], self.params["lm_head"], streams,
                                                                   *sampler.bind(self.mesh))
         sampler.advance(nk)
-        return logits, new, hists, hidden, ids
+        return (logits, new, hists, hidden, ids) + extra
 
     def spec_decode(self, token, caches, pos, k=None, sampler=None, draft_override=None, stop_ids=()):
         """One speculative step from the committed token `token` [B] at position `pos` (B = 1): the MTP layer
@@ -813,6 +891,113 @@ class ResidentLayerEngine(Engine):
         emitted = drafts_h[:a] + [preds[a]]
         h_next = lax.dynamic_index_in_dim(hidden, a, axis=1, keepdims=True)
         return emitted, logits[:, a], new + [{**mcache, "h": h_next}], pos + a + 1
+
+    # ---- speculative decoding with the DFlash 2 drafter (block diffusion, glm53.dflash)
+    def set_dflash(self, params, dcfg, int8=False):
+        """Install the DFlash 2 drafter (`glm53.dflash.load_params`) on the engine's mesh; it shares the target's
+        embedding and lm_head. Its context ring becomes cache entry n_layers (`alloc_caches`), filled by `prefill`
+        with the captured target features (the stream mean after each of dcfg.target_layers) and by `dflash_step`
+        with the accepted positions'. int8: the drafter's big matrices as q8 (glm53.quant8)."""
+        from glm53 import dflash as DF
+        assert self.mtp is None, "MTP and DFlash share cache entry n_layers"
+        assert max(dcfg.target_layers) < self.cfg.n_layers, dcfg.target_layers
+        self.dflash = DF.Drafter(dataclasses.replace(dcfg, dtype=self.cfg.dtype), params, self.mesh,
+                                 self.specs["embed"], self.specs["lm_head"], int8=int8)
+
+    def _dflash_zeros(self, B, T):
+        key = ("dflash_zeros", B, T)
+        if key not in self._progs:
+            n_f, D = len(self.dflash.cfg.target_layers), self.cfg.hidden
+            z = jax.jit(lambda: [jnp.zeros((B, T, D), self.cfg.dtype)] * n_f,
+                        out_shardings=[NamedSharding(self.mesh, R)] * n_f)()
+            self._progs[key] = z
+        return self._progs[key]
+
+    def _prog_head_accept(self, B, T, stop_ids):
+        """The DFlash verify's head with the acceptance on the chips: (norm, lm_head, streams, seq [B,T] = anchor +
+        drafts, pos (), temperature, top_p, key) -> dict: emitted [B,T] (the accepted drafts, then the target's own
+        token, -1 after), a [B] (accepted drafts), bonus [B] (the target's token = the next anchor), n_keep () = a+1,
+        pos_next () = pos + a + 1, pos_b [B] = pos, n_new_b [B] = a + 1, key. The target's token at every position is
+        device-sampled (temperature 0: the argmax); a draft is accepted iff it equals it, and a draft in `stop_ids`
+        ends the accepted run (B = 1: n_keep and pos_next are row 0's)."""
+        key = ("head_accept", B, T, tuple(stop_ids))
+        if key not in self._progs:
+            def prog(norm, lm_head, streams, seq, pos, temp, top_p, k):
+                h = M.rmsnorm(streams.mean(2).astype(self.lcfg.dtype), norm, self.cfg.eps)
+                k1, k2 = jax.random.split(k)
+                ids = device_sample(self._logits_local(lm_head, h).reshape(B * T, -1), temp, top_p, k1)
+                ids = ids.reshape(B, T).astype(jnp.int32)
+                d = seq[:, 1:].astype(jnp.int32)
+                ok = ids[:, :-1] == d
+                for sid in stop_ids:
+                    ok &= d != sid
+                a = jnp.cumprod(ok.astype(jnp.int32), 1).sum(1)
+                bonus = jnp.take_along_axis(ids, a[:, None], 1)[:, 0]
+                j = jnp.arange(T)[None, :]
+                dpad = jnp.concatenate([d, jnp.zeros((B, 1), jnp.int32)], 1)
+                emitted = jnp.where(j < a[:, None], dpad, jnp.where(j == a[:, None], bonus[:, None], -1))
+                return {"emitted": emitted, "a": a, "bonus": bonus, "n_keep": a[0] + 1, "pos_next": pos + a[0] + 1,
+                        "pos_b": jnp.broadcast_to(pos, (B,)), "n_new_b": a + 1, "key": k2}
+            outs = {k: R for k in ("emitted", "a", "bonus", "n_keep", "pos_next", "pos_b", "n_new_b", "key")}
+            in_specs = (R, self.specs["lm_head"], R, R, R, R, R, R)
+            self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=outs,
+                                                 check_vma=False))
+        return self._progs[key]
+
+    def _dflash_draft(self, ring, feats, pos_b, n_new_b, anchor_b, T):
+        r = self.dflash.draft(ring, feats, pos_b, n_new_b, anchor_b, self.params["embed"], self.params["lm_head"], T=T)
+        return r["seq"], r["ring"]
+
+    def dflash_start(self, token, caches, pos, T=None, pending=None):
+        """Begin DFlash 2 decoding of one stream (B = 1) from the committed token `token` [B] at position `pos` (not yet
+        fed; e.g. the token sampled from `prefill`'s logits): dispatches the first draft. `pending` = the features of
+        positions the ring has not seen yet (None right after `prefill`, which fills it). Returns the state that
+        `dflash_step` advances: {"caches", "pos" (device scalar), "pos_h" (host int), "seq" (the drafted block, on the
+        device), "T"}."""
+        n = self.cfg.n_layers
+        T = self.dflash.cfg.block if T is None else T
+        B = np.asarray(token).reshape(-1).shape[0]
+        assert B == 1 and self.dflash is not None
+        feats, p0, n_new = pending if pending is not None else (self._dflash_zeros(B, self.dflash.cfg.block), pos, 0)
+        seq, ring = self._dflash_draft(caches[n], feats, self.device_positions([p0] * B),
+                                       self.device_positions([n_new] * B),
+                                       self.device_positions(np.asarray(token).reshape(B)), T)
+        return {"caches": caches[:n] + [ring], "pos": self.scalar(pos), "pos_h": int(pos), "seq": seq, "T": T}
+
+    def dflash_step(self, st, sampler: DeviceSampler | None = None, stop_ids=(), draft_override=None, next_T=None):
+        """One DFlash 2 step: the target verifies the drafted block [anchor, drafts] in one T-token step that also
+        captures its features; the acceptance runs on the chips (the head program: the target's token per position,
+        device-sampled, `sampler` None = greedy; a draft is accepted iff it equals it — exact for greedy, a valid if
+        conservative scheme for sampling; a draft in `stop_ids` ends the run and is emitted unfed); the KDA states and
+        pool tails are rolled back to the accepted prefix; the NEXT draft (anchor = the target's token, the accepted
+        positions' features into the ring) is dispatched before the host reads this step's tokens, so the host's
+        bookkeeping overlaps it (it only writes committed positions: stopping after any step leaves a consistent
+        state). `next_T` = the block size of the next draft (default: this one's). `draft_override` (T-1 ids,
+        tests) replaces this step's drafts. Returns (emitted tokens [1..T] — all but the last were fed to the model,
+        the new state)."""
+        n = self.cfg.n_layers
+        T, B = st["T"], 1
+        sampler = sampler if sampler is not None else self._dflash_greedy()
+        seq = st["seq"]
+        if draft_override is not None:
+            seq = jnp.concatenate([seq[:, :1], jnp.asarray(np.asarray(draft_override, np.int32).reshape(B, T - 1))], 1)
+        caches = st["caches"]
+        streams, new, hists, feats = self._verify_layers(seq, caches[:n], st["pos"], capture=True)
+        r = self._prog_head_accept(B, T, tuple(stop_ids))(self.params["norm"], self.params["lm_head"], streams, seq,
+                                                          st["pos"], *sampler.bind(self.mesh))
+        sampler.advance(r["key"])
+        rolled = self._prog_rollback(B, T)(hists, r["n_keep"])
+        new = [({**c, **x} if x else c) for c, x in zip(new, rolled)]
+        next_T = T if next_T is None else next_T
+        nseq, ring = self._dflash_draft(caches[n], feats, r["pos_b"], r["n_new_b"], r["bonus"], next_T)
+        emitted = [int(x) for x in np.asarray(r["emitted"])[0] if x >= 0]     # the host waits here, the draft queued
+        return emitted, {"caches": new + [ring], "pos": r["pos_next"], "pos_h": st["pos_h"] + len(emitted),
+                         "seq": nseq, "T": next_T}
+
+    def _dflash_greedy(self):
+        if getattr(self, "_greedy_sampler", None) is None:
+            self._greedy_sampler = DeviceSampler(0.0, 1.0, seed=0)
+        return self._greedy_sampler
 
     def decode(self, token, caches, pos):
         B = token.shape[0]
