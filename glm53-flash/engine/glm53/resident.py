@@ -7,9 +7,11 @@ expert in VMEM without byte slicing and XLA needs no relayout copies. gate/up: R
 moe_inter), inputs D; down: R = D rows, inputs ml.
 
 Tables live in `params["layers"][i]["mlp"]`; `M.moe_dense` calls `ResidentFetch.apply`:
-  decode (N*k <= gather_max_rows): `glm53.pallas_moe.moe_matvec` per matrix (fused dequant + VPU matvec, the expert
-  planes DMA'd by index), or the XLA path (dynamic slices + glm53.planes.dequant_planes + einsum) when use_pallas=False;
-  prefill: sweep over all experts in chunks (XLA dequant + dense masked matmuls) so no per-token weight copies exist.
+  decode (N*k <= gather_max_rows and fewer than `ragged_min_seq` tokens of one sequence): `glm53.pallas_moe`
+  `moe_matvec_gu` + `moe_matvec` per (token, expert) slot (fused dequant + VPU matvec, the expert planes DMA'd by
+  index), or the XLA path (dynamic slices + glm53.planes.dequant_planes + einsum) when use_pallas=False;
+  prefill and multi-token verifies of one sequence: the grouped (ragged) kernels — every routed expert dequantized
+  once, so the cost follows the DISTINCT experts (consecutive tokens share many; independent streams almost none).
 Activations are permuted to the planes' "pm" input order (planes.pm_x / pm_flat); outputs are in natural row order.
 """
 import numpy as np
@@ -97,10 +99,23 @@ class ResidentFetch:
         parts = [lax.dynamic_slice_in_dim(a, flat[j] * rows_p, rows_p, axis=1) for j in range(flat.shape[0])]
         return jnp.concatenate(parts, axis=1)[0]
 
-    def apply(self, p, x, idx, w, layer, limit):
-        """x [N,D]; idx [N,k] int32 into E; w [N,k] fp32 -> partial MoE output [N,D] (TP-reduced by the caller)."""
+    # Multi-token steps of ONE sequence (verifies): from `ragged_min_seq` tokens and up to `verify_max_rows` slots they
+    # take the ragged kernels with these settings. v6e 2026-10-03 (j67-4c51, whole verify step): T=4 slot 18.2 / ragged
+    # 17.9 ms, T=8 27.8 / 25.6, T=16 48.8 / 36.3 — below 8 tokens the per-slot decode kernels are as fast or faster.
+    ragged_min_seq = 8
+    verify_dtype = None        # activations/tiles (None = out_dtype; f32 = f32 tiles + HIGHEST dots: ~1.5x slower)
+    verify_tm = 16             # rows per block (a verify has <= T rows per expert; 16 = the bf16 minimum)
+    verify_lane_block = 4096   # lane block (the down kernel in one grid step per block: j66 -19 % MoE at T=8)
+    verify_max_rows = 256
+
+    def apply(self, p, x, idx, w, layer, limit, seq_tokens=1):
+        """x [N,D]; idx [N,k] int32 into E; w [N,k] fp32 -> partial MoE output [N,D] (TP-reduced by the caller).
+        seq_tokens: consecutive tokens per sequence in x (a verify of T positions: T; B independent rows: 1)."""
         gate_q, up_q, down_q = p["gate_q"], p["up_q"], p["down_q"]         # {plane: [1, E*rows_p, R]} on this chip
         N, k = idx.shape
+        if self.use_pallas and seq_tokens >= self.ragged_min_seq and N * k <= self.verify_max_rows:
+            return self._apply_ragged_kernel(x, idx, w, layer, gate_q, up_q, down_q, limit, self.verify_dtype,
+                                             self.verify_tm, self.verify_lane_block)
         if N * k <= self.gather_max_rows:
             if self.use_pallas:
                 return self._apply_kernel(x, idx, w, layer, gate_q, up_q, down_q, limit)
@@ -111,12 +126,12 @@ class ResidentFetch:
         N, k = idx.shape
         flat = idx.reshape(-1)
         qt_gu, qt_dn = self.qtypes[layer]["gate_q"], self.qtypes[layer]["down_q"]
+        assert self.qtypes[layer]["up_q"] == qt_gu, self.qtypes[layer]
         Xg = jnp.repeat(PL.pm_x(qt_gu, x.astype(jnp.float32)), k, axis=0)              # [Nk, W, C]
-        mv = lambda planes, qt, key, X: K.moe_matvec(planes, qt, self.nblk[key], flat, X, interpret=self.interpret)
-        g = mv(gate_q, qt_gu, "gate_q", Xg)                                             # [Nk, ml] f32
-        u = mv(up_q, self.qtypes[layer]["up_q"], "up_q", Xg)
+        g, u = K.moe_matvec_gu(gate_q, up_q, qt_gu, self.nblk["gate_q"], flat, Xg, interpret=self.interpret)
         h = M.swiglu_clamped(g, u, limit)                                               # [Nk, ml]
-        y = mv(down_q, qt_dn, "down_q", PL.pm_x(qt_dn, h)).reshape(N, k, -1)            # [N, k, D]
+        y = K.moe_matvec(down_q, qt_dn, self.nblk["down_q"], flat, PL.pm_x(qt_dn, h),
+                         interpret=self.interpret).reshape(N, k, -1)                    # [N, k, D]
         return jnp.einsum("nkd,nk->nd", y, w)
 
     def _apply_gather(self, x, idx, w, layer, gate_q, up_q, down_q, limit):
@@ -141,24 +156,28 @@ class ResidentFetch:
             return self._apply_sweep_kernel(x, idx, w, layer, gate_q, up_q, down_q, limit)
         return self._apply_sweep_xla(x, idx, w, layer, gate_q, up_q, down_q, limit)
 
-    def _apply_ragged_kernel(self, x, idx, w, layer, gate_q, up_q, down_q, limit):
+    def _apply_ragged_kernel(self, x, idx, w, layer, gate_q, up_q, down_q, limit, dtype=None, tm=None, lane_block=None):
         """Prefill through the grouped GEMM kernels: (token, expert) slots sorted by expert into `tm`-row blocks,
         each expert dequantized once and multiplied against its own rows only; the per-token combine gathers each
-        token's k slot rows (or, `combine="matmul"`, multiplies by a [T, Rp] weight matrix)."""
+        token's k slot rows (or, `combine="matmul"`, multiplies by a [T, Rp] weight matrix). dtype (default out_dtype)
+        = activations, VMEM tiles and outputs; f32 = f32 tiles + HIGHEST-precision dots (a verify close to the decode
+        kernels' f32 numerics)."""
         qt_gu, qt_dn = self.qtypes[layer]["gate_q"], self.qtypes[layer]["down_q"]
         E = gate_q["qs"].shape[1] // PL.plane_rows(qt_gu, self.nblk["gate_q"])["qs"]
         T, k = idx.shape
-        plan = K.ragged_plan(idx, w, E, self.tm)
+        tm = tm or self.tm
+        plan = K.ragged_plan(idx, w, E, tm)
         tok = plan["tok_row"]
-        xk = K.pm_mxu(qt_gu, x.astype(jnp.float32)).astype(self.out_dtype)                     # [T, D]
+        dtype = dtype or self.out_dtype
+        xk = K.pm_mxu(qt_gu, x.astype(jnp.float32)).astype(dtype)                             # [T, D]
         xs = jnp.take(xk, jnp.maximum(tok, 0), axis=0, mode="clip")
         xs = jnp.where((tok >= 0)[:, None], xs, jnp.zeros((), xs.dtype))                       # [Rp, D]
         h = K.moe_ragged_gateup(gate_q, up_q, qt_gu, self.nblk["gate_q"], plan["blk_expert"], plan["n_blocks"], xs,
-                                limit, tm=self.tm, interpret=self.interpret)                     # [Rp, ml]
-        hk = K.pm_mxu(qt_dn, h.astype(jnp.float32)).astype(self.out_dtype)
+                                limit, tm=tm, interpret=self.interpret, lane_block=lane_block)   # [Rp, ml]
+        hk = K.pm_mxu(qt_dn, h.astype(jnp.float32)).astype(dtype)
         y = K.moe_ragged_down(down_q, qt_dn, self.nblk["down_q"], plan["blk_expert"], plan["n_blocks"], hk,
-                              tm=self.tm, interpret=self.interpret)                              # [Rp, D]
-        if self.combine == "matmul":
+                              tm=tm, interpret=self.interpret, lane_block=lane_block)            # [Rp, D]
+        if self.combine == "matmul" and dtype != jnp.float32:     # f32 (verify): the slot path's combine below
             wc = (tok[None, :] == jnp.arange(T, dtype=jnp.int32)[:, None]).astype(jnp.float32) * plan["w_row"][None, :]
             return jnp.dot(wc.astype(y.dtype), y, preferred_element_type=jnp.float32)
         ys = jnp.take(y, plan["row_slot"].reshape(-1), axis=0, mode="clip").reshape(T, k, -1).astype(jnp.float32)
@@ -518,7 +537,7 @@ class ResidentLayerEngine(Engine):
                                                    jnp.asarray(override[1]))
         new_caches = []
         has_cache = caches is not None
-        pos0, length = jnp.int32(pos0), jnp.int32(length)
+        pos0, length = self.scalar(pos0), self.scalar(length)
         for g in self.groups["decode" if use_recurrent else "prefill"]:
             prog = self._prog_group(g, B, T, has_cache, use_recurrent)
             streams, ncs = prog([self.params["layers"][i] for i in g], streams, pos0, length,
@@ -533,8 +552,14 @@ class ResidentLayerEngine(Engine):
         streams, new_caches = self._run_layers(tokens, caches, pos0, use_recurrent, length, override)
         logits = None
         if want_logits:
-            logits = self._prog_head(B, T)(self.params["norm"], self.params["lm_head"], streams, jnp.int32(length))
+            logits = self._prog_head(B, T)(self.params["norm"], self.params["lm_head"], streams, self.scalar(length))
         return (logits, new_caches, streams) if want_streams else (logits, new_caches)
+
+    def scalar(self, x):
+        """A host int as a replicated int32 device scalar. A plain jnp.int32(x) is uncommitted, so every program it is
+        passed to reshards it on the host (`cpp_pjit_shard_arg_fallback`, ~0.3 ms per argument and call: ~3.6 ms of a
+        verify step's ~16 ms host time, j69 2026-10-03)."""
+        return jax.device_put(np.int32(x), NamedSharding(self.mesh, P()))
 
     def decode_sample(self, token, caches, pos, sampler: DeviceSampler):
         """`decode` with the next token sampled on the device: returns (ids [B] int32 device array, logits [B,V],
@@ -621,7 +646,7 @@ class ResidentLayerEngine(Engine):
         for b in range(B):                                   # extra entries (an MTP cache) pass through untouched
             new_sets[b].extend(cache_sets[b][n:])
         if sampler is None:
-            logits = self._prog_head(B, 1)(self.params["norm"], self.params["lm_head"], streams, jnp.int32(1))
+            logits = self._prog_head(B, 1)(self.params["norm"], self.params["lm_head"], streams, self.scalar(1))
             return None, logits, new_sets, pos_next
         if getattr(self, "_one", None) is None:
             self._one = jax.device_put(jnp.int32(1), NamedSharding(self.mesh, P()))
@@ -680,7 +705,7 @@ class ResidentLayerEngine(Engine):
             mcache = {k: v for k, v in mc.items() if k != "h"}
             if length > 0:
                 _, _, mcache = self._prog_mtp(B, Tp, True)(self.mtp, self.params["embed"], self.params["lm_head"],
-                                                           jnp.asarray(mt), hp, jnp.int32(start), jnp.int32(length), mcache)
+                                                           jnp.asarray(mt), hp, self.scalar(start), self.scalar(length), mcache)
             mc = {**mcache, "h": lax.dynamic_index_in_dim(hidden, L - 1, axis=1, keepdims=True)}
         return logits, (main + [mc] if mc is not None else main), pos0 + T
 
@@ -728,10 +753,10 @@ class ResidentLayerEngine(Engine):
         B, T = tokens.shape
         streams = self._prog_embed(B, T)(self.params["embed"], jnp.asarray(tokens))
         new, hists = [], []
-        pos0 = jnp.int32(pos0)
+        pos0, length = self.scalar(pos0), self.scalar(T)
         for g in self.groups["decode"]:
             prog = self._prog_group(g, B, T, True, True, hist=True)
-            streams, ncs, hs = prog([self.params["layers"][i] for i in g], streams, pos0, jnp.int32(T), [caches[i] for i in g])
+            streams, ncs, hs = prog([self.params["layers"][i] for i in g], streams, pos0, length, [caches[i] for i in g])
             new.extend(ncs); hists.extend(hs)
             self.launches += 1
         if sampler is None:
@@ -763,7 +788,7 @@ class ResidentLayerEngine(Engine):
         for j in range(k):
             tails.append((mcache["tk"], mcache["tg"]))          # before draft j (donated: keep the objects, not copies)
             lg, hd, mcache = self._prog_mtp(B, 1, True)(self.mtp, self.params["embed"], self.params["lm_head"],
-                                                        tok, hp, jnp.int32(pos - 1 + j), jnp.int32(1),
+                                                        tok, hp, self.scalar(pos - 1 + j), self.scalar(1),
                                                         {**mcache, "tk": jnp.copy(mcache["tk"]), "tg": jnp.copy(mcache["tg"])})
             d = jnp.asarray([[int(draft_override[j])]], jnp.int32) if draft_override is not None else jnp.argmax(lg, axis=-1)[:, None].astype(jnp.int32)
             drafts.append(d); tok = d; hp = hd
@@ -781,7 +806,7 @@ class ResidentLayerEngine(Engine):
         while a < k and preds[a] == drafts_h[a] and drafts_h[a] not in stop_ids:
             a += 1
         if a < k:
-            rolled = self._prog_rollback(B, k + 1)(hists, jnp.int32(a + 1))
+            rolled = self._prog_rollback(B, k + 1)(hists, self.scalar(a + 1))
             new = [({**c, **r} if r else c) for c, r in zip(new, rolled)]
             if a + 1 < k:                                       # drafts a+1.. were fed rejected tokens: tail as before draft a+1
                 mcache = {**mcache, "tk": tails[a + 1][0], "tg": tails[a + 1][1]}

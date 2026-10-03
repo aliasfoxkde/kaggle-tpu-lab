@@ -138,3 +138,34 @@ def test_spec_decode_matches_greedy(seq_shard):
     e1, _, _, _ = eng.spec_decode(np.array([int(jnp.argmax(l1[0]))]), c1, p1, k=1)
     e2, _, _, _ = eng.spec_decode(np.array([int(jnp.argmax(l2[0]))]), c2, p2, k=1)
     assert e1 == e2
+
+
+def test_ragged_verify_matches_greedy():
+    """Phase 2: the verify's MoE through the ragged (grouped) kernels — every routed expert dequantized once for all
+    T positions — still reproduces plain greedy decoding (rollback and acceptance paths, verifies of 2..8 positions,
+    with the attention's per-query cut-off at 4 and at 8 queries); no multi-token step falls back to the per-slot
+    kernels."""
+    import dataclasses
+    eng, cfg, rng = build(False)
+    ids = rng.integers(0, cfg.vocab_size, size=(1, 45))
+    ref = greedy(eng, ids, 12)
+    f = eng.expert_fetch
+    slot = f._apply_kernel
+
+    def only_single(x, *a):
+        assert x.shape[0] == 1, f"a {x.shape[0]}-token step took the per-slot kernels"
+        return slot(x, *a)
+    rms0 = f.ragged_min_seq
+    f._apply_kernel, f.ragged_min_seq = only_single, 2
+    l0 = eng.lcfg
+    try:
+        for pq in (4, 8):
+            eng.lcfg, eng._progs = dataclasses.replace(l0, per_query_max=pq), {}
+            for k in (1, 2):
+                out, _, _, _ = spec(eng, ids, 12, k)                             # random MTP: rollback
+                assert out == ref, (pq, k, out, ref)
+            for k in (2, 7):
+                out, acc, _, _ = spec(eng, ids, 12, k, oracle=ref)              # oracle drafts: acceptance, T = k+1
+                assert out == ref and acc > 0, (pq, k, out, ref, acc)
+    finally:
+        f._apply_kernel, f.ragged_min_seq, eng.lcfg = slot, rms0, l0

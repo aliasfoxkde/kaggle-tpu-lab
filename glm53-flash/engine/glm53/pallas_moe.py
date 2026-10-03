@@ -6,15 +6,23 @@ where X[i, w, c] = x_i[input(w, c)] is the per-word activation matrix of glm53.p
 
 Grid = expert slots; the expert id comes from a scalar-prefetch operand so each grid step DMAs exactly the planes
 of the chosen expert (double-buffered by Pallas). Inside, one (8, 128) vreg of the qs plane = 8 packed words x 128
-matrix rows; the codebook index of every group is looked up with in-vreg lane gathers (`jnp.take_along_axis` along
-lanes on the (8, 128)-tiled code table, one gather per 128-entry table row + a select tree over the high index
-bits), the 2-/3-bit levels and sign bits are unpacked with shifts, and the values are multiplied-accumulated on the
-VPU against the activation broadcast along lanes: acc[s, r] += v[s, r] * X[8b + s, c]. The sublane sum of the
-accumulator over all words is the output row block. Everything is 32-bit (no packed dtypes), loads are (n, 128)
-windows at 8-aligned sublane offsets, so the kernel also runs under `interpret=True` on CPU for the tests.
+matrix rows; the codebook index of every group is looked up with in-vreg lane gathers (two codes per int32 table
+word: one gather per 128-word table row + a select tree over the high index bits + a shift for the half), the values
+come out of the code with shifts (IQ2_S: one int multiply builds the f32 bits), the sign bits are XORed into the f32
+sign, and the values are multiplied-accumulated on the VPU against the activation broadcast along lanes:
+acc[s, r] += v[s, r] * X[8b + s, c]. The lane broadcasts of X are computed once per expert slot into VMEM. The
+sublane sum of the accumulator over all words is the output row block. `moe_matvec_gu` does gate and up of the same
+slots in one kernel (one grid step per slot, the broadcasts shared). Everything is 32-bit (no packed dtypes), loads
+are (n, 128) windows at 8-aligned sublane offsets, so the kernels also run under `interpret=True` on CPU for the tests.
 
-Codebook tables: `code_table(qtype)` packs each grid entry as GROUP_W[qtype] level indices (2 or 3 bits each) into
-one int32; entries are laid out [n_entries // 128, 128].
+Why this shape (speed plan §4/§12, measured on the v6e 2026-10-03 with jobs/j65): the decode kernel is bound by
+cross-lane ops (each lane gather or lane broadcast ~1.5 ns per vreg) and then by VALU ops per weight; one gather per
+128 table entries (8 for IQ2_S's 1024-entry grid) + a lane broadcast per weight vreg cost 15.7 us per expert, the
+pair table + hoisted broadcasts + fused gate/up + pre-encoded values + XOR sign + one grid step per down slot 8.4 us,
+with identical outputs. Mosaic in libtpu 0.0.42 has no multi-dimension in-vreg gather ("Zero or multiple gather
+dimensions"), so a one-op 1024-entry lookup is not available.
+
+Codebook tables: `code_table(qtype)` (see there).
 """
 import functools
 import numpy as np
@@ -32,17 +40,31 @@ LANES = 128
 SUB = 8
 
 
+SIGN = 0x80000000
+IQ2S_F32 = (0x41000000, 0x640000)          # f32 bits of the IQ2_S levels 8, 25, 43 = base + u * step, u = 0, 2, 3
+
+
 @functools.lru_cache(None)
 def code_table(qtype):
-    """int32 [n // 128, 128]: entry e -> sum_k level_k << (lb * k)."""
+    """int32 [n // 256, 128]: the grid, TWO entries per int32 (entry 2w in the low 16 bits of word w, 2w + 1 in the
+    high 16; word w at [w // 128, w % 128]). One field per weight k of the entry: IQ2_S stores its level lv in
+    {0, 1, 2} as u = 0, 2, 3 in bits 2k..2k+1 (so the value's f32 bits are IQ2S_F32[0] + u * IQ2S_F32[1]), IQ3_S
+    stores the value 2 lv + 1 in bits 4k..4k+3."""
     grid, levels = Q.GRIDS[qtype], Q.LEVELS[qtype]
-    lb = int(np.ceil(np.log2(len(levels))))
-    lv = np.searchsorted(levels, grid)                                   # [n, w]
+    lv = np.searchsorted(levels, grid).astype(np.int64)                 # [n, w]
     assert np.array_equal(levels[lv], grid)
+    if qtype == "IQ2_S":
+        assert np.array_equal(levels, [8, 25, 43])
+        f, fw = np.array([0, 2, 3])[lv], 2
+    elif qtype == "IQ3_S":
+        assert np.array_equal(levels, 2 * np.arange(8) + 1)
+        f, fw = 2 * lv + 1, 4
+    else:
+        raise ValueError(qtype)
     code = np.zeros(grid.shape[0], np.int64)
     for k in range(grid.shape[1]):
-        code |= lv[:, k].astype(np.int64) << (lb * k)
-    return code.astype(np.int32).reshape(-1, LANES)
+        code |= f[:, k] << (fw * k)
+    return (code[0::2] | (code[1::2] << 16)).astype(np.uint32).view(np.int32).reshape(-1, LANES)
 
 
 @functools.lru_cache(None)
@@ -81,22 +103,35 @@ def _sub_iota():
     return lax.broadcasted_iota(jnp.uint32, (SUB, LANES), 0)
 
 
-def _lookup(tb, idx):
-    """tb: list of (8,128) int32 table rows (128 entries each); idx (8,128) int32 -> codes (8,128) int32."""
-    lo = idx & (LANES - 1)
-    hi = idx >> 7
-    vals = [jnp.take_along_axis(t, lo, axis=1) for t in tb]
+_GATHER_DN = lax.GatherDimensionNumbers(offset_dims=(), collapsed_slice_dims=(1,), start_index_map=(1,),
+                                        operand_batching_dims=(0,), start_indices_batching_dims=(0,))
+
+
+def _take(t, i):
+    """In-vreg lane gather t[s, i[s, l]] (Mosaic's dynamic_gather; indices are in range, so no negative-index fix-up
+    as jnp.take_along_axis adds)."""
+    return lax.gather(t, i[..., None], _GATHER_DN, (1, 1), mode=lax.GatherScatterMode.PROMISE_IN_BOUNDS)
+
+
+def _lookup(tb, q, j, hw, hb):
+    """Code of grid entry idx = (byte j of q) | (high index bits << 8), from `code_table`'s rows `tb` (each (8, 128),
+    one table row broadcast to all sublanes): table word = idx >> 1 (low 7 bits = bits 1..7 of the byte, row = the high
+    index bits, bit hb.. of hw), half = bit 0 of the byte. Returns int32 (8, 128) with the code in its low 16 bits (the
+    high bits are the other entry or a sign extension; the decoders never read them)."""
+    vals = [_take(t, ((q >> (8 * j + 1)) & 127).astype(jnp.int32)) for t in tb]
     bit = 0
     while len(vals) > 1:
-        sel = ((hi >> bit) & 1) == 1
+        sel = (hw & (1 << (hb + bit))) != 0
         vals = [jnp.where(sel, vals[2 * m + 1], vals[2 * m]) for m in range(len(vals) // 2)]
         bit += 1
-    return vals[0]
+    half = ((q << 4) if j == 0 else (q >> (8 * j - 4))) & 16
+    return vals[0] >> half.astype(jnp.int32)
 
 
-def _signed(v_int, sgn_bits, k):
-    v = v_int.astype(jnp.int32).astype(jnp.float32)
-    return jnp.where(((sgn_bits >> k) & 1) == 1, -v, v)
+def _signed(v, word, bit):
+    """f32 v negated where bit `bit` of the u32 `word` is set (XOR into the f32 sign bit: shl, and, xor)."""
+    m = (word << (31 - bit)) & jnp.uint32(SIGN)
+    return lax.bitcast_convert_type(lax.bitcast_convert_type(v, jnp.uint32) ^ m, jnp.float32)
 
 
 # ------------------------------------------------------------------------------------------ per-format word decoders
@@ -113,21 +148,20 @@ def _decode_iq2_s(b, rows, tb):
     dv = jnp.broadcast_to(_f16_bits_to_f32(dw), (SUB, LANES))
     scale = [dv * (0.5 + ((scw >> (4 * h)) & 15).astype(jnp.int32).astype(jnp.float32)) * 0.25 for h in range(2)]
     groups = [(scale[0], []), (scale[1], [])]
+    base, step = IQ2S_F32
     for j in range(4):
-        idx = (((q >> (8 * j)) & 255) | (((qhw >> (2 * j)) & 3) << 8)).astype(jnp.int32)
-        code = _lookup(tb, idx)
-        sgn = (sgw >> (8 * j)) & 255
+        code = _lookup(tb, q, j, qhw, 2 * j)
         for k in range(8):
-            lv = (code >> (2 * k)) & 3
-            v = 8 + 17 * lv + (lv >> 1)
-            groups[j // 2][1].append((8 * j + k, _signed(v, sgn, k)))
+            bits = (code & (3 << (2 * k))) * (step >> (2 * k)) + base                    # u << 2k times step >> 2k
+            v = lax.bitcast_convert_type(bits, jnp.float32)
+            groups[j // 2][1].append((8 * j + k, _signed(v, sgw, 8 * j + k)))
     return groups
 
 
 def _decode_iq3_s(b, rows, tb):
     q = rows("qs", 8 * b, 8)
     sub = _sub_iota()
-    sgh = (_rows8(rows("sg", 4 * b, 4), 2) >> ((sub & 1) * 16)) & 0xFFFF   # 16 sign bits of word 8b+s
+    sgh = _rows8(rows("sg", 4 * b, 4), 2) >> ((sub & 1) * 16)              # the 16 sign bits of word 8b+s (low half)
     qhn = (_rows8(rows("qh", b, 1), 8) >> (sub * 4)) & 15                    # 4 high bits of word 8b+s
     scn = (_rows8(rows("sc", b // 2, 1), 8) >> ((4 * (b % 2) + (sub >> 1)) * 4)) & 15
     dw = rows("d", b // 4, 1) >> (16 * ((b // 2) % 2))
@@ -135,12 +169,10 @@ def _decode_iq3_s(b, rows, tb):
     scale = dv * (1.0 + 2.0 * scn.astype(jnp.int32).astype(jnp.float32))
     items = []
     for j in range(4):
-        idx = (((q >> (8 * j)) & 255) | (((qhn >> j) & 1) << 8)).astype(jnp.int32)
-        code = _lookup(tb, idx)
-        sgn = (sgh >> (4 * j)) & 15
+        code = _lookup(tb, q, j, qhn, j)
         for k in range(4):
-            lv = (code >> (3 * k)) & 7
-            items.append((4 * j + k, _signed(2 * lv + 1, sgn, k)))
+            v = ((code >> (4 * k)) & 15 if k else code & 15).astype(jnp.float32)     # 2 lv + 1
+            items.append((4 * j + k, _signed(v, sgh, 4 * j + k)))
     return [(scale, items)]
 
 
@@ -235,12 +267,54 @@ def _pick_rows(block, off, r0, n):
 
 
 # ------------------------------------------------------------------------------------------------------- the kernel
+def _table_rows(tbl_ref, qtype):
+    """The decoders' `tb`: each table row broadcast to all sublanes (IQ4_XS: its one 16-entry row)."""
+    n = 1 if qtype == "IQ4_XS" else tbl_ref.shape[0]
+    return [jnp.broadcast_to(tbl_ref[r:r + 1, :], (SUB, LANES)) for r in range(n)]
+
+
+def _fill_bx(x_ref, bx_ref, nb, C):
+    """bx[b*C + c] = X[8b:8b+8, c] broadcast along lanes, once per expert slot (instead of once per weight vreg)."""
+    for b in range(nb):
+        xb = x_ref[SUB * b:SUB * (b + 1), :]
+        for c in range(C):
+            bx_ref[b * C + c] = jnp.broadcast_to(xb[:, c:c + 1], (SUB, LANES))
+
+
+def _matvec_lanes(decode, rows, tb, bx_ref, nb, C):
+    """sum_n W[r, n] x[n] for the 128 rows of one lane vreg -> (1, 128) f32."""
+    out = jnp.zeros((SUB, LANES), jnp.float32)
+    for b in range(nb):
+        for scale, items in decode(b, rows, tb):
+            acc = jnp.zeros((SUB, LANES), jnp.float32)
+            for c, val in items:
+                acc = acc + val * bx_ref[b * C + c]
+            out = out + acc * scale
+    return jnp.sum(out, axis=0, keepdims=True)
+
+
+def _rows_fn(prefs, offs, lanes):
+    """rows(plane, r0, n) of the current expert at `lanes` (planes with < 8 rows per expert: picked from their 8-row
+    block with selects on the scalar-prefetched offset)."""
+    def rows(k, r0, n):
+        if offs[k] is None:
+            return prefs[k][r0:r0 + n, lanes]
+        return _pick_rows(prefs[k][0:SUB, lanes], offs[k], r0, n)
+    return rows
+
+
+def _offsets(keys, rows_p, e):
+    return {k: (lax.rem(e * rows_p[k], SUB) if rows_p[k] % SUB else None) for k in keys}
+
+
 def moe_matvec(planes, qtype, nblk, idx, X, *, interpret=False, lane_block=None):
     """planes: {k: u32 [E*rows_p, R] or [1, E*rows_p, R]}; idx int32 [Nk]; X f32 [Nk, W, C] -> f32 [Nk, R].
 
-    Grid = (expert slot, lane block of `lane_block` matrix rows); every ref access uses static indices (Mosaic rejects
-    dynamic sublane/lane offsets that are not provably tile aligned): planes with fewer than 8 rows per expert are
-    fetched as their 8-row block and the expert's rows are picked with selects on the scalar-prefetched offset."""
+    Grid = (expert slot, lane block of `lane_block` matrix rows, default all rows up to 4096: one grid step per slot,
+    every lane vreg unrolled; 2026-10-03 on the v6e the down matrix took 2.99 us per expert this way vs 3.35 with two
+    steps and 6.0 with a fori_loop over the lane vregs); every ref access uses static indices (Mosaic rejects dynamic
+    sublane/lane offsets that are not provably tile aligned): planes with fewer than 8 rows per expert are fetched as
+    their 8-row block and the expert's rows are picked with selects on the scalar-prefetched offset."""
     keys = PL.PLANE_KEYS[qtype]
     rows_p = PL.plane_rows(qtype, nblk)
     W = PL.WORDS_PER_BLOCK[qtype] * nblk
@@ -251,42 +325,24 @@ def moe_matvec(planes, qtype, nblk, idx, X, *, interpret=False, lane_block=None)
     Nk = idx.shape[0]
     assert X.shape == (Nk, W, C), (X.shape, (Nk, W, C))
     assert R % LANES == 0 and W % SUB == 0, (R, W)
-    LB = lane_block or min(R, 1024)
+    LB = lane_block or min(R, 4096)
     assert R % LB == 0 and LB % LANES == 0, (R, LB)
     n_lb = R // LB
     n_vreg = LB // LANES
+    nb = W // SUB
     tbl = _table_arrays(qtype)
-    n_tbl = tbl.shape[0]
     blocks = {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys}
     decode = DECODE[qtype]
 
     def kernel(idx_ref, *refs):
         plane_refs = dict(zip(keys, refs[:len(keys)]))
-        tbl_ref, x_ref, o_ref = refs[len(keys):]
-        i = pl.program_id(0)
-        e = idx_ref[i]
-        offs = {k: (lax.rem(e * rows_p[k], SUB) if rows_p[k] % SUB else None) for k in keys}
-        if qtype == "IQ4_XS":
-            tb = [jnp.broadcast_to(tbl_ref[0:1, :], (SUB, LANES))]
-        else:
-            tb = [jnp.broadcast_to(tbl_ref[r:r + 1, :], (SUB, LANES)) for r in range(n_tbl)]
+        tbl_ref, x_ref, o_ref, bx_ref = refs[len(keys):]
+        offs = _offsets(keys, rows_p, idx_ref[pl.program_id(0)])
+        tb = _table_rows(tbl_ref, qtype)
+        pl.when(pl.program_id(1) == 0)(lambda: _fill_bx(x_ref, bx_ref, nb, C))
         for v in range(n_vreg):
             lanes = slice(v * LANES, (v + 1) * LANES)
-
-            def rows(k, r0, n, lanes=lanes):
-                if offs[k] is None:
-                    return plane_refs[k][r0:r0 + n, lanes]
-                return _pick_rows(plane_refs[k][0:SUB, lanes], offs[k], r0, n)
-
-            out = jnp.zeros((SUB, LANES), jnp.float32)
-            for b in range(W // SUB):
-                xb = x_ref[SUB * b:SUB * (b + 1), :]                                    # (8, C)
-                for scale, items in decode(b, rows, tb):
-                    acc = jnp.zeros((SUB, LANES), jnp.float32)
-                    for c, val in items:
-                        acc = acc + val * jnp.broadcast_to(xb[:, c:c + 1], (SUB, LANES))
-                    out = out + acc * scale
-            o_ref[:, lanes] = jnp.sum(out, axis=0, keepdims=True)
+            o_ref[:, lanes] = _matvec_lanes(decode, _rows_fn(plane_refs, offs, lanes), tb, bx_ref, nb, C)
 
     def plane_spec(k):
         B = blocks[k]
@@ -299,12 +355,65 @@ def moe_matvec(planes, qtype, nblk, idx, X, *, interpret=False, lane_block=None)
                  pl.BlockSpec((None, W, C), lambda i, cb, idx_ref: (i, 0, 0))]
     out_spec = pl.BlockSpec((None, 1, LB), lambda i, cb, idx_ref: (i, 0, cb))
     grid_spec = pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=1, grid=(Nk, n_lb), in_specs=in_specs,
-                                             out_specs=out_spec)
+                                             out_specs=out_spec,
+                                             scratch_shapes=[pltpu.VMEM((nb * C, SUB, LANES), jnp.float32)])
     fn = pl.pallas_call(kernel, grid_spec=grid_spec, out_shape=jax.ShapeDtypeStruct((Nk, 1, R), jnp.float32),
                         interpret=interpret,
                         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary", "arbitrary")))
     args = [planes[k] for k in keys] + [tbl, X]
     return fn(idx, *args).reshape(Nk, R)
+
+
+def moe_matvec_gu(planes_g, planes_u, qtype, nblk, idx, X, *, interpret=False):
+    """gate and up of the same expert slots in ONE kernel: planes_{g,u} as in `moe_matvec` (same qtype and shape,
+    R <= 1024 rows: all lane vregs unrolled), X f32 [Nk, W, C] (shared) -> (g, u) f32 [Nk, R] each.
+    One grid step per slot; the lane broadcasts of X are made once and serve both matrices (2026-10-03 on the v6e:
+    5.47 us per expert for gate + up vs 2 x 3.43 as two hoisted kernels and 2 x 4.75 shipped)."""
+    keys = PL.PLANE_KEYS[qtype]
+    rows_p = PL.plane_rows(qtype, nblk)
+    W = PL.WORDS_PER_BLOCK[qtype] * nblk
+    C = PL.PLANES_PER_WORD[qtype]
+    first = planes_g[keys[0]]
+    lead = first.ndim == 3
+    R = first.shape[-1]
+    Nk = idx.shape[0]
+    assert X.shape == (Nk, W, C), (X.shape, (Nk, W, C))
+    assert R % LANES == 0 and R <= 1024 and W % SUB == 0, (R, W)
+    assert all(planes_u[k].shape == planes_g[k].shape for k in keys)
+    n_vreg = R // LANES
+    nb = W // SUB
+    nk = len(keys)
+    tbl = _table_arrays(qtype)
+    blocks = {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys}
+    decode = DECODE[qtype]
+
+    def kernel(idx_ref, *refs):
+        g_refs, u_refs = dict(zip(keys, refs[:nk])), dict(zip(keys, refs[nk:2 * nk]))
+        tbl_ref, x_ref, o_ref, bx_ref = refs[2 * nk:]
+        offs = _offsets(keys, rows_p, idx_ref[pl.program_id(0)])
+        tb = _table_rows(tbl_ref, qtype)
+        _fill_bx(x_ref, bx_ref, nb, C)
+        for m, prefs in enumerate((g_refs, u_refs)):
+            for v in range(n_vreg):
+                lanes = slice(v * LANES, (v + 1) * LANES)
+                o_ref[m:m + 1, lanes] = _matvec_lanes(decode, _rows_fn(prefs, offs, lanes), tb, bx_ref, nb, C)
+
+    def plane_spec(k):
+        B = blocks[k]
+        if lead:
+            return pl.BlockSpec((None, B, R), lambda i, idx_ref: (0, (idx_ref[i] * rows_p[k]) // B, 0))
+        return pl.BlockSpec((B, R), lambda i, idx_ref: ((idx_ref[i] * rows_p[k]) // B, 0))
+
+    in_specs = [plane_spec(k) for k in keys] * 2
+    in_specs += [pl.BlockSpec(tbl.shape, lambda i, idx_ref: (0, 0)),
+                 pl.BlockSpec((None, W, C), lambda i, idx_ref: (i, 0, 0))]
+    grid_spec = pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=1, grid=(Nk,), in_specs=in_specs,
+                                             out_specs=pl.BlockSpec((None, 2, R), lambda i, idx_ref: (i, 0, 0)),
+                                             scratch_shapes=[pltpu.VMEM((nb * C, SUB, LANES), jnp.float32)])
+    fn = pl.pallas_call(kernel, grid_spec=grid_spec, out_shape=jax.ShapeDtypeStruct((Nk, 2, R), jnp.float32),
+                        interpret=interpret, compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)))
+    out = fn(idx, *[planes_g[k] for k in keys], *[planes_u[k] for k in keys], tbl, X)
+    return out[:, 0], out[:, 1]
 
 
 def moe_matvec_ref(planes, qtype, nblk, idx, X):
@@ -396,14 +505,13 @@ def moe_sweep_gateup(planes_g, planes_u, qtype, nblk, ids, n_active, xk, limit, 
     first = planes_g[keys[0]]
     lead = first.ndim == 3
     R = first.shape[-1]
-    LB = lane_block or min(R, 1024)
+    LB = min(lane_block or 1024, R)
     TB = min(T, t_block)
     assert T % TB == 0 and R % LB == 0
     n_lb, n_vreg, n_tb = R // LB, LB // LANES, T // TB
     nbg = _k_group(qtype)
     K = nbg * C * SUB
     tbl = _table_arrays(qtype)
-    n_tbl = tbl.shape[0]
     blocks = {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys}
     decode = DECODE[qtype]
     nk = len(keys)
@@ -415,10 +523,7 @@ def moe_sweep_gateup(planes_g, planes_u, qtype, nblk, ids, n_active, xk, limit, 
         e = pl.program_id(1)
         eid = ids_ref[e]
         offs = {k: (lax.rem(eid * rows_p[k], SUB) if rows_p[k] % SUB else None) for k in keys}
-        if qtype == "IQ4_XS":
-            tb = [jnp.broadcast_to(tbl_ref[0:1, :], (SUB, LANES))]
-        else:
-            tb = [jnp.broadcast_to(tbl_ref[r:r + 1, :], (SUB, LANES)) for r in range(n_tbl)]
+        tb = _table_rows(tbl_ref, qtype)
 
         @pl.when(e >= nact_ref[0])
         def _inactive():
@@ -489,14 +594,13 @@ def moe_sweep_down(planes, qtype, nblk, ids, n_active, hk, *, interpret=False, l
     first = planes[keys[0]]
     lead = first.ndim == 3
     R = first.shape[-1]
-    LB = lane_block or min(R, 1024)
+    LB = min(lane_block or 1024, R)
     TB = min(T, t_block)
     assert T % TB == 0 and R % LB == 0
     n_lb, n_vreg, n_tb = R // LB, LB // LANES, T // TB
     nbg = _k_group(qtype)
     K = nbg * C * SUB
     tbl = _table_arrays(qtype)
-    n_tbl = tbl.shape[0]
     blocks = {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys}
     decode = DECODE[qtype]
     nk = len(keys)
@@ -507,10 +611,7 @@ def moe_sweep_down(planes, qtype, nblk, ids, n_active, hk, *, interpret=False, l
         e = pl.program_id(2)
         eid = ids_ref[e]
         offs = {k: (lax.rem(eid * rows_p[k], SUB) if rows_p[k] % SUB else None) for k in keys}
-        if qtype == "IQ4_XS":
-            tb = [jnp.broadcast_to(tbl_ref[0:1, :], (SUB, LANES))]
-        else:
-            tb = [jnp.broadcast_to(tbl_ref[r:r + 1, :], (SUB, LANES)) for r in range(n_tbl)]
+        tb = _table_rows(tbl_ref, qtype)
 
         @pl.when(e == 0)
         def _init():
@@ -563,12 +664,14 @@ def moe_sweep_down(planes, qtype, nblk, ids, n_active, hk, *, interpret=False, l
 # block's expert changes; the dequantized W^T tiles stay in VMEM scratch) and multiply only that expert's rows.
 def ragged_plan(idx, w, E, tm):
     """Slot layout for the grouped kernels. idx int32 [T, k], w f32 [T, k] -> dict with
-    blk_expert int32 [G] (expert of row block g; G = T*k//tm + E blocks of `tm` rows, blocks >= n_blocks are padding
-    and repeat the last expert), n_blocks int32 [1], tok_row int32 [Rp] (token of every sorted row, -1 = padding),
-    w_row f32 [Rp] (its routing weight), row_slot int32 [T, k] (the row of every (token, slot))."""
+    blk_expert int32 [G] (expert of row block g; G = ceil(T*k / tm) + min(E, T*k) blocks of `tm` rows — every routed
+    expert needs ceil(count / tm) <= count / tm + 1 blocks, and at most min(E, T*k) experts are routed — blocks >=
+    n_blocks are padding and repeat the last expert), n_blocks int32 [1], tok_row int32 [Rp] (token of every sorted
+    row, -1 = padding), w_row f32 [Rp] (its routing weight), row_slot int32 [T, k] (the row of every (token, slot)).
+    (A verify of 8 tokens: 2 + 64 blocks instead of 2 + 288 — each padding block is a grid step.)"""
     T, k = idx.shape
     S = T * k
-    G = -(-S // tm) + E
+    G = -(-S // tm) + min(E, S)
     Rp = G * tm
     flat = idx.reshape(-1).astype(jnp.int32)
     order = jnp.argsort(flat)
@@ -634,13 +737,12 @@ def moe_ragged_gateup(planes_g, planes_u, qtype, nblk, blk_expert, n_blocks, xs,
     G = Rp // tm
     assert blk_expert.shape == (G,), (blk_expert.shape, G)
     R = planes_g[keys[0]].shape[-1]
-    LB = lane_block or min(R, 1024)
+    LB = min(lane_block or 1024, R)
     assert R % LB == 0
     n_vreg = LB // LANES
     nbg = _k_group(qtype)
     K = nbg * C * SUB
     tbl = _table_arrays(qtype)
-    n_tbl = tbl.shape[0]
     blocks = {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys}
     decode = DECODE[qtype]
     nk = len(keys)
@@ -653,10 +755,7 @@ def moe_ragged_gateup(planes_g, planes_u, qtype, nblk, blk_expert, n_blocks, xs,
         eid = be_ref[g]
         prev = be_ref[jnp.maximum(g - 1, 0)]
         offs = {k: (lax.rem(eid * rows_p[k], SUB) if rows_p[k] % SUB else None) for k in keys}
-        if qtype == "IQ4_XS":
-            tb = [jnp.broadcast_to(tbl_ref[0:1, :], (SUB, LANES))]
-        else:
-            tb = [jnp.broadcast_to(tbl_ref[r:r + 1, :], (SUB, LANES)) for r in range(n_tbl)]
+        tb = _table_rows(tbl_ref, qtype)
 
         @pl.when((g == 0) | (eid != prev))
         def _decode():                                     # this expert's W^T tiles for the lane block, once
@@ -705,13 +804,12 @@ def moe_ragged_down(planes, qtype, nblk, blk_expert, n_blocks, hs, *, tm=32, int
     G = Rp // tm
     assert blk_expert.shape == (G,), (blk_expert.shape, G)
     R = planes[keys[0]].shape[-1]
-    LB = lane_block or min(R, 1024)
+    LB = min(lane_block or 1024, R)
     assert R % LB == 0
     n_vreg = LB // LANES
     nbg = _k_group(qtype)
     K = nbg * C * SUB
     tbl = _table_arrays(qtype)
-    n_tbl = tbl.shape[0]
     blocks = {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys}
     decode = DECODE[qtype]
     nk = len(keys)
@@ -723,10 +821,7 @@ def moe_ragged_down(planes, qtype, nblk, blk_expert, n_blocks, hs, *, tm=32, int
         eid = be_ref[g]
         prev = be_ref[jnp.maximum(g - 1, 0)]
         offs = {k: (lax.rem(eid * rows_p[k], SUB) if rows_p[k] % SUB else None) for k in keys}
-        if qtype == "IQ4_XS":
-            tb = [jnp.broadcast_to(tbl_ref[0:1, :], (SUB, LANES))]
-        else:
-            tb = [jnp.broadcast_to(tbl_ref[r:r + 1, :], (SUB, LANES)) for r in range(n_tbl)]
+        tb = _table_rows(tbl_ref, qtype)
 
         @pl.when((g == 0) | (eid != prev))
         def _decode():

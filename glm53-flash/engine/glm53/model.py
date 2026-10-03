@@ -73,6 +73,7 @@ class Cfg:
     seq_shard: int = 1                # MLA/indexer caches sharded over this many chips (interleaved by k-pool)
     q_block: int = 128                # queries per attention block (bounds the per-query temporaries)
     union_pools: int = 512            # per-block key-dedup budget (local pools); over budget -> per-query gathers; 0 = always per-query
+    per_query_max: int = 4            # query blocks of up to this many queries skip the dedup (decode, short verifies)
     topk_local: int = 128             # first-stage local top-k per chip (exact: falls back to the full K when a chip's list was cut short)
     cache_cap: int = 0                # set inside mla_attention: global cache capacity
     cache_q8: bool = False            # MLA latent cache stored as int8 rows + a per-token f32 scale ("cs"): half the HBM
@@ -719,7 +720,7 @@ def mla_core(p, proj, cfg: Cfg, cache=None, pos0=0, sparse=None, cap=None, lengt
             sc = jax.nn.relu(jnp.einsum("bthd,bpd->bthp", qi_b, pool_keys) * (ihd ** -0.5))
             sc = jnp.einsum("bth,bthp->btp", wts_b, sc)                             # [B,Tq,P_local]
             pools, pvalid = indexer_select(sc, pool_valid, qpos_b, cfg, chip)      # [B,Tq,K] global pools
-            if qpos_b.shape[0] <= 4 or cfg.union_pools == 0:                       # decode / spec verify / dedup off
+            if qpos_b.shape[0] <= cfg.per_query_max or cfg.union_pools == 0:       # decode / spec verify / dedup off
                 return per_query_attend(q_lat_b, pools, pvalid, qpos_b)             # (no union bookkeeping, no conds)
             member, upool, count, U = union_pools(pools, pvalid, qpos_b, cfg, chip)
             over = count > U
@@ -845,7 +846,7 @@ def moe_dense(p, x, cfg: Cfg, fetch=None, layer=0):
     xf = x.reshape(-1, D)
     idx, w = moe_route(p, xf, cfg)
     if fetch is not None and hasattr(fetch, "apply"):      # resident quantized experts (glm53.resident)
-        y = fetch.apply(p, xf, idx, w, layer, cfg.swiglu_limit).astype(xf.dtype)
+        y = fetch.apply(p, xf, idx, w, layer, cfg.swiglu_limit, seq_tokens=T).astype(xf.dtype)
     else:
         if fetch is None:
             gu_w, dn_w = p["gate_up"][idx], p["down"][idx]

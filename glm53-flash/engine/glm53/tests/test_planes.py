@@ -90,7 +90,8 @@ def test_pm_permutations(qt, n):
 
 @pytest.mark.parametrize("qt,R,nblk,lead", [("IQ2_S", 256, 4, True), ("IQ3_S", 256, 2, False), ("IQ3_S", 512, 1, True),
                                              ("Q2_K", 256, 2, True), ("Q3_K", 256, 1, False),
-                                             ("IQ4_XS", 512, 1, True), ("IQ2_S", 128, 1, True)])
+                                             ("IQ4_XS", 512, 1, True), ("IQ2_S", 128, 1, True),
+                                             ("IQ3_S", 2048, 1, True), ("IQ3_S", 8192, 1, True)])
 def test_kernel_interpret_matches_dense(qt, R, nblk, lead):
     rng = np.random.default_rng(1)
     E, Nk = 6, 5
@@ -106,6 +107,41 @@ def test_kernel_interpret_matches_dense(qt, R, nblk, lead):
     np.testing.assert_allclose(ref, want, rtol=1e-4, atol=1e-4)
     out = np.asarray(K.moe_matvec(planes, qt, nblk, idx, X, interpret=True))
     np.testing.assert_allclose(out, want, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("qt", ["IQ2_S", "IQ3_S"])
+def test_code_table_decodes_grid(qt):
+    """Every grid entry of the pair-packed, pre-encoded `code_table` gives back the grid's values the way the decoders
+    read it (IQ2_S: f32 bits base + u * step from the 2-bit field; IQ3_S: the 4-bit field)."""
+    grid = np.asarray(Q.GRIDS[qt])
+    words = K.code_table(qt).reshape(-1)                                     # int32
+    e = np.arange(grid.shape[0])
+    code = words[e >> 1].astype(np.int64) >> (16 * (e & 1))                 # arithmetic shift, as in _lookup
+    for k in range(grid.shape[1]):
+        if qt == "IQ2_S":
+            base, step = K.IQ2S_F32
+            bits = ((code & (3 << (2 * k))) * (step >> (2 * k)) + base).astype(np.uint32)
+            v = bits.view(np.float32)
+        else:
+            v = (code >> (4 * k)) & 15
+        assert np.array_equal(v, grid[:, k]), (qt, k)
+
+
+@pytest.mark.parametrize("qt,R,nblk,lead", [("IQ2_S", 256, 2, True), ("IQ3_S", 128, 2, False)])
+def test_gateup_kernel_interpret_matches_dense(qt, R, nblk, lead):
+    rng = np.random.default_rng(6)
+    E, Nk = 6, 5
+    tg, tu = random_blocks(rng, E, R, nblk, qt), random_blocks(rng, E, R, nblk, qt)
+    pg, _ = as_planes(tg, qt, lead)
+    pu, _ = as_planes(tu, qt, lead)
+    idx = jnp.asarray(rng.integers(0, E, Nk, dtype=np.int32))
+    n_in = nblk * 256
+    x = jnp.asarray(rng.standard_normal((Nk, n_in)).astype(np.float32))
+    g, u = K.moe_matvec_gu(pg, pu, qt, nblk, idx, PL.pm_x(qt, x), interpret=True)
+    for t, out in ((tg, g), (tu, u)):
+        dense = np.asarray(Q.DEQUANT[qt](jnp.asarray(t))).reshape(E, R, n_in)
+        want = np.stack([dense[int(idx[i])] @ np.asarray(x[i]) for i in range(Nk)])
+        np.testing.assert_allclose(np.asarray(out), want, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("qt_gu,nblk_gu", [("IQ2_S", 2), ("IQ3_S", 1)])
