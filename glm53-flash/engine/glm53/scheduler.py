@@ -606,7 +606,8 @@ class Scheduler:
             self._rows_end()
         if s.spec is None:
             return
-        s.caches, s.pos, s.spec = s.spec["caches"], s.spec["pos_h"], None
+        st = self.eng.dflash_settle(s.spec)                            # the last step's rollback was deferred
+        s.caches, s.pos, s.spec = st["caches"], st["pos_h"], None
         self.eng.dflash_end()
         self._members = None
 

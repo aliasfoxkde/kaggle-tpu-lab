@@ -178,7 +178,7 @@ class DeviceSampler:
 def layer_specs(cfg: M.Cfg, i: int, p: dict) -> dict:
     col, row = P(None, AXIS), P(AXIS, None)
     s = {"ln1": R, "ln2": R,
-         "hc_attn": {"fn": R, "base": R, "scale": R}, "hc_ffn": {"fn": R, "base": R, "scale": R}}
+         "hc_attn": {k: R for k in p["hc_attn"]}, "hc_ffn": {k: R for k in p["hc_ffn"]}}   # fn / fnT, base, scale
     if cfg.layer_types[i] == "linear_attention":
         s["attn"] = {"q": col, "k": col, "v": col, "conv_q": row, "conv_k": row, "conv_v": row,
                      "f_a": R, "f_b": col, "dt_bias": P(AXIS), "A_log": P(AXIS), "b": col,
@@ -349,6 +349,9 @@ class Engine:
             params["layers"] = [{**L, "mlp": {**L["mlp"], "gate_up": np.asarray(L["mlp"]["gate_up"]).reshape(
                 cfg.n_exp, cfg.hidden, 2, cfg.moe_inter)}} if cfg.mlp_types[i] == "sparse" and "gate_up" in L["mlp"]
                 else L for i, L in enumerate(params["layers"])]
+        if M.mhc_active():                    # the mHC kernels read the site projections transposed (same bytes)
+            params["layers"] = [{**L, "hc_attn": M.mhc_params(L["hc_attn"]), "hc_ffn": M.mhc_params(L["hc_ffn"])}
+                                for L in params["layers"]]
         self.specs = param_specs(cfg, params)
         from glm53 import quant8 as Q8
         if int8_nonexpert:                    # quantize the big non-expert matrices on the host before device_put

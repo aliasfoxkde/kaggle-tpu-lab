@@ -44,6 +44,9 @@ DEFAULTS = {
                                      # counts live buffers (`min_free_gb`; the old in-use figure fitted two or three)
     "q_block": 32,                   # queries per attention block during prefill
     "cache_q8": True,                # int8 latent cache (a 262k set costs ~0.2 GB/chip instead of 0.3)
+    "mhc_kernel": "bf16",            # the mHC sites of decode / verify steps as Pallas kernels (glm53.pallas_mhc: plain
+                                     # decode -8 %, DFlash 3 streams -4 % on the v6e); "" = XLA's chain (the numerics
+                                     # of the builds before 2026-10-05)
     "bucket_min": 256,               # smallest prefill bucket compiled (short prompts pad to it)
     "min_free_gb": 0.75,             # HBM an admission needs beyond the live buffers: a 262k cache set (0.23 GB/chip), one
                                      # piece's prefill temporaries (~0.22) and the programs of a decode step + a prefill
@@ -70,13 +73,13 @@ DEFAULTS = {
                                      # dataset (config.json + model.safetensors of incoai/GLM-5.3-Flash-DFlash2: CC BY-NC-ND
                                      # 4.0, research only -> attach it yourself); "" = off
     "dflash_int8": True,             # the drafter's big matrices as int8 (159 instead of 295 MB per chip, same acceptance)
-    "dflash_cost": {"4": 14.6},      # ms per DFlash step by block size (v6e-8, 2026-10-04) = the block sizes compiled:
+    "dflash_cost": {"4": 13.6},      # ms per DFlash step by block size (v6e-8, 2026-10-05) = the block sizes compiled:
                                      # {"4": ..., "8": ...} also drafts 8 (2026-10-03: math-like text x1.97 instead of
                                      # x1.64, no gain overall at temperature 1.0; its programs only add warm-up)
     "dflash_prior": {"4": 2.8, "8": 3.3},    # tokens per step a new stream assumes until it has measured its own
-    "dflash_rows": {"2": [22.9, 12.2], "3": [32.5, 14.9]},   # DFlash for B streams at once: {"B": [ms of a B-stream
+    "dflash_rows": {"2": [21.5, 11.7], "3": [30.1, 13.8]},   # DFlash for B streams at once: {"B": [ms of a B-stream
                                      # DFlash step (block = the smallest of dflash_cost), ms of a plain batched step of
-                                     # B]} = the B compiled (v6e-8, 2026-10-04; served at temperature 1.0 x1.2 at 2 and
+                                     # B]} = the B compiled (v6e-8, 2026-10-05; served at temperature 1.0 x1.26 / x1.17 at 2 and
                                      # 3 streams; ~3-6 min of warm-up each); the scheduler picks DFlash or plain per
                                      # step from these and the streams' tokens per step; {} = plain batched steps
     "dflash_draft_temp": 0.7,        # drafts are drawn at this x the request's temperature; the verify accepts them by
@@ -303,6 +306,7 @@ if "eng" not in globals():
         if i % 5 == 0 or i == N_LAYERS - 1:
             log(f"   layer {i + 1}/{N_LAYERS} ({time.time() - ti:.0f}s) | HBM chip0 {hbm()[0]:.2f} GB")
     log(f"   expert tables {hbm_total / 1e9:.1f} GB across {N_DEV} chips; weights read in {(time.time() - t_load) / 60:.1f} min")
+    M.MHC_KERNEL = CFG["mhc_kernel"] or None
     fetch = ResidentFetch(qtypes, tc.hidden_size, tc.moe_intermediate_size // N_DEV, out_dtype=jnp.bfloat16, gather_max_rows=64, chunk=8,
                           use_pallas=True, sweep_mode="ragged", tm=32, combine="matmul")
     eng = ResidentLayerEngine(cfg, params, fetch, max_len=CFG["max_len"], layers_per_program=4, layers_per_program_prefill=1,

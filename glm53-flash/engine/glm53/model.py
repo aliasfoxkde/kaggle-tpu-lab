@@ -22,6 +22,7 @@ import dataclasses
 from typing import Any
 
 import jax
+import numpy as np
 import jax.numpy as jnp
 from jax import lax
 
@@ -138,7 +139,10 @@ def hc_pre(p, streams, cfg: Cfg):
     hc = cfg.hc
     B, T = streams.shape[:2]
     flat = unweighted_rmsnorm_f32(streams.reshape(B, T, -1).astype(jnp.float32), cfg.eps)
-    mix = flat @ p["fn"].astype(jnp.float32)                       # [B,T,(2+hc)*hc]
+    if "fn" in p:
+        mix = flat @ p["fn"].astype(jnp.float32)                   # [B,T,(2+hc)*hc]
+    else:                                                          # stored transposed for the kernels (mhc_params)
+        mix = jnp.einsum("btk,mk->btm", flat, p["fnT"].astype(jnp.float32))
     pre_w, post_w, comb_w = mix[..., :hc], mix[..., hc:2 * hc], mix[..., 2 * hc:]
     base, scale = p["base"].astype(jnp.float32), p["scale"].astype(jnp.float32)
     pre = jax.nn.sigmoid(pre_w * scale[0] + base[:hc]) + cfg.hc_eps
@@ -156,6 +160,16 @@ def hc_pre(p, streams, cfg: Cfg):
         comb = comb / (csum(comb) + cfg.hc_eps)
     collapsed = jnp.einsum("bth,bthd->btd", pre, streams.astype(jnp.float32)).astype(streams.dtype)
     return post, comb, collapsed
+
+
+def mhc_params(p):
+    """An mHC site's params as the kernels read them: fn [hc*D, M] stored transposed, fnT [M, hc*D] (a [., 24] minor
+    dim would be lane-padded in VMEM; the HBM bytes are the same). hc_pre's XLA path reads either."""
+    if "fn" not in p:
+        return p
+    fn = p["fn"]
+    fnT = np.ascontiguousarray(np.asarray(fn).T) if isinstance(fn, np.ndarray) else jnp.transpose(fn)
+    return {"fnT": fnT, **{k: v for k, v in p.items() if k != "fn"}}
 
 
 def hc_post(post, comb, y, residual):
@@ -1035,23 +1049,62 @@ def moe_dense(p, x, cfg: Cfg, fetch=None, layer=0):
 
 
 # ----------------------------------------------------------------------------- layer / model
+MHC_KERNEL = "bf16"        # "bf16" / "f32": the mHC sites of decode and short-verify layer calls (at most
+MHC_MAX_TOKENS = 16        # MHC_MAX_TOKENS = B*T tokens) run as glm53.pallas_mhc kernels with that precision for the
+MHC_INTERPRET = False      # two small contractions, on the TPU (elsewhere only with MHC_INTERPRET); None = XLA's
+                           # chain. Read at trace time. v6e 2026-10-04 (j139, j136b): plain decode B=1 10.47 -> 9.65 ms,
+                           # B=3 15.28 -> 14.14, DFlash 3 streams 30.99 -> 29.68, one-stream DFlash device 14.29 -> 13.56
+
+
+def mhc_active():
+    """Whether the mHC kernels serve decode / short-verify layer calls on this backend."""
+    return bool(MHC_KERNEL) and (MHC_INTERPRET or jax.default_backend() == "tpu")
+
+
+def _mhc(streams):
+    B, T = streams.shape[:2]
+    return MHC_KERNEL if mhc_active() and B * T <= MHC_MAX_TOKENS else None
+
+
 def decoder_layer(p, streams, cfg: Cfg, ltype, mtype, cache=None, pos0=0, use_recurrent=False, fetch=None,
                   sparse="auto", layer=0, cap=None, length=None, hist=False):
-    post, comb, h = hc_pre(p["hc_attn"], streams, cfg)
-    h = rmsnorm(h, p["ln1"], cfg.eps)
+    kern = _mhc(streams)
+    post, comb, h = _site_pre(p["hc_attn"], p["ln1"], streams, cfg, kern)
     if ltype == "linear_attention":
         h, new_cache = kda_attention(p["attn"], h, cfg, cache, use_recurrent, length, hist)
     else:
         h, new_cache = mla_attention(p["attn"], h, cfg, cache, pos0, sparse, cap, length, hist)
-    streams = hc_post(post, comb, h, streams)
-    post, comb, h = hc_pre(p["hc_ffn"], streams, cfg)
-    h = rmsnorm(h, p["ln2"], cfg.eps)
+    streams, post, comb, h = _site_post_pre(post, comb, h, streams, p["hc_ffn"], p["ln2"], cfg, kern)
     if mtype == "sparse":
         h = moe_dense(p["mlp"], h, cfg, fetch, layer)
     else:
         h = mlp(p["mlp"], h, cfg)
-    streams = hc_post(post, comb, h, streams)
-    return streams, new_cache
+    return _site_post(post, comb, h, streams, kern), new_cache
+
+
+def _site_pre(p_hc, ln, streams, cfg: Cfg, kern):
+    """A layer's first mHC site: (post, comb, normed block input). With `kern` (the pallas_mhc path) comb is flat."""
+    if kern:
+        from glm53 import pallas_mhc as PMH
+        return PMH.mhc_pre(streams, p_hc, ln, cfg, kern, MHC_INTERPRET)
+    post, comb, h = hc_pre(p_hc, streams, cfg)
+    return post, comb, rmsnorm(h, ln, cfg.eps)
+
+
+def _site_post_pre(post, comb, y, streams, p_hc, ln, cfg: Cfg, kern):
+    """The middle site: the attention block's residual update, then the MLP block's pre."""
+    if kern:
+        from glm53 import pallas_mhc as PMH
+        return PMH.mhc_post_pre(post, comb, y, streams, p_hc, ln, cfg, kern, MHC_INTERPRET)
+    streams = hc_post(post, comb, y, streams)
+    return (streams,) + _site_pre(p_hc, ln, streams, cfg, None)
+
+
+def _site_post(post, comb, y, streams, kern):
+    if kern:
+        from glm53 import pallas_mhc as PMH
+        return PMH.mhc_post(post, comb, y, streams, MHC_INTERPRET)
+    return hc_post(post, comb, y, streams)
 
 
 def decoder_layer_rows(p, streams, cfg: Cfg, ltype, mtype, caches, pos, fetch=None, sparse="auto", layer=0, cap=None,
@@ -1060,17 +1113,15 @@ def decoder_layer_rows(p, streams, cfg: Cfg, ltype, mtype, caches, pos, fetch=No
     verifies its own T-token block); caches[b] = row b's own cache (batch dim 1), pos[b] its position (traced
     scalar). Attention runs per row on its own cache, everything else (mHC, projections, MoE: T consecutive tokens
     per row) batched over the rows. Returns (streams, [new cache per row], with the *_hist entries when hist)."""
-    post, comb, h = hc_pre(p["hc_attn"], streams, cfg)
-    h = rmsnorm(h, p["ln1"], cfg.eps)
+    kern = _mhc(streams)
+    post, comb, h = _site_pre(p["hc_attn"], p["ln1"], streams, cfg, kern)
     if ltype == "linear_attention":
         h, new = kda_attention_rows(p["attn"], h, cfg, caches, hist)
     else:
         h, new = mla_attention_rows(p["attn"], h, cfg, caches, pos, sparse, cap, hist)
-    streams = hc_post(post, comb, h, streams)
-    post, comb, h = hc_pre(p["hc_ffn"], streams, cfg)
-    h = rmsnorm(h, p["ln2"], cfg.eps)
+    streams, post, comb, h = _site_post_pre(post, comb, h, streams, p["hc_ffn"], p["ln2"], cfg, kern)
     h = moe_dense(p["mlp"], h, cfg, fetch, layer) if mtype == "sparse" else mlp(p["mlp"], h, cfg)
-    return hc_post(post, comb, h, streams), new
+    return _site_post(post, comb, h, streams, kern), new
 
 
 def layer_pre(p, streams, cfg: Cfg, ltype, mtype, cache=None, pos0=0, use_recurrent=False, sparse="auto", cap=None,

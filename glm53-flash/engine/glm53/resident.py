@@ -394,12 +394,16 @@ class ResidentLayerEngine(Engine):
                 lay.setdefault(k, []).append(j)
         return {k: tuple(v) for k, v in sorted(lay.items())}
 
-    def _prog_group(self, layers, B, T, has_cache, use_recurrent, hist=False, capture=()):
+    def _prog_group(self, layers, B, T, has_cache, use_recurrent, hist=False, capture=(), pend=None):
         """capture = positions j in the group whose output's stream mean is returned as a last output, stacked
         [len(capture), B, T, D] (DFlash features); hist=True returns the per-token histories stacked per key
-        (`_hist_layout`)."""
+        (`_hist_layout`). pend = T of the previous verify whose rollback is still pending (`dflash_step`): the program
+        then also takes that verify's histories of this group (DONATED: this verify's histories reuse their buffers)
+        and its n_keep, and first rolls the small state entries of its layers back to the accepted prefix (the
+        rollback program's own op, `M.rollback_states`), so no separate rollback program runs between the steps."""
         kinds = tuple(self._kind(i) for i in layers)
-        key = ("group", kinds, B, T, has_cache, use_recurrent, hist) + ((capture,) if capture else ())
+        key = ("group", kinds, B, T, has_cache, use_recurrent, hist) + ((capture,) if capture else ()) + \
+            ((("pend", pend),) if pend else ())
         if key not in self._progs:
             lts = [self.cfg.layer_types[i] for i in layers]
             mts = [self.cfg.mlp_types[i] for i in layers]
@@ -410,8 +414,14 @@ class ResidentLayerEngine(Engine):
 
             from glm53 import quant8 as Q8
 
-            def prog(ps, streams, pos0, length, caches):
+            def prog(ps, streams, pos0, length, caches, hg=None, nk=None):
                 new, hs, feats = [], [], []
+                if pend:
+                    caches = list(caches)
+                    roll = M.rollback_states([{k: hg[k][js.index(j)] for k, js in lay.items() if j in js} or None
+                                              for j in range(len(ps))], nk,
+                                             [{k_: c[k_].dtype for k_ in c} for c in caches])
+                    caches = [c if r_ is None else {**c, **r_} for c, r_ in zip(caches, roll)]
                 for j, p in enumerate(ps):
                     p = Q8.dequant_tree(p, self.lcfg.dtype)          # int8 non-expert matrices -> bf16 (fused into dots)
                     fetch = self.expert_fetch if mts[j] == "sparse" else None
@@ -427,10 +437,11 @@ class ResidentLayerEngine(Engine):
                 if hist:
                     out += ({k: jnp.stack([hs[j][k] for j in js]) for k, js in lay.items()},)
                 return out + ((jnp.stack(feats),) if capture else ())
-            in_specs = ([self.specs["layers"][i] for i in layers], R, R, R, css if has_cache else None)
+            in_specs = ([self.specs["layers"][i] for i in layers], R, R, R, css if has_cache else None) + \
+                ((hss, R) if pend else ())
             out_specs = (R, css) + ((hss,) if hist else ()) + ((R,) if capture else ())
             sm = shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
-            self._progs[key] = jax.jit(sm, donate_argnums=(4,) if has_cache else ())
+            self._progs[key] = jax.jit(sm, donate_argnums=((4,) if has_cache else ()) + ((5,) if pend else ()))
         return self._progs[key]
 
     def _stream_mean(self, streams):
@@ -1052,22 +1063,24 @@ class ResidentLayerEngine(Engine):
             self._progs[key] = jax.jit(sm, donate_argnums=(7,))
         return self._progs[key]
 
-    def _verify_layers(self, tokens, caches, pos0, capture=False):
+    def _verify_layers(self, tokens, caches, pos0, capture=False, pend=None):
         """embed + the decode layer groups of a recurrent T-token step with per-token histories -> (final streams,
         caches, histories (per group, stacked per key: `_prog_rollback` takes them), DFlash features when capture: (the
         stacked stream means [len(g), B, T, D] of the groups holding drafter target layers, the target positions in
-        each) — the drafter's programs take that pair (`dflash.Drafter.draft(feat_index=...)`))."""
+        each) — the drafter's programs take that pair (`dflash.Drafter.draft(feat_index=...)`)). pend = (histories
+        per group, n_keep, T) of the previous verify whose rollback the groups apply first (`dflash_step`)."""
         B, T = tokens.shape
         streams = self._prog_embed(B, T)(self.params["embed"], jnp.asarray(tokens))
         new, hists, feats, fidx = [], [], [], []
         pos0, length = self.scalar(pos0), self.scalar(T)
         tl = self.dflash.cfg.target_layers if capture else ()
-        for g in self.groups["decode"]:
+        for gi, g in enumerate(self.groups["decode"]):
             # with capture, every group program returns the stream mean after EACH of its layers: groups with the same
             # layer kinds then share one program whichever layer they capture (5 verify programs per T instead of 9)
             every = tuple(range(len(g))) if capture else ()
-            prog = self._prog_group(g, B, T, True, True, hist=True, capture=every)
-            out = prog([self.params["layers"][i] for i in g], streams, pos0, length, [caches[i] for i in g])
+            prog = self._prog_group(g, B, T, True, True, hist=True, capture=every, pend=pend[2] if pend else None)
+            out = prog([self.params["layers"][i] for i in g], streams, pos0, length, [caches[i] for i in g],
+                       *((pend[0][gi], pend[1]) if pend else ()))
             streams, ncs, hs = out[:3]
             new.extend(ncs); hists.append(hs)
             js = tuple(j for j, i in enumerate(g) if i in tl)
@@ -1246,15 +1259,16 @@ class ResidentLayerEngine(Engine):
         if draft_override is not None:
             seq = jnp.concatenate([seq[:, :1], jnp.asarray(np.asarray(draft_override, np.int32).reshape(B, T - 1))], 1)
         caches = st["caches"]
-        streams, new, hists, feats = self._verify_layers(seq, caches[:n], st["pos"], capture=True)
-        del grave                                        # released while the device runs the verify
+        pend = st.get("pend") or self._pend_identity(caches[:n], T)
+        streams, new, hists, feats = self._verify_layers(seq, caches[:n], st["pos"], capture=True, pend=pend)
+        del grave, pend                                  # released while the device runs the verify
         temp, top_p, k = sampler.bind(self.mesh)
         r = self._prog_head_accept(B, T, tuple(stop_ids))(self.params["norm"], self.params["lm_head"], streams, seq,
                                                           st["cand"], st["q"], st["pos"], temp, top_p, k)
         sampler.advance(r["key"])
-        pre = new
-        rolled = self._prog_rollback(B, T)(hists, r["n_keep"], self._hist_cur(new))
-        new = [({**c, **x} if x else c) for c, x in zip(new, rolled)]
+        # the rollback of this verify to its accepted prefix is deferred: the next step's group programs apply it
+        # first (or `dflash_settle`, when the stream leaves DFlash): no rollback program, its ~90 outputs and their
+        # release between the steps (the one-stream step was host-bound, j141 2026-10-04)
         next_T = T if next_T is None else next_T
         nseq, cand, q, ring = self._dflash_draft(caches[n], feats, r["pos_b"], r["n_new_b"], r["bonus"], next_T, temp,
                                                  r["key"])
@@ -1262,9 +1276,40 @@ class ResidentLayerEngine(Engine):
         # Dropping a jax array costs ~11-20 us of host time on the 8-chip mesh (j107) and a step leaves ~300 behind (the
         # consumed caches, the pre-rollback states, histories, ...): keep them until the next step has dispatched its
         # verify, so the release happens while the device works instead of between the steps (`dflash_end` frees them).
-        self._grave = (st, pre, hists, feats, streams, r, rolled)
-        return emitted, {"caches": new + [ring], "pos": r["pos_next"], "pos_h": st["pos_h"] + len(emitted),
-                         "seq": nseq, "cand": cand, "q": q, "T": next_T}
+        self._grave = (st, feats, streams, r)
+        return emitted, {"caches": new + [ring], "pend": (hists, r["n_keep"], T), "pos": r["pos_next"],
+                         "pos_h": st["pos_h"] + len(emitted), "seq": nseq, "cand": cand, "q": q, "T": next_T}
+
+    def _pend_identity(self, caches, T):
+        """A pending rollback that changes nothing (the first step of a DFlash run): every history entry = the
+        current state, n_keep = T; the same group programs then serve every step."""
+        key = ("pend_identity", T)
+        if key not in self._progs:
+            groups = self.groups["decode"]
+            lays = [self._hist_layout(g) for g in groups]
+            hgs = [{k: P(None, *self._hist_spec(g[js[0]])[k]) for k, js in lay.items()} for g, lay in zip(groups, lays)]
+            cur_specs = [None if h is None else {M.HIST_KEYS[k]: P(*v[1:]) for k, v in h.items()}
+                         for h in (self._hist_spec(i) for i in range(self.cfg.n_layers))]
+
+            def prog(cur):
+                return [{k: jnp.stack([jnp.broadcast_to(cur[g[j]][M.HIST_KEYS[k]][None],
+                                                        (T,) + cur[g[j]][M.HIST_KEYS[k]].shape) for j in js])
+                         for k, js in lay.items()} for g, lay in zip(groups, lays)]
+            self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=(cur_specs,), out_specs=hgs,
+                                                 check_vma=False))
+        return self._progs[key](self._hist_cur(caches)), self.scalar(T), T
+
+    def dflash_settle(self, st):
+        """The state with its pending rollback applied (call before using st["caches"] outside DFlash steps: a stream
+        leaving DFlash mode, tests). Idempotent."""
+        if not st.get("pend"):
+            return st
+        n = self.cfg.n_layers
+        hists, nk, T = st["pend"]
+        caches = st["caches"]
+        rolled = self._prog_rollback(1, T)(hists, nk, self._hist_cur(caches[:n]))
+        new = [({**c, **x} if x else c) for c, x in zip(caches[:n], rolled)]
+        return {**st, "caches": new + list(caches[n:]), "pend": None}
 
     def dflash_end(self):
         """Release what the last `dflash_step` kept for a deferred release (call when a stream leaves DFlash mode)."""
