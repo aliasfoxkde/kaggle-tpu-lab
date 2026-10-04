@@ -109,6 +109,10 @@ class ResidentFetch:
     verify_tm = 16             # rows per block (a verify has <= T rows per expert; 16 = the bf16 minimum)
     verify_lane_block = 4096   # lane block (the down kernel in one grid step per block: j66 -19 % MoE at T=8)
     verify_max_rows = 256
+    group_min_seq = 0          # >= 2: multi-token steps below ragged_min_seq decode slots that share an expert once
+                               # (`_apply_kernel_grouped`). OFF: bit-identical but slower on the v6e (j115 2026-10-04:
+                               # DFlash step 21.9 vs 17.3 ms at T = 4 — every group pays tm = T token slots of
+                               # activation fill and MACs although most groups hold one or two tokens)
 
     def apply(self, p, x, idx, w, layer, limit, seq_tokens=1):
         """x [N,D]; idx [N,k] int32 into E; w [N,k] fp32 -> partial MoE output [N,D] (TP-reduced by the caller).
@@ -119,6 +123,8 @@ class ResidentFetch:
             return self._apply_ragged_kernel(x, idx, w, layer, gate_q, up_q, down_q, limit, self.verify_dtype,
                                              self.verify_tm, self.verify_lane_block)
         if N * k <= self.gather_max_rows:
+            if self.use_pallas and self.group_min_seq and seq_tokens >= self.group_min_seq and seq_tokens == N:
+                return self._apply_kernel_grouped(x, idx, w, layer, gate_q, up_q, down_q, limit)
             if self.use_pallas:
                 return self._apply_kernel(x, idx, w, layer, gate_q, up_q, down_q, limit)
             return self._apply_gather(x, idx, w, layer, gate_q, up_q, down_q, limit)
@@ -129,12 +135,50 @@ class ResidentFetch:
         flat = idx.reshape(-1)
         qt_gu, qt_dn = self.qtypes[layer]["gate_q"], self.qtypes[layer]["down_q"]
         assert self.qtypes[layer]["up_q"] == qt_gu, self.qtypes[layer]
-        Xg = jnp.repeat(PL.pm_x(qt_gu, x.astype(jnp.float32)), k, axis=0)              # [Nk, W, C]
-        g, u = K.moe_matvec_gu(gate_q, up_q, qt_gu, self.nblk["gate_q"], flat, Xg, interpret=self.interpret)
+        Xt = PL.pm_x(qt_gu, x.astype(jnp.float32))                                      # [N, W, C]: per token
+        g, u = K.moe_matvec_gu(gate_q, up_q, qt_gu, self.nblk["gate_q"], flat, Xt, interpret=self.interpret, k=k)
         h = M.swiglu_clamped(g, u, limit)                                               # [Nk, ml]
         y = K.moe_matvec(down_q, qt_dn, self.nblk["down_q"], flat, PL.pm_x(qt_dn, h),
                          interpret=self.interpret).reshape(N, k, -1)                    # [N, k, D]
         return jnp.einsum("nkd,nk->nd", y, w)
+
+    def _apply_kernel_grouped(self, x, idx, w, layer, gate_q, up_q, down_q, limit):
+        """`_apply_kernel` for the T tokens of ONE sequence (a verify): the T*k slots are grouped by expert (a token's k
+        experts are distinct, so a group holds at most T tokens) and each distinct expert is decoded once for all its
+        tokens (`moe_matvec_gu_multi` / `moe_matvec_multi`; bit-identical to the per-slot kernels). The grouping and the
+        moves between slot and group order are tiny exact one-hot products (no XLA gathers)."""
+        N, k = idx.shape
+        S, f32 = N * k, jnp.float32
+        flat = idx.reshape(-1)
+        qt_gu, qt_dn = self.qtypes[layer]["gate_q"], self.qtypes[layer]["down_q"]
+        eq = flat[:, None] == flat[None, :]
+        earlier = jnp.tril(eq, -1)
+        first = ~jnp.any(earlier, axis=1)                                   # the first slot of each expert
+        gid = jnp.cumsum(first.astype(jnp.int32)) - 1
+        g_of = gid[jnp.argmax(eq, axis=1)]                                  # [S] the group of every slot
+        rank = jnp.sum(earlier, axis=1, dtype=jnp.int32)                    # [S] its place in the group
+        n_groups = jnp.sum(first, dtype=jnp.int32)
+        G, tm = S, N
+        cell = g_of * tm + rank                                             # [S] (group, rank) cell, distinct
+        to_cell = (cell[:, None] == jnp.arange(G * tm)[None, :]).astype(f32)   # [S, G*tm] one-hot
+        eids = jnp.sum(jnp.where(g_of[:, None] == jnp.arange(G)[None, :], flat[:, None], 0) * first[:, None], 0)
+        eids = jnp.where(jnp.arange(G) < n_groups, eids, jnp.take(eids, jnp.maximum(n_groups - 1, 0)))
+        hi = lax.Precision.HIGHEST                                          # one-hot products: exact in f32
+
+        def to_groups(a):                                                   # [S, ...] -> [G, tm, ...] (empty cells 0)
+            return jnp.einsum("sc,s...->c...", to_cell, a, precision=hi).reshape((G, tm) + a.shape[1:])
+
+        live = (jnp.arange(G) < n_groups)[:, None, None]                    # (skipped groups' rows are never written)
+
+        def to_slots(a):                                                    # [G, tm, R] -> [S, R]
+            return jnp.einsum("sc,cr->sr", to_cell, jnp.where(live, a, 0.0).reshape(G * tm, -1), precision=hi)
+        Xs = jnp.repeat(PL.pm_x(qt_gu, x.astype(f32)), k, axis=0)                     # [S, W, C]
+        g, u = K.moe_matvec_gu_multi(gate_q, up_q, qt_gu, self.nblk["gate_q"], eids, n_groups[None], to_groups(Xs),
+                                     interpret=self.interpret)
+        h = M.swiglu_clamped(to_slots(g), to_slots(u), limit)                           # [S, ml]
+        y = K.moe_matvec_multi(down_q, qt_dn, self.nblk["down_q"], eids, n_groups[None], to_groups(PL.pm_x(qt_dn, h)),
+                               interpret=self.interpret)
+        return jnp.einsum("nkd,nk->nd", to_slots(y).reshape(N, k, -1), w)
 
     def _apply_gather(self, x, idx, w, layer, gate_q, up_q, down_q, limit):
         """XLA decode path on the planar tables (no Pallas): per-expert dynamic slices + dequant + einsum."""
@@ -232,7 +276,7 @@ class ResidentFetch:
 
 
 # ------------------------------------------------------------------------------------- per-layer-kind engine
-from glm53.engine import Engine, AXIS, R, shard_map, cache_specs, device_sample, DeviceSampler   # noqa: E402
+from glm53.engine import Engine, AXIS, R, shard_map, cache_specs, device_sample, device_probs, spec_accept, DeviceSampler   # noqa: E402
 from jax.sharding import NamedSharding, PartitionSpec as P           # noqa: E402
 
 
@@ -330,16 +374,28 @@ class ResidentLayerEngine(Engine):
             return {"tk_hist": R, "tg_hist": R}
         return None
 
+    def _hist_layout(self, layers):
+        """How a group program returns the per-token histories of a verify: {hist key: positions j in the group that
+        have it}, one array stacked over those layers per key (not one per layer: every array a program allocates for
+        its outputs costs ~17.5 us of host time per dispatch on the 8-chip mesh, j101 2026-10-04)."""
+        lay = {}
+        for j, i in enumerate(layers):
+            for k in (self._hist_spec(i) or {}):
+                lay.setdefault(k, []).append(j)
+        return {k: tuple(v) for k, v in sorted(lay.items())}
+
     def _prog_group(self, layers, B, T, has_cache, use_recurrent, hist=False, capture=()):
-        """capture = positions j in the group whose output's stream mean [B,T,D] is returned as a last output (a
-        list; DFlash features of layers in the middle of a group)."""
+        """capture = positions j in the group whose output's stream mean is returned as a last output, stacked
+        [len(capture), B, T, D] (DFlash features); hist=True returns the per-token histories stacked per key
+        (`_hist_layout`)."""
         kinds = tuple(self._kind(i) for i in layers)
         key = ("group", kinds, B, T, has_cache, use_recurrent, hist) + ((capture,) if capture else ())
         if key not in self._progs:
             lts = [self.cfg.layer_types[i] for i in layers]
             mts = [self.cfg.mlp_types[i] for i in layers]
             css = [self._cache_spec(i) for i in layers]
-            hss = [self._hist_spec(i) for i in layers]
+            lay = self._hist_layout(layers)
+            hss = {k: P(None, *self._hist_spec(layers[js[0]])[k]) for k, js in lay.items()}
             rep = list(layers)                     # representative layer ids (only used to look up expert qtypes)
 
             from glm53 import quant8 as Q8
@@ -354,12 +410,15 @@ class ResidentLayerEngine(Engine):
                                                   layer=rep[j], cap=self.max_len, length=None if use_recurrent else length,
                                                   hist=hist)
                     nc, h = M.split_hist(nc)
-                    new.append(nc); hs.append(h if hist else None)
+                    new.append(nc); hs.append(h)
                     if j in capture:
                         feats.append(self._stream_mean(streams))
-                return (streams, new) + ((hs,) if hist else ()) + ((feats,) if capture else ())
+                out = (streams, new)
+                if hist:
+                    out += ({k: jnp.stack([hs[j][k] for j in js]) for k, js in lay.items()},)
+                return out + ((jnp.stack(feats),) if capture else ())
             in_specs = ([self.specs["layers"][i] for i in layers], R, R, R, css if has_cache else None)
-            out_specs = (R, css) + ((hss,) if hist else ()) + (([R] * len(capture),) if capture else ())
+            out_specs = (R, css) + ((hss,) if hist else ()) + ((R,) if capture else ())
             sm = shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
             self._progs[key] = jax.jit(sm, donate_argnums=(4,) if has_cache else ())
         return self._progs[key]
@@ -409,19 +468,38 @@ class ResidentLayerEngine(Engine):
         return self._progs[key]
 
     def _prog_rollback(self, B, T):
-        """per-token histories of a T-token verify + n_keep -> the small state entries (KDA state/conv, pool tails)
-        as after the first n_keep tokens; spliced into the caches by the caller (the big positional arrays are
-        not touched)."""
+        """the per-group stacked histories of a T-token verify (`_verify_layers`) + n_keep + the current small state
+        entries (`_hist_cur`, DONATED: the outputs reuse their buffers, so the dispatch allocates nothing) -> the small
+        state entries (KDA state/conv, pool tails) as after the first n_keep tokens, per layer; spliced into the caches
+        by the caller (the big positional arrays are not touched)."""
         key = ("rollback", B, T)
         if key not in self._progs:
+            groups = self.groups["decode"]
+            lays = [self._hist_layout(g) for g in groups]
+            hgs = [{k: P(None, *self._hist_spec(g[js[0]])[k]) for k, js in lay.items()} for g, lay in zip(groups, lays)]
             hss = [self._hist_spec(i) for i in range(self.cfg.n_layers)]
             oss = [None if h is None else {M.HIST_KEYS[k]: P(*v[1:]) for k, v in h.items()} for h in hss]   # drop the T axis
             dts = [{M.HIST_KEYS[k]: self.cfg.dtype if M.HIST_KEYS[k] != "state" else jnp.float32 for k in h} if h else None
                    for h in hss]
-            sm = shard_map(lambda h, n: M.rollback_states(h, n, dts), mesh=self.mesh, in_specs=(hss, R), out_specs=oss,
-                           check_vma=False)
-            self._progs[key] = jax.jit(sm)
+
+            def prog(hg, n, cur):
+                per = [None] * self.cfg.n_layers
+                for g, lay, h in zip(groups, lays, hg):
+                    for k, js in lay.items():
+                        for s_, j in enumerate(js):
+                            per[g[j]] = {**(per[g[j]] or {}), k: h[k][s_]}
+                return M.rollback_states(per, n, dts)
+            sm = shard_map(prog, mesh=self.mesh, in_specs=(hgs, R, oss), out_specs=oss, check_vma=False)
+            self._progs[key] = jax.jit(sm, donate_argnums=(2,))
         return self._progs[key]
+
+    def _hist_cur(self, caches):
+        """The small state entries of a verify's output caches that `_prog_rollback` replaces (and takes donated)."""
+        out = []
+        for i, c in enumerate(caches[:self.cfg.n_layers]):
+            h = self._hist_spec(i)
+            out.append(None if h is None else {M.HIST_KEYS[k]: c[M.HIST_KEYS[k]] for k in h})
+        return out
 
     mtp = None                       # MTP (NextN) layer params on device, or None (see set_mtp)
     dflash = None                    # DFlash 2 drafter (glm53.dflash.Drafter), or None (see set_dflash)
@@ -584,7 +662,7 @@ class ResidentLayerEngine(Engine):
             streams, ncs = out[:2]
             new_caches.extend(ncs)
             if mid:
-                feats.extend(out[2])
+                feats.extend(out[2][j] for j in range(len(mid)))
             if last:
                 feats.append(self._prog_stream_mean(B, T)(streams))
             self.launches += 1
@@ -608,6 +686,12 @@ class ResidentLayerEngine(Engine):
         passes through."""
         if isinstance(x, jax.Array):
             return x
+        x = int(x)
+        if 0 <= x < 64:                                  # small constants (block sizes, lengths): placed once
+            c = self.__dict__.setdefault("_small_scalars", {})
+            if x not in c:
+                c[x] = jax.device_put(np.int32(x), NamedSharding(self.mesh, P()))
+            return c[x]
         return jax.device_put(np.int32(x), NamedSharding(self.mesh, P()))
 
     def decode_sample(self, token, caches, pos, sampler: DeviceSampler):
@@ -637,11 +721,13 @@ class ResidentLayerEngine(Engine):
                                                  out_specs=(R, R), check_vma=False))
         return self._progs[key]
 
-    def _prog_group_rows(self, layers, B):
+    def _prog_group_rows(self, layers, B, capture=False):
         """Decode step of `layers` for B independent streams: (params, streams [B,1,hc,D], pos [B], caches) with
-        caches[j][b] = layer j's cache of stream b (batch dim 1, donated) -> (streams, new caches[j][b])."""
+        caches[j][b] = layer j's cache of stream b (batch dim 1, donated) -> (streams, new caches[j][b][, the stream
+        means after EACH layer stacked [len(layers), B, 1, D] with capture=True: DFlash features, one program per layer
+        kinds as in the verify])."""
         kinds = tuple(self._kind(i) for i in layers)
-        key = ("group_rows", kinds, B)
+        key = ("group_rows", kinds, B) + (("capture",) if capture else ())
         if key not in self._progs:
             lts = [self.cfg.layer_types[i] for i in layers]
             mts = [self.cfg.mlp_types[i] for i in layers]
@@ -651,17 +737,53 @@ class ResidentLayerEngine(Engine):
 
             def prog(ps, streams, pos, caches):
                 pos_b = [pos[b] for b in range(B)]
-                new = []
+                new, feats = [], []
                 for j, p in enumerate(ps):
                     p = Q8.dequant_tree(p, self.lcfg.dtype)
                     fetch = self.expert_fetch if mts[j] == "sparse" else None
                     streams, ncs = M.decoder_layer_rows(p, streams, self.lcfg, lts[j], mts[j], caches[j], pos_b, fetch,
                                                         "auto", layer=rep[j], cap=self.max_len)
                     new.append(ncs)
-                return streams, new
+                    if capture:
+                        feats.append(streams.astype(jnp.float32).mean(2).astype(self.lcfg.dtype))
+                return (streams, new) + ((jnp.stack(feats),) if capture else ())
             in_specs = ([self.specs["layers"][i] for i in layers], R, R, css)
-            sm = shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=(R, css), check_vma=False)
+            out_specs = (R, css) + ((R,) if capture else ())
+            sm = shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
             self._progs[key] = jax.jit(sm, donate_argnums=(3,))
+        return self._progs[key]
+
+    def _prog_head_ring(self, B, sample, fidx):
+        """`decode_rows`' head with a DFlash drafter installed: the head (`_prog_head(B, 1, sample)`: logits [B,V][, ids,
+        next key]) + every row's drafter ring takes the step's position (its features captured after the drafter's
+        target layers -> the drafter's context K/V, `dflash.ingest`): positions decoded in batched or plain steps are
+        never holes in a stream's ring. (norm, lm_head, streams, drafter params, feats (the stacked stream means of the
+        groups holding target layers, [len(g), B, 1, D]; `fidx` = the target positions in each), rings [B] (each batch
+        1, donated), pos [B][, temperature, top_p, key]) -> (logits, rings) or (ids, logits, key, rings)."""
+        key = ("head_ring", B, sample, fidx)
+        if key not in self._progs:
+            from glm53 import dflash as DF
+            from glm53 import quant8 as Q8
+            dr = self.dflash
+
+            def prog(norm, lm_head, streams, dparams, feats, rings, pos, *samp):
+                h = M.rmsnorm(streams.mean(2).astype(self.lcfg.dtype), norm, self.cfg.eps)[:, 0]
+                zl = self._logits_local(lm_head, h)
+                logits = lax.all_gather(zl, AXIS, axis=-1, tiled=True)
+                dp = Q8.dequant_tree(dparams, dr.cfg.dtype)
+                one = jnp.ones((1,), jnp.int32)
+                fl = [f[j] for f, js in zip(feats, fidx) for j in js]
+                new = [DF.ingest(dp, rings[b], [f[b:b + 1] for f in fl], pos[b:b + 1], one, dr.lcfg) for b in range(B)]
+                if not sample:
+                    return logits, new
+                temp, top_p, k = samp
+                k1, k2 = jax.random.split(k)
+                return device_sample(zl, temp, top_p, k1), logits, k2, new
+            rs = [dict(DF.RING_SPECS)] * B
+            in_specs = (R, self.specs["lm_head"], R, dr.specs, [R] * len(fidx), rs, R) + ((R, R, R) if sample else ())
+            out_specs = (R, R, R, rs) if sample else (R, rs)
+            self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs,
+                                                 check_vma=False), donate_argnums=(5,))
         return self._progs[key]
 
     def device_positions(self, pos):
@@ -674,7 +796,8 @@ class ResidentLayerEngine(Engine):
         `restore_prefix` return them, batch dim 1; consumed), `pos` [B] int32 replicated device array
         (`device_positions`) or host ints. Returns (ids [B] device int32 or None without a sampler, logits [B,V],
         new cache sets, pos + 1 on the device). Streams may sit at any positions; the MoE/mHC/projections run
-        batched, the attention per row. Compiles one program set per B."""
+        batched, the attention per row. Compiles one program set per B. With a DFlash drafter installed (cache sets
+        with its ring) the step also writes every row's position into that stream's ring (`_prog_head_ring`)."""
         B = len(cache_sets)
         n = self.cfg.n_layers
         assert all(len(c) >= n for c in cache_sets), "every stream needs a full cache set"
@@ -683,22 +806,40 @@ class ResidentLayerEngine(Engine):
         if not (isinstance(tokens, jax.Array) and tokens.shape == (B,) and tokens.dtype == jnp.int32):
             tokens = jnp.asarray(np.asarray(tokens, np.int32).reshape(B))   # (a device array from the last step passes through)
         streams, pos_next = self._prog_embed_rows(B)(self.params["embed"], tokens, pos)
+        cap = self.dflash is not None and all(len(c) > n for c in cache_sets)
         new_sets = [[] for _ in range(B)]
+        feats, fidx = [], []
         for g in self.groups["decode"]:
-            prog = self._prog_group_rows(g, B)
-            streams, ncs = prog([self.params["layers"][i] for i in g], streams, pos,
-                                [[cache_sets[b][i] for b in range(B)] for i in g])
+            prog = self._prog_group_rows(g, B, cap)
+            out = prog([self.params["layers"][i] for i in g], streams, pos, [[cache_sets[b][i] for b in range(B)] for i in g])
+            streams, ncs = out[:2]
+            js = tuple(j for j, i in enumerate(g) if i in self.dflash.cfg.target_layers) if cap else ()
+            if js:
+                feats.append(out[2]); fidx.append(js)
             for j in range(len(g)):
                 for b in range(B):
                     new_sets[b].append(ncs[j][b])
             self.launches += 1
+        if getattr(self, "_one", None) is None:
+            self._one = jax.device_put(jnp.int32(1), NamedSharding(self.mesh, P()))
+        if cap:                                              # the drafter's rings take this step's positions
+            args = (self.params["norm"], self.params["lm_head"], streams, self.dflash.params, feats,
+                    [cache_sets[b][n] for b in range(B)], pos)
+            if sampler is None:
+                logits, rings = self._prog_head_ring(B, False, tuple(fidx))(*args)
+                ids = None
+            else:
+                ids, logits, nk, rings = self._prog_head_ring(B, True, tuple(fidx))(*args, *sampler.bind(self.mesh))
+                sampler.advance(nk)
+            for b in range(B):
+                new_sets[b].append(rings[b])
+                new_sets[b].extend(cache_sets[b][n + 1:])
+            return ids, logits, new_sets, pos_next
         for b in range(B):                                   # extra entries (an MTP cache) pass through untouched
             new_sets[b].extend(cache_sets[b][n:])
         if sampler is None:
-            logits = self._prog_head(B, 1)(self.params["norm"], self.params["lm_head"], streams, self.scalar(1))
+            logits = self._prog_head(B, 1)(self.params["norm"], self.params["lm_head"], streams, self._one)
             return None, logits, new_sets, pos_next
-        if getattr(self, "_one", None) is None:
-            self._one = jax.device_put(jnp.int32(1), NamedSharding(self.mesh, P()))
         ids, logits, nk = self._prog_head(B, 1, True)(self.params["norm"], self.params["lm_head"], streams, self._one,
                                                       *sampler.bind(self.mesh))
         sampler.advance(nk)
@@ -811,24 +952,27 @@ class ResidentLayerEngine(Engine):
 
     def _verify_layers(self, tokens, caches, pos0, capture=False):
         """embed + the decode layer groups of a recurrent T-token step with per-token histories -> (final streams,
-        caches, histories, DFlash features: the stream mean after each drafter target layer, [B,T,D] each, when
-        capture)."""
+        caches, histories (per group, stacked per key: `_prog_rollback` takes them), DFlash features when capture: (the
+        stacked stream means [len(g), B, T, D] of the groups holding drafter target layers, the target positions in
+        each) — the drafter's programs take that pair (`dflash.Drafter.draft(feat_index=...)`))."""
         B, T = tokens.shape
         streams = self._prog_embed(B, T)(self.params["embed"], jnp.asarray(tokens))
-        new, hists, feats = [], [], []
+        new, hists, feats, fidx = [], [], [], []
         pos0, length = self.scalar(pos0), self.scalar(T)
+        tl = self.dflash.cfg.target_layers if capture else ()
         for g in self.groups["decode"]:
-            mid, last = self._capture_plan(g, capture)
-            prog = self._prog_group(g, B, T, True, True, hist=True, capture=mid)
+            # with capture, every group program returns the stream mean after EACH of its layers: groups with the same
+            # layer kinds then share one program whichever layer they capture (5 verify programs per T instead of 9)
+            every = tuple(range(len(g))) if capture else ()
+            prog = self._prog_group(g, B, T, True, True, hist=True, capture=every)
             out = prog([self.params["layers"][i] for i in g], streams, pos0, length, [caches[i] for i in g])
             streams, ncs, hs = out[:3]
-            new.extend(ncs); hists.extend(hs)
-            if mid:
-                feats.extend(out[3])
-            if last:
-                feats.append(self._prog_stream_mean(B, T)(streams))
+            new.extend(ncs); hists.append(hs)
+            js = tuple(j for j, i in enumerate(g) if i in tl)
+            if js:
+                feats.append(out[3]); fidx.append(js)
             self.launches += 1
-        return streams, new, hists, feats
+        return streams, new, hists, (feats, tuple(fidx))
 
     def _run_verify(self, tokens, caches, pos0, sampler=None, capture=False):
         """Recurrent T-token step returning (logits [B,T,V], caches, per-layer histories, hidden [B,T,D], ids[,
@@ -884,7 +1028,7 @@ class ResidentLayerEngine(Engine):
         while a < k and preds[a] == drafts_h[a] and drafts_h[a] not in stop_ids:
             a += 1
         if a < k:
-            rolled = self._prog_rollback(B, k + 1)(hists, self.scalar(a + 1))
+            rolled = self._prog_rollback(B, k + 1)(hists, self.scalar(a + 1), self._hist_cur(new))
             new = [({**c, **r} if r else c) for c, r in zip(new, rolled)]
             if a + 1 < k:                                       # drafts a+1.. were fed rejected tokens: tail as before draft a+1
                 mcache = {**mcache, "tk": tails[a + 1][0], "tg": tails[a + 1][1]}
@@ -893,106 +1037,132 @@ class ResidentLayerEngine(Engine):
         return emitted, logits[:, a], new + [{**mcache, "h": h_next}], pos + a + 1
 
     # ---- speculative decoding with the DFlash 2 drafter (block diffusion, glm53.dflash)
-    def set_dflash(self, params, dcfg, int8=False):
+    def set_dflash(self, params, dcfg, int8=False, temp_scale=0.7):
         """Install the DFlash 2 drafter (`glm53.dflash.load_params`) on the engine's mesh; it shares the target's
         embedding and lm_head. Its context ring becomes cache entry n_layers (`alloc_caches`), filled by `prefill`
         with the captured target features (the stream mean after each of dcfg.target_layers) and by `dflash_step`
-        with the accepted positions'. int8: the drafter's big matrices as q8 (glm53.quant8)."""
+        with the accepted positions'. int8: the drafter's big matrices as q8 (glm53.quant8). temp_scale: drafts are
+        drawn at temp_scale x the request's temperature (rejection sampling accepts against the target's own; 0.5-0.7
+        accepted ~1 % more than 1.0 and ~4 % more than greedy drafts at temperature 1.0, v6e 2026-10-04)."""
         from glm53 import dflash as DF
         assert self.mtp is None, "MTP and DFlash share cache entry n_layers"
         assert max(dcfg.target_layers) < self.cfg.n_layers, dcfg.target_layers
         self.dflash = DF.Drafter(dataclasses.replace(dcfg, dtype=self.cfg.dtype), params, self.mesh,
-                                 self.specs["embed"], self.specs["lm_head"], int8=int8)
+                                 self.specs["embed"], self.specs["lm_head"], int8=int8, temp_scale=temp_scale)
 
-    def _dflash_zeros(self, B, T):
-        key = ("dflash_zeros", B, T)
+    def _dflash_zeros(self, B):
+        """Zero DFlash features in the verify's layout (`_verify_layers`): for a draft with no new positions."""
+        key = ("dflash_zeros", B)
         if key not in self._progs:
-            n_f, D = len(self.dflash.cfg.target_layers), self.cfg.hidden
-            z = jax.jit(lambda: [jnp.zeros((B, T, D), self.cfg.dtype)] * n_f,
-                        out_shardings=[NamedSharding(self.mesh, R)] * n_f)()
-            self._progs[key] = z
+            tl, blk = self.dflash.cfg.target_layers, self.dflash.cfg.block
+            shapes, fidx = [], []
+            for g in self.groups["decode"]:
+                js = tuple(j for j, i in enumerate(g) if i in tl)
+                if js:
+                    shapes.append((len(g), B, blk, self.cfg.hidden)); fidx.append(js)
+            z = jax.jit(lambda: [jnp.zeros(sh, self.cfg.dtype) for sh in shapes],
+                        out_shardings=[NamedSharding(self.mesh, R)] * len(shapes))()
+            self._progs[key] = (z, tuple(fidx))
         return self._progs[key]
 
     def _prog_head_accept(self, B, T, stop_ids):
         """The DFlash verify's head with the acceptance on the chips: (norm, lm_head, streams, seq [B,T] = anchor +
-        drafts, pos (), temperature, top_p, key) -> dict: emitted [B,T] (the accepted drafts, then the target's own
-        token, -1 after), a [B] (accepted drafts), bonus [B] (the target's token = the next anchor), n_keep () = a+1,
-        pos_next () = pos + a + 1, pos_b [B] = pos, n_new_b [B] = a + 1, key. The target's token at every position is
-        device-sampled (temperature 0: the argmax); a draft is accepted iff it equals it, and a draft in `stop_ids`
-        ends the accepted run (B = 1: n_keep and pos_next are row 0's)."""
+        drafts, cand / q [B,T-1,k] = the drafter's candidates and its distribution over them, pos (), temperature,
+        top_p, key) -> dict: emitted [B,T] (the accepted drafts, then the emitted token, -1 after), a [B] (accepted
+        drafts), bonus [B] (the emitted token = the next anchor), n_keep () = a+1, pos_next () = pos + a + 1, pos_b [B] =
+        pos, n_new_b [B] = a + 1, key. The acceptance is rejection sampling against the target's distribution after
+        temperature and top-p (`engine.spec_accept`): every emitted token is distributed as plain sampling; at
+        temperature 0 a draft is accepted iff it is the argmax (greedy). A draft in `stop_ids` ends the accepted run
+        (B = 1: n_keep and pos_next are row 0's)."""
         key = ("head_accept", B, T, tuple(stop_ids))
         if key not in self._progs:
-            def prog(norm, lm_head, streams, seq, pos, temp, top_p, k):
+            def prog(norm, lm_head, streams, seq, cand, q, pos, temp, top_p, k):
                 h = M.rmsnorm(streams.mean(2).astype(self.lcfg.dtype), norm, self.cfg.eps)
                 k1, k2 = jax.random.split(k)
-                ids = device_sample(self._logits_local(lm_head, h).reshape(B * T, -1), temp, top_p, k1)
-                ids = ids.reshape(B, T).astype(jnp.int32)
+                rows = lambda v: jnp.broadcast_to(jnp.reshape(v, (-1, 1)), (B, T)).reshape(-1)   # noqa: E731
+                gidx, p = device_probs(self._logits_local(lm_head, h).reshape(B * T, -1), rows(temp), rows(top_p))
+                C = gidx.shape[-1]
                 d = seq[:, 1:].astype(jnp.int32)
-                ok = ids[:, :-1] == d
-                for sid in stop_ids:
-                    ok &= d != sid
-                a = jnp.cumprod(ok.astype(jnp.int32), 1).sum(1)
-                bonus = jnp.take_along_axis(ids, a[:, None], 1)[:, 0]
+                a, bonus = spec_accept(gidx.reshape(B, T, C), p.reshape(B, T, C), d, cand, q, k1, stop_ids)
                 j = jnp.arange(T)[None, :]
                 dpad = jnp.concatenate([d, jnp.zeros((B, 1), jnp.int32)], 1)
                 emitted = jnp.where(j < a[:, None], dpad, jnp.where(j == a[:, None], bonus[:, None], -1))
                 return {"emitted": emitted, "a": a, "bonus": bonus, "n_keep": a[0] + 1, "pos_next": pos + a[0] + 1,
                         "pos_b": jnp.broadcast_to(pos, (B,)), "n_new_b": a + 1, "key": k2}
             outs = {k: R for k in ("emitted", "a", "bonus", "n_keep", "pos_next", "pos_b", "n_new_b", "key")}
-            in_specs = (R, self.specs["lm_head"], R, R, R, R, R, R)
+            in_specs = (R, self.specs["lm_head"], R, R, R, R, R, R, R, R)
             self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=outs,
                                                  check_vma=False))
         return self._progs[key]
 
-    def _dflash_draft(self, ring, feats, pos_b, n_new_b, anchor_b, T):
-        r = self.dflash.draft(ring, feats, pos_b, n_new_b, anchor_b, self.params["embed"], self.params["lm_head"], T=T)
-        return r["seq"], r["ring"]
+    def _dflash_draft(self, ring, feats, pos_b, n_new_b, anchor_b, T, temp, key):
+        """One draft program (any temperature: the selector draws from its q, the argmax at temperature 0) ->
+        (seq [B,T] = anchor + drafts, cand, q [B,T-1,k], the new ring)."""
+        r = self.dflash.draft(ring, feats[0], pos_b, n_new_b, anchor_b, self.params["embed"], self.params["lm_head"], T=T,
+                              temperature=temp, key=key, feat_index=feats[1])
+        return r["seq"], r["cand"], r["q"], r["ring"]
 
-    def dflash_start(self, token, caches, pos, T=None, pending=None):
+    def dflash_start(self, token, caches, pos, T=None, pending=None, sampler: DeviceSampler | None = None):
         """Begin DFlash 2 decoding of one stream (B = 1) from the committed token `token` [B] at position `pos` (not yet
-        fed; e.g. the token sampled from `prefill`'s logits): dispatches the first draft. `pending` = the features of
-        positions the ring has not seen yet (None right after `prefill`, which fills it). Returns the state that
-        `dflash_step` advances: {"caches", "pos" (device scalar), "pos_h" (host int), "seq" (the drafted block, on the
-        device), "T"}."""
+        fed; e.g. the token sampled from `prefill`'s logits): dispatches the first draft (drawn at the sampler's
+        temperature; pass the same sampler to `dflash_step`). `pending` = the features of positions the ring has not
+        seen yet (None right after `prefill`, which fills it). Returns the state that `dflash_step` advances:
+        {"caches", "pos" (device scalar), "pos_h" (host int), "seq" (the drafted block, on the device), "cand", "q",
+        "T"}."""
         n = self.cfg.n_layers
         T = self.dflash.cfg.block if T is None else T
         B = np.asarray(token).reshape(-1).shape[0]
         assert B == 1 and self.dflash is not None
-        feats, p0, n_new = pending if pending is not None else (self._dflash_zeros(B, self.dflash.cfg.block), pos, 0)
-        seq, ring = self._dflash_draft(caches[n], feats, self.device_positions([p0] * B),
-                                       self.device_positions([n_new] * B),
-                                       self.device_positions(np.asarray(token).reshape(B)), T)
-        return {"caches": caches[:n] + [ring], "pos": self.scalar(pos), "pos_h": int(pos), "seq": seq, "T": T}
+        sampler = sampler if sampler is not None else self._dflash_greedy()
+        temp, _, k = sampler.bind(self.mesh)
+        feats, p0, n_new = pending if pending is not None else (self._dflash_zeros(B), pos, 0)
+        seq, cand, q, ring = self._dflash_draft(caches[n], feats, self.device_positions([p0] * B),
+                                                self.device_positions([n_new] * B),
+                                                self.device_positions(np.asarray(token).reshape(B)), T, temp, k)
+        return {"caches": caches[:n] + [ring], "pos": self.scalar(pos), "pos_h": int(pos), "seq": seq, "cand": cand,
+                "q": q, "T": T}
 
     def dflash_step(self, st, sampler: DeviceSampler | None = None, stop_ids=(), draft_override=None, next_T=None):
         """One DFlash 2 step: the target verifies the drafted block [anchor, drafts] in one T-token step that also
-        captures its features; the acceptance runs on the chips (the head program: the target's token per position,
-        device-sampled, `sampler` None = greedy; a draft is accepted iff it equals it — exact for greedy, a valid if
-        conservative scheme for sampling; a draft in `stop_ids` ends the run and is emitted unfed); the KDA states and
-        pool tails are rolled back to the accepted prefix; the NEXT draft (anchor = the target's token, the accepted
-        positions' features into the ring) is dispatched before the host reads this step's tokens, so the host's
-        bookkeeping overlaps it (it only writes committed positions: stopping after any step leaves a consistent
-        state). `next_T` = the block size of the next draft (default: this one's). `draft_override` (T-1 ids,
-        tests) replaces this step's drafts. Returns (emitted tokens [1..T] — all but the last were fed to the model,
-        the new state)."""
+        captures its features; the acceptance runs on the chips (the head program: rejection sampling of the drafts
+        against the target's distribution, `sampler` None = greedy, where a draft is accepted iff it is the argmax; a
+        draft in `stop_ids` ends the run and is emitted unfed); the KDA states and pool tails are rolled back to the
+        accepted prefix; the NEXT draft (anchor = the emitted token, the accepted positions' features into the ring)
+        is dispatched before the host reads this step's tokens, so the host's bookkeeping overlaps it (it only writes
+        committed positions: stopping after any step leaves a consistent state). `next_T` = the block size of the next
+        draft (default: this one's). `draft_override` (T-1 ids, tests; exact only at temperature 0) replaces this
+        step's drafts. Returns (emitted tokens [1..T] — all but the last were fed to the model, the new state)."""
         n = self.cfg.n_layers
         T, B = st["T"], 1
         sampler = sampler if sampler is not None else self._dflash_greedy()
+        grave = self.__dict__.pop("_grave", None)        # the previous step's dropped arrays (see the end)
         seq = st["seq"]
         if draft_override is not None:
             seq = jnp.concatenate([seq[:, :1], jnp.asarray(np.asarray(draft_override, np.int32).reshape(B, T - 1))], 1)
         caches = st["caches"]
         streams, new, hists, feats = self._verify_layers(seq, caches[:n], st["pos"], capture=True)
+        del grave                                        # released while the device runs the verify
+        temp, top_p, k = sampler.bind(self.mesh)
         r = self._prog_head_accept(B, T, tuple(stop_ids))(self.params["norm"], self.params["lm_head"], streams, seq,
-                                                          st["pos"], *sampler.bind(self.mesh))
+                                                          st["cand"], st["q"], st["pos"], temp, top_p, k)
         sampler.advance(r["key"])
-        rolled = self._prog_rollback(B, T)(hists, r["n_keep"])
+        pre = new
+        rolled = self._prog_rollback(B, T)(hists, r["n_keep"], self._hist_cur(new))
         new = [({**c, **x} if x else c) for c, x in zip(new, rolled)]
         next_T = T if next_T is None else next_T
-        nseq, ring = self._dflash_draft(caches[n], feats, r["pos_b"], r["n_new_b"], r["bonus"], next_T)
+        nseq, cand, q, ring = self._dflash_draft(caches[n], feats, r["pos_b"], r["n_new_b"], r["bonus"], next_T, temp,
+                                                 r["key"])
         emitted = [int(x) for x in np.asarray(r["emitted"])[0] if x >= 0]     # the host waits here, the draft queued
+        # Dropping a jax array costs ~11-20 us of host time on the 8-chip mesh (j107) and a step leaves ~300 behind (the
+        # consumed caches, the pre-rollback states, histories, ...): keep them until the next step has dispatched its
+        # verify, so the release happens while the device works instead of between the steps (`dflash_end` frees them).
+        self._grave = (st, pre, hists, feats, streams, r, rolled)
         return emitted, {"caches": new + [ring], "pos": r["pos_next"], "pos_h": st["pos_h"] + len(emitted),
-                         "seq": nseq, "T": next_T}
+                         "seq": nseq, "cand": cand, "q": q, "T": next_T}
+
+    def dflash_end(self):
+        """Release what the last `dflash_step` kept for a deferred release (call when a stream leaves DFlash mode)."""
+        self.__dict__.pop("_grave", None)
 
     def _dflash_greedy(self):
         if getattr(self, "_greedy_sampler", None) is None:

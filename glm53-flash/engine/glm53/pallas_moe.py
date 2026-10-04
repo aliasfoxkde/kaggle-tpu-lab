@@ -364,11 +364,12 @@ def moe_matvec(planes, qtype, nblk, idx, X, *, interpret=False, lane_block=None)
     return fn(idx, *args).reshape(Nk, R)
 
 
-def moe_matvec_gu(planes_g, planes_u, qtype, nblk, idx, X, *, interpret=False):
+def moe_matvec_gu(planes_g, planes_u, qtype, nblk, idx, X, *, interpret=False, k=1):
     """gate and up of the same expert slots in ONE kernel: planes_{g,u} as in `moe_matvec` (same qtype and shape,
-    R <= 1024 rows: all lane vregs unrolled), X f32 [Nk, W, C] (shared) -> (g, u) f32 [Nk, R] each.
-    One grid step per slot; the lane broadcasts of X are made once and serve both matrices (2026-10-03 on the v6e:
-    5.47 us per expert for gate + up vs 2 x 3.43 as two hoisted kernels and 2 x 4.75 shipped)."""
+    R <= 1024 rows: all lane vregs unrolled), X f32 [Nk / k, W, C] = one row per TOKEN, whose k consecutive slots
+    share it -> (g, u) f32 [Nk, R] each. One grid step per slot; the lane broadcasts of X are made once per token
+    (the first of its k slots; the scratch persists across the sequential grid) and serve both matrices (2026-10-03 on
+    the v6e: 5.47 us per expert for gate + up vs 2 x 3.43 as two hoisted kernels and 2 x 4.75 shipped)."""
     keys = PL.PLANE_KEYS[qtype]
     rows_p = PL.plane_rows(qtype, nblk)
     W = PL.WORDS_PER_BLOCK[qtype] * nblk
@@ -377,9 +378,9 @@ def moe_matvec_gu(planes_g, planes_u, qtype, nblk, idx, X, *, interpret=False):
     lead = first.ndim == 3
     R = first.shape[-1]
     Nk = idx.shape[0]
-    assert X.shape == (Nk, W, C), (X.shape, (Nk, W, C))
+    assert Nk % k == 0 and X.shape == (Nk // k, W, C), (X.shape, (Nk // k, W, C))
     assert R % LANES == 0 and R <= 1024 and W % SUB == 0, (R, W)
-    assert all(planes_u[k].shape == planes_g[k].shape for k in keys)
+    assert all(planes_u[kk].shape == planes_g[kk].shape for kk in keys)
     n_vreg = R // LANES
     nb = W // SUB
     nk = len(keys)
@@ -392,7 +393,10 @@ def moe_matvec_gu(planes_g, planes_u, qtype, nblk, idx, X, *, interpret=False):
         tbl_ref, x_ref, o_ref, bx_ref = refs[2 * nk:]
         offs = _offsets(keys, rows_p, idx_ref[pl.program_id(0)])
         tb = _table_rows(tbl_ref, qtype)
-        _fill_bx(x_ref, bx_ref, nb, C)
+        if k == 1:
+            _fill_bx(x_ref, bx_ref, nb, C)
+        else:                                      # the token's first slot fills, its other k-1 slots reuse
+            pl.when(pl.program_id(0) % k == 0)(lambda: _fill_bx(x_ref, bx_ref, nb, C))
         for m, prefs in enumerate((g_refs, u_refs)):
             for v in range(n_vreg):
                 lanes = slice(v * LANES, (v + 1) * LANES)
@@ -404,9 +408,9 @@ def moe_matvec_gu(planes_g, planes_u, qtype, nblk, idx, X, *, interpret=False):
             return pl.BlockSpec((None, B, R), lambda i, idx_ref: (0, (idx_ref[i] * rows_p[k]) // B, 0))
         return pl.BlockSpec((B, R), lambda i, idx_ref: ((idx_ref[i] * rows_p[k]) // B, 0))
 
-    in_specs = [plane_spec(k) for k in keys] * 2
+    in_specs = [plane_spec(kk) for kk in keys] * 2
     in_specs += [pl.BlockSpec(tbl.shape, lambda i, idx_ref: (0, 0)),
-                 pl.BlockSpec((None, W, C), lambda i, idx_ref: (i, 0, 0))]
+                 pl.BlockSpec((None, W, C), lambda i, idx_ref: (i // k, 0, 0))]
     grid_spec = pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=1, grid=(Nk,), in_specs=in_specs,
                                              out_specs=pl.BlockSpec((None, 2, R), lambda i, idx_ref: (i, 0, 0)),
                                              scratch_shapes=[pltpu.VMEM((nb * C, SUB, LANES), jnp.float32)])
@@ -414,6 +418,147 @@ def moe_matvec_gu(planes_g, planes_u, qtype, nblk, idx, X, *, interpret=False):
                         interpret=interpret, compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)))
     out = fn(idx, *[planes_g[k] for k in keys], *[planes_u[k] for k in keys], tbl, X)
     return out[:, 0], out[:, 1]
+
+
+# ---------------------------------------------------------------- grouped slots (a multi-token step of one sequence)
+# A verify of T tokens of ONE sequence routes T*k slots, and neighbouring tokens share experts (v6e j64: ~24 distinct
+# of 32 slots at T = 4). These variants take one grid step per DISTINCT expert: its weights are decoded once and
+# multiplied into the accumulators of every token routed to it (up to tm), each in exactly the per-slot kernel's
+# order (bit-identical results). Groups past n_groups repeat the last expert id (no new plane DMA) and skip compute.
+def _fill_bx_multi(x_ref, bx_ref, nb, C, tm):
+    """`_fill_bx` for the tm tokens of a group: bx[(t*nb + b)*C + c] = X[t, 8b:8b+8, c] broadcast along lanes."""
+    for t in range(tm):
+        for b in range(nb):
+            xb = x_ref[t, SUB * b:SUB * (b + 1), :]
+            for c in range(C):
+                bx_ref[(t * nb + b) * C + c] = jnp.broadcast_to(xb[:, c:c + 1], (SUB, LANES))
+
+
+def _matvec_lanes_multi(decode, rows, tb, bx_ref, nb, C, tm):
+    """`_matvec_lanes` for tm tokens sharing the expert: each weight vreg decoded once, tm accumulators -> tm x (1, 128)."""
+    outs = [jnp.zeros((SUB, LANES), jnp.float32) for _ in range(tm)]
+    for b in range(nb):
+        for scale, items in decode(b, rows, tb):
+            accs = [jnp.zeros((SUB, LANES), jnp.float32) for _ in range(tm)]
+            for c, val in items:
+                for t in range(tm):
+                    accs[t] = accs[t] + val * bx_ref[(t * nb + b) * C + c]
+            for t in range(tm):
+                outs[t] = outs[t] + accs[t] * scale
+    return [jnp.sum(o, axis=0, keepdims=True) for o in outs]
+
+
+def moe_matvec_gu_multi(planes_g, planes_u, qtype, nblk, eids, n_groups, X, *, interpret=False):
+    """`moe_matvec_gu` over grouped slots: eids int32 [G] (distinct experts first; the rest repeat the last), n_groups
+    int32 [1], X f32 [G, tm, W, C] (the tokens of each group, zero rows past its size) -> (g, u) f32 [G, tm, R] each
+    (rows of groups >= n_groups are undefined)."""
+    keys = PL.PLANE_KEYS[qtype]
+    rows_p = PL.plane_rows(qtype, nblk)
+    W = PL.WORDS_PER_BLOCK[qtype] * nblk
+    C = PL.PLANES_PER_WORD[qtype]
+    first = planes_g[keys[0]]
+    lead = first.ndim == 3
+    R = first.shape[-1]
+    G, tm = X.shape[:2]
+    assert X.shape == (G, tm, W, C), (X.shape, (G, tm, W, C))
+    assert R % LANES == 0 and R <= 1024 and W % SUB == 0, (R, W)
+    n_vreg = R // LANES
+    nb = W // SUB
+    nk = len(keys)
+    tbl = _table_arrays(qtype)
+    blocks = {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys}
+    decode = DECODE[qtype]
+
+    def kernel(eid_ref, ng_ref, *refs):
+        g_refs, u_refs = dict(zip(keys, refs[:nk])), dict(zip(keys, refs[nk:2 * nk]))
+        tbl_ref, x_ref, o_ref, bx_ref = refs[2 * nk:]
+        g = pl.program_id(0)                       # (read outside pl.when: interpret mode cannot inside a branch)
+        offs = _offsets(keys, rows_p, eid_ref[g])
+
+        @pl.when(g < ng_ref[0])
+        def _():
+            tb = _table_rows(tbl_ref, qtype)
+            _fill_bx_multi(x_ref, bx_ref, nb, C, tm)
+            for m, prefs in enumerate((g_refs, u_refs)):
+                for v in range(n_vreg):
+                    lanes = slice(v * LANES, (v + 1) * LANES)
+                    res = _matvec_lanes_multi(decode, _rows_fn(prefs, offs, lanes), tb, bx_ref, nb, C, tm)
+                    for t in range(tm):
+                        o_ref[t, m:m + 1, lanes] = res[t]
+
+    def plane_spec(k):
+        B = blocks[k]
+        if lead:
+            return pl.BlockSpec((None, B, R), lambda i, eid_ref, ng_ref: (0, (eid_ref[i] * rows_p[k]) // B, 0))
+        return pl.BlockSpec((B, R), lambda i, eid_ref, ng_ref: ((eid_ref[i] * rows_p[k]) // B, 0))
+
+    in_specs = [plane_spec(k) for k in keys] * 2
+    in_specs += [pl.BlockSpec(tbl.shape, lambda i, eid_ref, ng_ref: (0, 0)),
+                 pl.BlockSpec((None, tm, W, C), lambda i, eid_ref, ng_ref: (i, 0, 0, 0))]
+    grid_spec = pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=2, grid=(G,), in_specs=in_specs,
+                                             out_specs=pl.BlockSpec((None, tm, 2, R), lambda i, eid_ref, ng_ref: (i, 0, 0, 0)),
+                                             scratch_shapes=[pltpu.VMEM((tm * nb * C, SUB, LANES), jnp.float32)])
+    fn = pl.pallas_call(kernel, grid_spec=grid_spec, out_shape=jax.ShapeDtypeStruct((G, tm, 2, R), jnp.float32),
+                        interpret=interpret, compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)))
+    out = fn(eids, n_groups, *[planes_g[k] for k in keys], *[planes_u[k] for k in keys], tbl, X)
+    return out[:, :, 0], out[:, :, 1]
+
+
+def moe_matvec_multi(planes, qtype, nblk, eids, n_groups, X, *, interpret=False, lane_block=None):
+    """`moe_matvec` over grouped slots (see `moe_matvec_gu_multi`): X f32 [G, tm, W, C] -> f32 [G, tm, R]."""
+    keys = PL.PLANE_KEYS[qtype]
+    rows_p = PL.plane_rows(qtype, nblk)
+    W = PL.WORDS_PER_BLOCK[qtype] * nblk
+    C = PL.PLANES_PER_WORD[qtype]
+    first = planes[keys[0]]
+    lead = first.ndim == 3
+    R = first.shape[-1]
+    G, tm = X.shape[:2]
+    assert X.shape == (G, tm, W, C), (X.shape, (G, tm, W, C))
+    assert R % LANES == 0 and W % SUB == 0, (R, W)
+    LB = lane_block or min(R, 4096)
+    assert R % LB == 0 and LB % LANES == 0, (R, LB)
+    n_lb = R // LB
+    n_vreg = LB // LANES
+    nb = W // SUB
+    tbl = _table_arrays(qtype)
+    blocks = {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys}
+    decode = DECODE[qtype]
+
+    def kernel(eid_ref, ng_ref, *refs):
+        plane_refs = dict(zip(keys, refs[:len(keys)]))
+        tbl_ref, x_ref, o_ref, bx_ref = refs[len(keys):]
+        g, first_lb = pl.program_id(0), pl.program_id(1) == 0
+        offs = _offsets(keys, rows_p, eid_ref[g])
+
+        @pl.when(g < ng_ref[0])
+        def _():
+            tb = _table_rows(tbl_ref, qtype)
+            pl.when(first_lb)(lambda: _fill_bx_multi(x_ref, bx_ref, nb, C, tm))
+            for v in range(n_vreg):
+                lanes = slice(v * LANES, (v + 1) * LANES)
+                res = _matvec_lanes_multi(decode, _rows_fn(plane_refs, offs, lanes), tb, bx_ref, nb, C, tm)
+                for t in range(tm):
+                    o_ref[t, :, lanes] = res[t]
+
+    def plane_spec(k):
+        B = blocks[k]
+        if lead:
+            return pl.BlockSpec((None, B, LB), lambda i, cb, eid_ref, ng_ref: (0, (eid_ref[i] * rows_p[k]) // B, cb))
+        return pl.BlockSpec((B, LB), lambda i, cb, eid_ref, ng_ref: ((eid_ref[i] * rows_p[k]) // B, cb))
+
+    in_specs = [plane_spec(k) for k in keys]
+    in_specs += [pl.BlockSpec(tbl.shape, lambda i, cb, eid_ref, ng_ref: (0, 0)),
+                 pl.BlockSpec((None, tm, W, C), lambda i, cb, eid_ref, ng_ref: (i, 0, 0, 0))]
+    out_spec = pl.BlockSpec((None, tm, 1, LB), lambda i, cb, eid_ref, ng_ref: (i, 0, 0, cb))
+    grid_spec = pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=2, grid=(G, n_lb), in_specs=in_specs,
+                                             out_specs=out_spec,
+                                             scratch_shapes=[pltpu.VMEM((tm * nb * C, SUB, LANES), jnp.float32)])
+    fn = pl.pallas_call(kernel, grid_spec=grid_spec, out_shape=jax.ShapeDtypeStruct((G, tm, 1, R), jnp.float32),
+                        interpret=interpret,
+                        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary", "arbitrary")))
+    args = [planes[k] for k in keys] + [tbl, X]
+    return fn(eids, n_groups, *args).reshape(G, tm, R)
 
 
 def moe_matvec_ref(planes, qtype, nblk, idx, X):

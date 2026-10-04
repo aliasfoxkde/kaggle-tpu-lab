@@ -36,16 +36,9 @@ R = P()  # replicated
 SAMPLE_IMPL = "approx"          # "approx": TPU-native approx_max_k candidates + bisection top-p (no sorts); "sort": exact top_k + sort
 
 
-def device_sample(z_local, temperature, top_p, key, n_cand=2048, impl=None):
-    """Inside a shard_map program: one token per row of the logits, whose vocab columns are sharded over AXIS
-    (`z_local` [N, V/n], any float dtype). Candidates = the top n_cand/n logits of every chip, all-gathered (2048 on
-    8 chips, the same truncation as the host sampler's partial sort); temperature and top-p in f32 over the
-    candidates, then a categorical draw with `key` (identical on every chip -> the same token everywhere).
-    temperature <= 0 -> the argmax (exact over the whole vocab). impl "approx" (default): `lax.approx_max_k`
-    picks the candidates (recall 0.99; the exact per-chip argmax is forced into the set, so greedy stays exact and
-    the mode is never missing) and the top-p set {p >= t} is found by bisection on t (24 steps) instead of a sort —
-    XLA sorts are slow on the TPU (the "sort" variant cost ~2 ms per token, as much as the host sampler).
-    Returns int32 [N] token ids."""
+def _candidates(z_local, temperature, top_p, n_cand, impl):
+    """The candidate set of `device_sample`: (gidx [N, C] global ids, lp [N, C] f32 log-weights after temperature with
+    -inf outside the top-p set, greedy [N] the global argmax, gi [N] its index in gidx, temperature [1 or N, 1])."""
     impl = SAMPLE_IMPL if impl is None else impl
     N, Vl = z_local.shape
     n = lax.axis_size(AXIS)
@@ -64,7 +57,8 @@ def device_sample(z_local, temperature, top_p, key, n_cand=2048, impl=None):
     gidx = idx.astype(jnp.int32) + lax.axis_index(AXIS).astype(jnp.int32) * Vl
     vals = lax.all_gather(vals, AXIS, axis=1, tiled=True)                        # [N, n*kc], replicated
     gidx = lax.all_gather(gidx, AXIS, axis=1, tiled=True)
-    greedy = jnp.take_along_axis(gidx, jnp.argmax(vals, axis=1, keepdims=True), axis=1)[:, 0]
+    gi = jnp.argmax(vals, axis=1)
+    greedy = jnp.take_along_axis(gidx, gi[:, None], axis=1)[:, 0]
     temperature = jnp.reshape(jnp.asarray(temperature, jnp.float32), (-1, 1))     # [] or [N] -> [1 or N, 1] per row
     top_p = jnp.reshape(jnp.asarray(top_p, jnp.float32), (-1, 1))
     t = jnp.where(temperature > 0, temperature, 1.0)
@@ -86,10 +80,65 @@ def device_sample(z_local, temperature, top_p, key, n_cand=2048, impl=None):
             lo = jnp.where(ok, mid, lo)
             hi = jnp.where(ok, hi, mid)
         thr = lo
-    lp = jnp.where(p >= thr, lp, -jnp.inf)
+    return gidx, jnp.where(p >= thr, lp, -jnp.inf), greedy, gi, temperature
+
+
+def device_sample(z_local, temperature, top_p, key, n_cand=2048, impl=None):
+    """Inside a shard_map program: one token per row of the logits, whose vocab columns are sharded over AXIS
+    (`z_local` [N, V/n], any float dtype). Candidates = the top n_cand/n logits of every chip, all-gathered (2048 on
+    8 chips, the same truncation as the host sampler's partial sort); temperature and top-p in f32 over the
+    candidates, then a categorical draw with `key` (identical on every chip -> the same token everywhere).
+    temperature <= 0 -> the argmax (exact over the whole vocab). impl "approx" (default): `lax.approx_max_k`
+    picks the candidates (recall 0.99; the exact per-chip argmax is forced into the set, so greedy stays exact and
+    the mode is never missing) and the top-p set {p >= t} is found by bisection on t (24 steps) instead of a sort —
+    XLA sorts are slow on the TPU (the "sort" variant cost ~2 ms per token, as much as the host sampler).
+    Returns int32 [N] token ids."""
+    gidx, lp, greedy, _, temperature = _candidates(z_local, temperature, top_p, n_cand, impl)
     draw = jax.random.categorical(key, lp, axis=1)
     sampled = jnp.take_along_axis(gidx, draw[:, None], axis=1)[:, 0]
     return jnp.where(temperature[:, 0] > 0, sampled, greedy).astype(jnp.int32)
+
+
+def device_probs(z_local, temperature, top_p, n_cand=2048, impl=None):
+    """`device_sample`'s distribution instead of a draw: (gidx [N, C] global token ids, p [N, C] f32 their
+    probabilities — the truncated softmax a draw would use; one-hot at the argmax for temperature <= 0). Tokens
+    outside gidx have probability 0. For speculative acceptance (`spec_accept`)."""
+    gidx, lp, _, gi, temperature = _candidates(z_local, temperature, top_p, n_cand, impl)
+    p = jax.nn.softmax(lp, axis=1)
+    onehot = (jnp.arange(gidx.shape[1])[None, :] == gi[:, None]).astype(jnp.float32)
+    return gidx, jnp.where(temperature > 0, p, onehot)
+
+
+def spec_accept(gidx, p, drafts, cand, q, key, stop_ids=()):
+    """Speculative acceptance by rejection sampling (Leviathan et al. 2023), replicated arrays (no collectives).
+    Row b verified the block [anchor, drafts[b]]: position t's target distribution (gidx, p: [B, T, C], `device_probs`)
+    predicts drafts[b, t] (t < T-1) and the drafter drew drafts[b, t] from q[b, t] over its candidates cand[b, t]
+    ([B, T-1, k]). Draft t is accepted with probability min(1, p(d)/q(d)); at the first rejection the emitted token
+    is drawn from norm(max(0, p - q)), after T-1 acceptances from p of the last position — so every emitted token
+    is distributed exactly as plain sampling from the target. A draft in `stop_ids` ends the run: if accepted it is
+    the emitted (unfed) token. With one-hot p and q (temperature 0) this is "accepted iff equal to the argmax, then
+    the argmax". -> (a [B] accepted drafts, bonus [B] the token emitted after them)."""
+    B, T, C = p.shape
+    d = drafts.astype(jnp.int32)
+    k_u, k_r = jax.random.split(key)
+    p_d = jnp.sum(jnp.where(gidx[:, :-1] == d[..., None], p[:, :-1], 0.0), -1)            # [B, T-1]
+    q_d = jnp.sum(jnp.where(cand == d[..., None], q, 0.0), -1)
+    u = jax.random.uniform(k_u, (B, T - 1), jnp.float32)
+    acc = u * q_d < p_d
+    ok = acc
+    for sid in stop_ids:
+        ok &= d != sid
+    a = jnp.cumprod(ok.astype(jnp.int32), 1).sum(1)
+    q_on = jnp.sum(jnp.where(gidx[:, :-1, :, None] == cand[:, :, None, :], q[:, :, None, :], 0.0), -1)   # [B, T-1, C]
+    q_on = jnp.concatenate([q_on, jnp.zeros((B, 1, C), q_on.dtype)], 1)
+    r = jnp.maximum(p - q_on, 0.0)
+    r = jnp.where(jnp.sum(r, -1, keepdims=True) > 1e-12, r, p)                  # (no mass left: only on rounding)
+    x = jnp.take_along_axis(gidx, jax.random.categorical(k_r, jnp.log(r), axis=-1)[..., None], -1)[..., 0]   # [B, T]
+    x_a = jnp.take_along_axis(x, a[:, None], 1)[:, 0]
+    dpad = jnp.concatenate([d, jnp.zeros((B, 1), jnp.int32)], 1)
+    accpad = jnp.concatenate([acc, jnp.zeros((B, 1), bool)], 1)
+    stopped = jnp.take_along_axis(accpad, a[:, None], 1)[:, 0]                   # an accepted stop draft ended the run
+    return a, jnp.where(stopped, jnp.take_along_axis(dpad, a[:, None], 1)[:, 0], x_a).astype(jnp.int32)
 
 
 class DeviceSampler:

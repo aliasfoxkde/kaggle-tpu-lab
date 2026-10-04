@@ -71,7 +71,8 @@ def test_capture_matches_prefill_path(setup):
     eng, cfg, ids, _ = setup
     n = eng.cfg.n_layers
     _, caches, pos = eng.prefill(ids[:, :40])
-    ver = eng._run_verify(jnp.asarray(ids[:, 40:45]), eng.copy_caches(caches[:n]), 40, capture=True)[5]
+    stacked, fidx = eng._run_verify(jnp.asarray(ids[:, 40:45]), eng.copy_caches(caches[:n]), 40, capture=True)[5]
+    ver = [f[j] for f, js in zip(stacked, fidx) for j in js]          # per group stacked -> per target layer
     padded = np.zeros((1, 32), np.int32)
     padded[:, :5] = ids[:, 40:45]
     pre = eng._run(padded, eng.copy_caches(caches[:n]), 40, False, length=5, want_logits=False, capture=True)[2]
@@ -134,3 +135,28 @@ def test_stop_token_ends_the_run(setup):
         out.extend(emitted)
     assert out == ref[:first + 1], (out, ref)
     assert st["pos_h"] == ids.shape[1] + first and int(np.asarray(st["pos"])) == st["pos_h"]
+
+
+def test_decode_rows_fills_the_ring(setup):
+    """Batched plain steps (decode_rows, two streams at different positions) write every stream's positions into its
+    own drafter ring: afterwards each ring equals the ring a fresh prefill of that stream's tokens builds (no holes
+    for a stream that goes back to DFlash)."""
+    eng, cfg, ids, _ = setup
+    n = eng.cfg.n_layers
+    seqs = [list(ids[0, :45]), list(ids[0, 5:38])]
+    toks, sets, pos = [], [], []
+    for s in seqs:
+        lg, cc, p = eng.prefill(np.asarray(s)[None])
+        toks.append(int(jnp.argmax(lg[0]))); sets.append(cc); pos.append(p)
+    for _ in range(6):
+        _, logits, sets, _ = eng.decode_rows(np.array(toks), sets, pos)
+        for r in range(2):
+            seqs[r].append(toks[r])
+        toks = [int(x) for x in np.asarray(jnp.argmax(logits, -1))]
+        pos = [p + 1 for p in pos]
+    for r in range(2):
+        _, fresh, _ = eng.prefill(np.asarray(seqs[r])[None])
+        np.testing.assert_array_equal(np.asarray(sets[r][n]["p"]), np.asarray(fresh[n]["p"]))
+        for k in ("k", "v"):
+            a, b = np.asarray(sets[r][n][k]), np.asarray(fresh[n][k])
+            np.testing.assert_allclose(a, b, rtol=1e-3, atol=1e-3 * np.abs(b).max())

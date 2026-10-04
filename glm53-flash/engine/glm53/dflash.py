@@ -18,9 +18,9 @@ Parameter layout ([in, out], y = x @ W, as glm53.model):
 
 Context cache ("ring"): k, v [L, B, W, KV, hd] = post-k_norm, post-RoPE K and V of context position p in slot p % W
 (exact: a block query never sees further back than W - 1 positions), p [B, W] int32 = the position each slot holds
-+ 1 (0 = empty): a slot is read only when that position is inside the window, so positions that never reached the
-ring (decoded in batched steps without capture) are holes, not stale context. Positions are absolute; the drafter
-has its own RoPE (theta 10000) although GLM is NoPE.
++ 1 (0 = empty): a slot is read only when that position is inside the window, so a position that never reached the
+ring is a hole, not stale context (the engine writes every fed position: prefill, the verify's accepted positions,
+batched decode steps). Positions are absolute; the drafter has its own RoPE (theta 10000) although GLM is NoPE.
 
 Tensor parallel inside shard_map (axis engine.AXIS): q/k/v heads and MLP columns split over the chips (one KV head per
 chip on 8 chips; the ring is sharded with them), o and down row-parallel (psum), fc and the conv kernel projections
@@ -303,9 +303,9 @@ def topk_vocab(z_local, k, cfg: DCfg):
 def select(sel, hidden, z_local, anchor, cfg: DCfg, temperature=None, key=None):
     """DFlash 2 candidate selector over the draft positions. hidden [B, T1, D], z_local their logits (this chip's
     vocab columns), anchor [B]. score_t(a, b) = logit_t(b) + <P[a] * (h_t @ H), S[b]> for the top-k candidates b of
-    position t, a = the token chosen at t-1 (the anchor at t = 0); greedy argmax, or (temperature given) a draw from
-    softmax(score / temperature) with `key`. -> (path [B, T1], candidates [B, T1, k], q [B, T1, k] or None,
-    scores [B, T1, k])."""
+    position t, a = the token chosen at t-1 (the anchor at t = 0); greedy argmax, or (temperature given: a float or a
+    traced scalar / [B]) a draw from softmax(score / temperature) with `key`, the argmax where temperature <= 0 (q is
+    then one-hot). -> (path [B, T1], candidates [B, T1, k], q [B, T1, k] or None, scores [B, T1, k])."""
     unary, cand = topk_vocab(z_local, cfg.sel_topk, cfg)
     B, T1, k = cand.shape
     hs = jnp.dot(hidden, sel["h"], preferred_element_type=jnp.float32)
@@ -314,15 +314,18 @@ def select(sel, hidden, z_local, anchor, cfg: DCfg, temperature=None, key=None):
     pa, pc = pr[:, 0], pr[:, 1:].reshape(B, T1, k, -1)
     sc = vocab_rows(sel["succ"], cand, cfg).astype(jnp.float32)          # [B, T1, k, r]
     path, qs, scores = [], [], []
+    if temperature is not None:              # a host float or a traced scalar / [B] (rows at <= 0 pick the argmax)
+        tt = jnp.reshape(jnp.asarray(temperature, jnp.float32), (-1, 1))
     for t in range(T1):
         s = unary[:, t] + jnp.einsum("br,bkr->bk", pa * hs[:, t], sc[:, t])
         if temperature is None:
             j = jnp.argmax(s, -1)
         else:
             key, sub = jax.random.split(key)
-            z = s / temperature
-            j = jax.random.categorical(sub, z, -1)
-            qs.append(jax.nn.softmax(z, -1))
+            z = s / jnp.where(tt > 0, tt, 1.0)
+            g = jnp.argmax(s, -1)
+            j = jnp.where(tt[:, 0] > 0, jax.random.categorical(sub, z, -1), g)
+            qs.append(jnp.where(tt > 0, jax.nn.softmax(z, -1), jax.nn.one_hot(g, k, dtype=jnp.float32)))
         path.append(jnp.take_along_axis(cand[:, t], j[:, None], -1)[:, 0])
         pa = jnp.take_along_axis(pc[:, t], j[:, None, None], 1)[:, 0]
         scores.append(s)
@@ -350,9 +353,11 @@ class Drafter:
     """The drafter's params on a mesh (axis engine.AXIS) and its jitted programs. `embed_spec` / `lm_head_spec` =
     the target's (engine `specs["embed"]`, `specs["lm_head"]`: vocab-sharded, possibly q8 dicts); the programs take
     the target's arrays as arguments. int8=True stores the big matrices (layers, fc) as q8 (glm53.quant8); the
-    codebooks stay in their dtype. Ring buffers are donated to `ingest` / `draft` (never reuse a ring passed in)."""
+    codebooks stay in their dtype. Ring buffers are donated to `ingest` / `draft` (never reuse a ring passed in).
+    temp_scale: a sampled draft draws its path at temp_scale x the given temperature (q is that distribution)."""
 
-    def __init__(self, cfg: DCfg, params, mesh, embed_spec=P(AXIS, None), lm_head_spec=P(None, AXIS), int8=False):
+    def __init__(self, cfg: DCfg, params, mesh, embed_spec=P(AXIS, None), lm_head_spec=P(None, AXIS), int8=False,
+                 temp_scale=1.0):
         assert cfg.kv_heads % mesh.size == 0 and cfg.vocab % mesh.size == 0, (cfg.kv_heads, cfg.vocab, mesh.size)
         self.cfg, self.mesh = cfg, mesh
         self.lcfg = dataclasses.replace(cfg, tp_axis=AXIS)
@@ -368,6 +373,7 @@ class Drafter:
         self.params = jax.tree.map(lambda a, s: jax.device_put(a, NamedSharding(mesh, s)), params, specs,
                                    is_leaf=lambda x: isinstance(x, P))
         self.embed_spec, self.lm_head_spec = embed_spec, lm_head_spec
+        self.temp_scale = float(temp_scale)      # the sampled path is drawn at temp_scale x the given temperature
         self._progs = {}
 
     def nbytes_per_chip(self):
@@ -389,12 +395,17 @@ class Drafter:
             self._progs[key] = jax.jit(sm, donate_argnums=(1,))
         return self._progs[key]
 
-    def _prog_draft(self, B, N, T, sample):
-        key = ("draft", B, N, T, sample)
+    def _prog_draft(self, B, N, T, sample, feat_index=None):
+        key = ("draft", B, N, T, sample) + ((feat_index,) if feat_index is not None else ())
         if key not in self._progs:
             def prog(params, ring, feats, pos0, n_new, anchor, embed, lm_head, *samp):
+                if feat_index is not None:      # stacked per layer group (the engine's verify): pick the target layers
+                    feats = [f[j] for f, js in zip(feats, feat_index) for j in js]
                 params = Q8.dequant_tree(params, self.cfg.dtype)
                 temp, k = samp if sample else (None, None)
+                if sample:                      # the engine passes the sampler's key, which its acceptance also splits
+                    k = jax.random.fold_in(k, 0xDF)
+                    temp = temp * self.temp_scale   # (a sharper q than the target's accepts more: v6e 2026-10-04)
                 path, cand, q, scores, ring, _ = draft(params, ring, feats, pos0, n_new, anchor, embed, lm_head,
                                                        self.lcfg, T, temp, k)
                 out = {"path": path, "cand": cand, "scores": scores, "ring": ring,
@@ -414,14 +425,16 @@ class Drafter:
         return self._prog_ingest(B, N)(self.params, ring, feats, jnp.asarray(pos0, jnp.int32),
                                        jnp.asarray(length, jnp.int32))
 
-    def draft(self, ring, feats, pos0, n_new, anchor, embed, lm_head, T=None, temperature=None, key=None):
+    def draft(self, ring, feats, pos0, n_new, anchor, embed, lm_head, T=None, temperature=None, key=None,
+              feat_index=None):
         """-> dict: path [B, T-1] (the drafted tokens), seq [B, T] (anchor + path: the verify's input), cand / scores
         [B, T-1, k], ring (the new one), q [B, T-1, k] when a temperature is given. pos0, n_new, anchor [B] int32 (host
-        values or device arrays)."""
-        B, N = _rows(feats)
+        values or device arrays). `feat_index`: feats is a list of stacked [n_g, B, N, D] arrays and feat_index[g] the
+        target positions to take from each (the engine's per-group capture)."""
+        B, N = _rows(feats) if feat_index is None else feats[0].shape[1:3]
         T = self.cfg.block if T is None else T
         args = (self.params, ring, feats, jnp.asarray(pos0, jnp.int32), jnp.asarray(n_new, jnp.int32),
                 jnp.asarray(anchor, jnp.int32), embed, lm_head)
-        if temperature is not None:
-            args += (jnp.float32(temperature), key)
-        return self._prog_draft(B, N, T, temperature is not None)(*args)
+        if temperature is not None:              # (a device scalar, e.g. DeviceSampler.bind's, passes through)
+            args += (temperature if isinstance(temperature, jax.Array) else jnp.float32(temperature), key)
+        return self._prog_draft(B, N, T, temperature is not None, feat_index)(*args)

@@ -36,14 +36,18 @@ DEFAULTS = {
     "dump_base": True,               # a cold run writes base/ into its output (so the serve dataset can be made from it)
     "libtpu": "0.0.42.*",            # the image's runtime is 140x slower on gathers and cannot run Pallas kernels
     "max_len": 262144,               # context capacity (tokens); a multiple of 32
-    "streams": 4,                    # requests decoded together (one program set per batch size, ~2.5 min compile each)
+    "streams": 3,                    # requests decoded together (one program set per batch size, ~1-2.5 min compile
+                                     # each); a 4th 262k set never passes the admission (`min_free_gb`) on the v5e budget
     "sets": 4,                       # cache sets on the chips: running streams + finished contexts kept for their next turn
-    "piece": 512,                    # prefill piece (tokens): 512 keeps the prefill temporaries small enough for three
-    "sched_piece": 512,              # 262k streams next to the engine (1024 is ~13 % faster prefill but fits two or three)
+    "piece": 1024,                   # prefill piece (tokens): 1024 = ~2,500-2,700 tok/s vs ~2,050-2,150 at 512 (v6e
+    "sched_piece": 1024,             # 2026-10-04, 16k-128k prompts); three 262k streams either way since the admission
+                                     # counts live buffers (`min_free_gb`; the old in-use figure fitted two or three)
     "q_block": 32,                   # queries per attention block during prefill
     "cache_q8": True,                # int8 latent cache (a 262k set costs ~0.2 GB/chip instead of 0.3)
     "bucket_min": 256,               # smallest prefill bucket compiled (short prompts pad to it)
-    "min_free_gb": 0.55,             # HBM headroom an admission needs (a cache set + the prefill temporaries of one piece)
+    "min_free_gb": 0.75,             # HBM an admission needs beyond the live buffers: a 262k cache set (0.23 GB/chip), one
+                                     # piece's prefill temporaries (~0.22) and the programs of a decode step + a prefill
+                                     # piece (~0.25: loaded programs are a cache the runtime evicts when buffers need room)
     "max_queue": 8,                  # waiting requests beyond the streams before a 429
     "max_wait_s": 90.0,              # a request waiting longer than this gets a 503 (clients retry)
     "keepalive_s": 15,               # SSE ping when nothing was streamed for this long (a buffered tool call, a queued
@@ -70,6 +74,8 @@ DEFAULTS = {
                                      # {"4": 21.2, "8": 27.3} also drafts 8 (math-like text x1.97 instead of x1.64) but its
                                      # programs cost ~0.23 GB/chip = one of the two 262k streams DFlash leaves
     "dflash_prior": {"4": 2.8, "8": 3.3},    # tokens per step a new stream assumes until it has measured its own
+    "dflash_draft_temp": 0.7,        # drafts are drawn at this x the request's temperature; the verify accepts them by
+                                     # rejection sampling (output distributed exactly as plain sampling)
     "served_model_name": "glm-5.3-flash",
     "tunnel": True,                  # False: no cloudflared (local testing)
     "skip_runtime": False,           # True: no pip installs (local testing)
@@ -349,7 +355,7 @@ if DFLASH_DIR and getattr(eng, "dflash", None) is None:
     from glm53 import dflash as DF
     t = time.time()
     _dcfg, _dp = DF.load_params(DFLASH_DIR, jnp.bfloat16)
-    eng.set_dflash(_dp, _dcfg, int8=CFG["dflash_int8"])
+    eng.set_dflash(_dp, _dcfg, int8=CFG["dflash_int8"], temp_scale=CFG["dflash_draft_temp"])
     del _dp
     log(f"   DFlash 2 drafter ({_dcfg.n_layers} layers, block {_dcfg.block}) from {DFLASH_DIR}: "
         f"{eng.dflash.nbytes_per_chip() / 1e6:.0f} MB per chip in {time.time() - t:.0f}s; HBM chip0 {hbm()[0]:.2f} GB")
@@ -976,7 +982,8 @@ class H(BaseHTTPRequestHandler):
             return self._json(200, {"status": "ok", "model": MODEL, "layers": cfg.n_layers, "max_len": eng.max_len, "max_streams": MAX_STREAMS,
                                     "max_sets": MAX_SETS, "max_queue": MAX_QUEUE, "piece": SCHED.piece, "buckets": list(eng.PREFILL_BUCKETS),
                                     "active": len(SCHED.active), "pending": len(SCHED.pending),
-                                    "live_contexts": len(SCHED.live), "hbm_free_gb": SCHED.free_gb(), **STATE})
+                                    "live_contexts": len(SCHED.live), "hbm_free_gb": SCHED.free_gb(),
+                                    "hbm_free_in_use_gb": SCHED.in_use_free_gb(), **STATE})
         if self.path.startswith("/v1/models"):
             return self._json(200, {"object": "list", "data": [{"id": MODEL, "object": "model"}]})
         self._json(404, {"error": "not found"})
@@ -1143,11 +1150,22 @@ class H(BaseHTTPRequestHandler):
 # ----------------------------------------------------------------------------- 5. warm-up, serve, tunnel
 banner(4, "Warm-up", "prefill buckets, batched decode programs, snapshot programs")
 t_warm = time.time()
+_u = [hbm()[0]]
+
+
+def grew():
+    """HBM the last warm-up stage kept (its programs: compiled code is loaded onto the chips at a program's first run
+    and stays for the session), in MB."""
+    u = hbm()[0]
+    d, _u[0] = u - _u[0], u
+    return f"+{d * 1e3:.0f} MB"
+
+
 for b in [b for b in eng.PREFILL_BUCKETS if b <= eng.prefill_piece]:
     t = time.time()
     seq = np.concatenate([ids] * (b // ids.shape[1] + 1), 1)[:, :b]
     lg, cc, _ = eng.prefill(seq); jax.block_until_ready(lg); del cc
-    log(f"   prefill bucket {b}: {time.time() - t:.0f}s")
+    log(f"   prefill bucket {b}: {time.time() - t:.0f}s, {grew()}")
     publish("compiling", what=f"prefill {b}", secs=int(time.time() - t))
 for B in range(1, MAX_STREAMS + 1):
     t = time.time()
@@ -1155,7 +1173,7 @@ for B in range(1, MAX_STREAMS + 1):
     _samp = DeviceSampler([1.0] * B, [0.95] * B, seed=0)
     _ids, _lg, _sets, _pos = eng.decode_rows(np.full((B,), 0, np.int32), _sets, [0] * B, _samp)
     jax.block_until_ready(_ids); del _sets, _lg, _ids, _pos
-    log(f"   batched decode B={B}: {time.time() - t:.0f}s")
+    log(f"   batched decode B={B}: {time.time() - t:.0f}s, {grew()}")
     publish("compiling", what=f"decode B={B}", secs=int(time.time() - t))
 if getattr(eng, "dflash", None) is not None:          # draft (every block-size pair), verify + capture, head, rollback
     for T0 in sorted(DFLASH_COST):
@@ -1165,13 +1183,15 @@ if getattr(eng, "dflash", None) is not None:          # draft (every block-size 
         for _nt in sorted(DFLASH_COST):
             _e, _st = eng.dflash_step(_st, DeviceSampler(1.0, 0.95, seed=0), tuple(sorted(STOP_IDS)), next_T=_nt)
         del _lg, _cc, _st
-        log(f"   DFlash block {T0}: {time.time() - t:.0f}s")
+        eng.dflash_end()                              # (the last step's arrays, kept for a deferred release)
+        log(f"   DFlash block {T0}: {time.time() - t:.0f}s, {grew()}")
         publish("compiling", what=f"dflash T={T0}", secs=int(time.time() - t))
 n_shard = max(eng.lcfg.seq_shard, 1)
 for n_tok in range(SNAP_ROWS * n_shard, SNAP_WARM + 1, SNAP_ROWS * n_shard):
     cc = eng.alloc_caches(1)
     hs = eng.snapshot_to_host(eng.snapshot_prefix(cc, n_tok, rows_bucket=SNAP_ROWS)); del cc
     cc = eng.restore_prefix(eng.snapshot_from_host(hs)); jax.block_until_ready(cc[0]["state"] if "state" in cc[0] else cc[0]["c"]); del cc, hs
+log(f"   snapshot programs: {grew()}")
 use, lim = hbm()
 log(f"   warm-up done in {(time.time() - t_warm) / 60:.1f} min; HBM chip0 {use:.2f} / {lim:.2f} GB")
 if CACHE_DIR.exists():

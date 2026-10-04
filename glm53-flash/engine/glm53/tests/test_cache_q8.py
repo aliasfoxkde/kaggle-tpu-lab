@@ -26,7 +26,7 @@ def test_q8_sharded_matches_replicated_and_is_close_to_exact():
     b, cb, _ = run(q8_rep, ids)
     c, cc, _ = run(q8_shd, ids)
     mla = [i for i in range(jcfg.n_layers) if jcfg.layer_types[i] != "linear_attention"][0]
-    assert cc[mla]["c"].dtype == jnp.int8 and cc[mla]["cs"].dtype == jnp.float32 and cc[mla]["cs"].shape == (1, 128)
+    assert cc[mla]["c"].dtype == jnp.int32 and cc[mla]["cs"].dtype == jnp.float32 and cc[mla]["cs"].shape == (1, 128)
     assert ca[mla]["c"].dtype == jnp.float32 and "cs" not in ca[mla]
     worst = 0.0
     for i, (x, y, z) in enumerate(zip(a, b, c)):
@@ -47,9 +47,11 @@ def test_write_latent_error_bound():
     lcfg = dataclasses.replace(jcfg, cache_q8=True, seq_shard=1)
     rng = np.random.default_rng(0)
     x = jnp.asarray(rng.standard_normal((2, 5, jcfg.kv_lora)).astype(np.float32) * rng.uniform(0.1, 3.0, (2, 5, 1)))
-    cache = {"c": jnp.zeros((2, 16, jcfg.kv_lora), jnp.int8), "cs": jnp.zeros((2, 16), jnp.float32)}
+    cache = {"c": jnp.zeros((2, 16, jcfg.kv_lora // 4), jnp.int32), "cs": jnp.zeros((2, 16), jnp.float32)}   # int8 rows packed in int32
     new = M.write_latent(cache, x, 3, lcfg)
-    assert new["c"].dtype == jnp.int8 and new["cs"].shape == (2, 16)
+    assert new["c"].dtype == jnp.int32 and new["cs"].shape == (2, 16)
+    q = jnp.asarray(np.random.default_rng(3).integers(-127, 128, (3, 5, 64)), jnp.int8)
+    assert M.unpack_latent(M.pack_latent(q)).tolist() == q.astype(jnp.int32).tolist()           # the packing is exact
     back = M.latent_dequant(new["c"][:, 3:8], new["cs"][:, 3:8], jnp.float32)
     bound = jnp.max(jnp.abs(x), -1, keepdims=True) / 254 + 1e-6
     assert bool(jnp.all(jnp.abs(back - x) <= bound))
@@ -91,7 +93,7 @@ def test_q8_resident_pieces_snapshots_match_one_shot():
         np.testing.assert_allclose(y, x, rtol=1e-4, atol=1e-4, err_msg=f"pieces step {i}")
     _, caches, pos = eng.prefill(ids[:, :40])
     mla = [i for i in range(jcfg.n_layers) if jcfg.layer_types[i] != "linear_attention"][0]
-    assert caches[mla]["c"].dtype == jnp.int8 and caches[mla]["cs"].shape == (1, 128)
+    assert caches[mla]["c"].dtype == jnp.int32 and caches[mla]["cs"].shape == (1, 128)
     ps = eng.snapshot_prefix(caches, pos, rows_bucket=8)                 # rows are per chip; global shape = rows x 8
     n = eng.lcfg.seq_shard
     assert ps["caches"][mla]["cs"].shape[1] == ps["rows"] * n == 64 and ps["caches"][mla]["c"].shape[1] == ps["rows"] * n

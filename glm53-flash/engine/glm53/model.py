@@ -415,11 +415,12 @@ def cache_write(cache, new, pos0, cfg: Cfg, chip=None, valid=None):
 
 def mla_cache_shapes(cfg: Cfg, B, S, has_indexer, n=1):
     """Global cache shapes of one MLA layer for capacity S (per chip: the sequence/pool axis divided by n):
-    "c" latent [B,S,kvr] (+ "cs" [B,S] per-token scales when cfg.cache_q8: "c" is then int8); with an indexer "pk"
+    "c" latent [B,S,kvr] (+ "cs" [B,S] per-token scales when cfg.cache_q8: "c" then holds the int8 rows packed four
+    to an int32 word, [B,S,kvr/4] — `pack_latent`); with an indexer "pk"
     pooled indexer keys [B,S/kp,ihd] (one row per complete k-pool) and the raw keys/gates of the incomplete tail
     pool "tk"/"tg" [B,kp,ihd] (replicated, tiny). Dtypes: `cache_dtype`."""
     kp = cfg.idx_kpool
-    out = {"c": (B, S // n, cfg.kv_lora)}
+    out = {"c": (B, S // n, cfg.kv_lora // 4 if cfg.cache_q8 else cfg.kv_lora)}
     if cfg.cache_q8:
         out["cs"] = (B, S // n)
     if has_indexer:
@@ -431,16 +432,36 @@ ROW_KEYS = ("c", "cs", "pk")         # positional cache entries (rows per token 
 
 
 def cache_dtype(cfg: Cfg, key, dtype):
-    """dtype of one MLA cache entry: int8 latents + f32 scales under cache_q8, else the model dtype."""
+    """dtype of one MLA cache entry: int8 latents (packed in int32 words) + f32 scales under cache_q8, else the model
+    dtype."""
     if cfg.cache_q8 and key == "c":
-        return jnp.int8
+        return jnp.int32
     if key == "cs":
         return jnp.float32
     return dtype
 
 
+def pack_latent(q):
+    """int8 rows [..., kvr] -> int32 words [..., kvr/4] (the q8 latent cache's storage): word j holds the bytes of
+    elements j, j + kvr/4, j + kvr/2, j + 3 kvr/4 (byte k = element j + k kvr/4). An int8 cache has (32,128) tiles
+    while XLA writes and reads single rows in (8,128) tiles, so every program that touched it copied the whole
+    per-layer cache (16.8 MB per chip at 262k) in and out (v6e xprof 2026-10-04: ~1.7 ms per DFlash step); 32-bit
+    words have one natural tiling, and the strided byte order lets `unpack_latent` rebuild a row from four 128-lane
+    blocks with shifts (a bitcast to int8 needed a relayout of every gathered row). Values are unchanged."""
+    w = q.shape[-1] // 4
+    b = q.reshape(q.shape[:-1] + (4, w)).astype(jnp.int32) & 0xFF
+    return b[..., 0, :] | (b[..., 1, :] << 8) | (b[..., 2, :] << 16) | (b[..., 3, :] << 24)
+
+
+def unpack_latent(w):
+    """int32 words [..., kvr/4] (`pack_latent`) -> the int8 values [..., kvr], as int32 (sign-extended bytes)."""
+    return jnp.concatenate([(w << (24 - 8 * k)) >> 24 for k in range(4)], -1)
+
+
 def latent_dequant(q, s, dtype):
-    """int8 latent rows [..., kvr] x per-row scales [...] -> dtype."""
+    """int8 latent rows [..., kvr] (or their int32 packing, `pack_latent`) x per-row scales [...] -> dtype."""
+    if q.dtype == jnp.int32:
+        q = unpack_latent(q)
     return (q.astype(jnp.float32) * s.astype(jnp.float32)[..., None]).astype(dtype)
 
 
@@ -451,7 +472,7 @@ def write_latent(cache, new_c, pos0, cfg: Cfg, chip=None):
     x = new_c.astype(jnp.float32)
     s = jnp.maximum(jnp.max(jnp.abs(x), axis=-1), 1e-12) / 127.0                  # [B,T]
     q = jnp.clip(jnp.round(x / s[..., None]), -127, 127).astype(jnp.int8)
-    return {"c": cache_write(cache["c"], q, pos0, cfg, chip), "cs": cache_write(cache["cs"], s, pos0, cfg, chip)}
+    return {"c": cache_write(cache["c"], pack_latent(q), pos0, cfg, chip), "cs": cache_write(cache["cs"], s, pos0, cfg, chip)}
 
 
 def pool_new_keys(ix, tail_k, tail_g, new_k, new_g, pos0, cfg: Cfg, length, hist=False):
@@ -625,8 +646,11 @@ def mla_project(p, x, cfg: Cfg):
     wts [B,T,IH] f32 (its queries / head weights))."""
     B, T, _ = x.shape
     H, qk, dv, kvr = cfg.n_heads, cfg.qk_nope, cfg.v_hd, cfg.kv_lora
+    # T > 1 (a verify): XLA folds the reshape into a dot batched over heads and copies the dequantized q_b / wq_b into
+    # that layout on every call; a barrier keeps the plain 2-D product (v6e 2026-10-04: DFlash step -0.17 ms)
+    bar = (lambda a: a) if T == 1 else lax.optimization_barrier
     q_resid = rmsnorm(x @ p["q_a"], p["q_a_norm"], cfg.eps)
-    q = (q_resid @ p["q_b"]).reshape(B, T, H, qk)
+    q = bar(q_resid @ p["q_b"]).reshape(B, T, H, qk)
     new_c = rmsnorm(x @ p["kv_a"], p["kv_a_norm"], cfg.eps)                         # [B,T,kvr]
     kv_b = p["kv_b"].reshape(kvr, H, qk + dv)
     Wk = kv_b[:, :, :qk]
@@ -636,7 +660,7 @@ def mla_project(p, x, cfg: Cfg):
         IH, ihd = cfg.idx_heads, cfg.idx_hd
         out["nk"] = layernorm(x @ ix["wk"], ix["k_norm_w"], ix["k_norm_b"], 1e-6)
         out["ng"] = x @ ix["gate"]
-        out["qi"] = (q_resid @ ix["wq_b"]).reshape(B, T, IH, ihd).astype(jnp.float32)
+        out["qi"] = bar(q_resid @ ix["wq_b"]).reshape(B, T, IH, ihd).astype(jnp.float32)
         out["wts"] = (x @ ix["weights_proj"]).astype(jnp.float32) * (IH ** -0.5)     # [B,T,IH]
     return out
 
@@ -691,7 +715,7 @@ def mla_core(p, proj, cfg: Cfg, cache=None, pos0=0, sparse=None, cap=None, lengt
         S_local = c_all.shape[1]
         P_local = -(-S_local // kp)
         c_pools = jnp.pad(c_all, ((0, 0), (0, P_local * kp - S_local), (0, 0))) if S_local % kp else c_all
-        c_view = c_pools.reshape(B, P_local, kp * kvr)
+        c_view = c_pools.reshape(B, P_local, kp * c_all.shape[-1])                   # (kvr/4 int32 words under q8)
         if q8:
             cs_pools = jnp.pad(cs_all, ((0, 0), (0, P_local * kp - S_local))) if S_local % kp else cs_all
             cs_view = cs_pools.reshape(B, P_local, kp)
@@ -730,7 +754,7 @@ def mla_core(p, proj, cfg: Cfg, cache=None, pos0=0, sparse=None, cap=None, lengt
                 q_b, member, upool = args
                 idx = jnp.minimum(upool, P_local - 1)
                 keys = c_view.at[:, idx].get(mode="promise_in_bounds")                # [B,U,kp*kvr]
-                keys = keys.reshape(B, U * kp, kvr)                                 # the union's tokens, pool-major
+                keys = keys.reshape(B, U * kp, c_all.shape[-1])                     # the union's tokens, pool-major
                 if q8:
                     keys = latent_dequant(keys, cs_view.at[:, idx].get(mode="promise_in_bounds").reshape(B, U * kp), dtype)
                 slots = (upool[:, None] * kp + jnp.arange(kp)[None, :]).reshape(-1)

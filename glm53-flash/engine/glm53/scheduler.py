@@ -10,8 +10,10 @@ sampled ids cross to the host: token ids, positions and the sampler state stay o
 DFlash 2 (`spec`, with a drafter installed on the engine: `ResidentLayerEngine.set_dflash`): a stream that runs ALONE
 decodes speculatively (`dflash_start` / `dflash_step`: a block of T-1 drafts verified per step); as soon as a second
 stream is active, every stream is decoded in the batched plain steps again (its DFlash state hands its caches back).
-The block size is picked per stream and step from an EMA of the tokens per step (`DFlashPolicy`). Positions decoded in
-batched steps leave stale slots in that stream's drafter ring (lower acceptance for a while, never a wrong token).
+The block size is picked per stream and step from an EMA of the tokens per step (`DFlashPolicy`). Batched steps write
+every stream's positions into its own drafter ring too (`decode_rows` captures the features), so a stream that goes
+back to DFlash drafts with its full context. With temperature > 0 the drafts are accepted by rejection sampling
+against the target's distribution (every token distributed as plain sampling).
 """
 import collections
 import threading
@@ -207,7 +209,7 @@ class Scheduler:
         self.log, self.state = log, (state if state is not None else {})
         self.base_min, self.snap_min = base_min, snap_min
         self.piece = piece or eng.prefill_piece
-        self.min_free_gb = min_free_gb                  # HBM headroom an admission needs (prefill temporaries); 0 = off
+        self.min_free_gb = min_free_gb                  # HBM an admission needs (free_gb: a set, prefill temporaries, programs); 0 = off
         self.max_wait_s = max_wait_s                    # a request queued longer than this fails ("queue_timeout")
         self.live = collections.OrderedDict()            # finished contexts on the chips (LRU): key -> ctx dict
         self._live_n = 0
@@ -225,6 +227,8 @@ class Scheduler:
         self.steps = 0
         self.spec = spec if spec is not None and getattr(eng, "dflash", None) is not None else None
         self.seed = seed
+        self._buf_cache = None                           # (sets on the chips, live buffer bytes on chip 0): free_gb
+        self._grave = None                               # the last batched step's consumed caches (deferred release)
 
     # ---- client side
     def submit(self, req: Request):
@@ -270,9 +274,33 @@ class Scheduler:
         return len(self.active) + len(self.live)
 
     def free_gb(self):
-        """Free HBM on chip 0 in GB, or None when the backend reports no memory statistics (CPU tests)."""
+        """HBM an admission can count on, chip 0, in GB: bytes_limit minus the live device buffers (None when the backend
+        reports no memory statistics: CPU tests). bytes_in_use is NOT the measure: it also holds the runtime's cache of
+        loaded programs, which the runtime evicts when a buffer needs the room and reloads at a program's next run
+        (2026-10-03, v6e under the v5e budget: five 262k sets allocated where bytes_limit - bytes_in_use promised two,
+        and 0.3-0.6 GB of in-use were such programs). `min_free_gb` therefore covers a new set, one prefill piece's
+        temporaries AND the programs a decode step and a prefill piece need at once. The buffer sum (global arrays,
+        ~6 ms) is cached while the number of cache sets on the chips does not change."""
         st = self.eng.mesh.devices.flat[0].memory_stats() or {}
-        return (st["bytes_limit"] - st["bytes_in_use"]) / 1e9 if "bytes_limit" in st else None
+        if "bytes_limit" not in st:
+            return None
+        key = self.n_sets
+        if self._buf_cache is None or self._buf_cache[0] != key:
+            n = len(self.eng.mesh.devices.flat)
+            tot = 0
+            for a in jax.live_arrays():
+                try:
+                    if len(a.sharding.device_set) == n:
+                        tot += a.nbytes if a.sharding.is_fully_replicated else a.nbytes // n
+                except Exception:  # noqa: BLE001  (deleted arrays)
+                    pass
+            self._buf_cache = (key, tot)
+        return (st["bytes_limit"] - self._buf_cache[1]) / 1e9
+
+    def in_use_free_gb(self):
+        """bytes_limit - bytes_in_use on chip 0 (GB; the loaded programs count as used): for logs."""
+        st = self.eng.mesh.devices.flat[0].memory_stats() or {}
+        return round((st["bytes_limit"] - st["bytes_in_use"]) / 1e9, 3) if "bytes_limit" in st else None
 
     def _headroom(self):
         """True when an admission can allocate a cache set and run its prefill: parks live contexts (LRU) until the
@@ -314,7 +342,9 @@ class Scheduler:
                     req = self.pending.popleft()
                 elif self.pending and not self.active:                  # nothing running and still no room
                     if self._waits % 10 == 0:
-                        self.log(f"admission waits: {len(self.live)} live contexts, free HBM {self.free_gb()} GB")
+                        self.log(f"admission waits: {len(self.live)} live contexts, free HBM {self.free_gb():.3f} GB "
+                                 f"(in-use figure {self.in_use_free_gb()} GB)" if self.free_gb() is not None else
+                                 f"admission waits: {len(self.live)} live contexts")
                     self._waits += 1
                     self.cond.wait(timeout=1.0)
             if req is not None:
@@ -495,6 +525,7 @@ class Scheduler:
             self._members = members
         t0 = time.perf_counter()
         ids, logits, sets, pos_next = self.eng.decode_rows(self._toks, [s.caches for s in act], self._pos, self.sampler)
+        self._grave = None                     # the last step's consumed caches: released while the device runs this one
         ids_h = np.asarray(ids)                                         # the one device -> host sync per step
         forced = False
         for r, s in enumerate(act):                                     # a budget reached: feed its forced tokens
@@ -517,6 +548,7 @@ class Scheduler:
             st["step_s"] = st.get("step_s", 0.0) + (t1 - self._t_step)
             st["steps_busy"] = st.get("steps_busy", 0) + 1
         self._t_step = t1
+        self._grave = [s.caches for s in act]           # (dropping ~126 arrays per set costs ~1.5 ms of host time)
         for r, s in enumerate(act):                                     # every row takes its new caches first
             s.caches, s.pos = sets[r], s.pos + 1
             s.seen.append(s.tok)
@@ -542,6 +574,7 @@ class Scheduler:
         if s.spec is None:
             return
         s.caches, s.pos, s.spec = s.spec["caches"], s.spec["pos_h"], None
+        self.eng.dflash_end()
         self._members = None
 
     def _spec_step(self, s):
@@ -551,7 +584,7 @@ class Scheduler:
                 self.spec.start(s)
             if s.sampler is None:
                 s.sampler = DeviceSampler(req.temperature, req.top_p, seed=self.seed)
-            s.spec = self.eng.dflash_start(np.array([s.tok]), s.caches, s.pos, T=self.spec.pick(s))
+            s.spec = self.eng.dflash_start(np.array([s.tok]), s.caches, s.pos, T=self.spec.pick(s), sampler=s.sampler)
             s.caches = None
             self._members = None
         T = s.spec["T"]
