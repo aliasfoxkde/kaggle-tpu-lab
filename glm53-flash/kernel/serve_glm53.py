@@ -70,9 +70,9 @@ DEFAULTS = {
                                      # dataset (config.json + model.safetensors of incoai/GLM-5.3-Flash-DFlash2: CC BY-NC-ND
                                      # 4.0, research only -> attach it yourself); "" = off
     "dflash_int8": True,             # the drafter's big matrices as int8 (159 instead of 295 MB per chip, same acceptance)
-    "dflash_cost": {"4": 21.2},      # ms per DFlash step by block size (v6e-8, 2026-10-03) = the block sizes compiled:
-                                     # {"4": 21.2, "8": 27.3} also drafts 8 (math-like text x1.97 instead of x1.64) but its
-                                     # programs cost ~0.23 GB/chip = one of the two 262k streams DFlash leaves
+    "dflash_cost": {"4": 14.6},      # ms per DFlash step by block size (v6e-8, 2026-10-04) = the block sizes compiled:
+                                     # {"4": ..., "8": ...} also drafts 8 (2026-10-03: math-like text x1.97 instead of
+                                     # x1.64, no gain overall at temperature 1.0; its programs only add warm-up)
     "dflash_prior": {"4": 2.8, "8": 3.3},    # tokens per step a new stream assumes until it has measured its own
     "dflash_draft_temp": 0.7,        # drafts are drawn at this x the request's temperature; the verify accepts them by
                                      # rejection sampling (output distributed exactly as plain sampling)

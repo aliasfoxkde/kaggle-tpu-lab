@@ -245,6 +245,15 @@ DECODE = {"IQ2_S": _decode_iq2_s, "IQ3_S": _decode_iq3_s, "IQ4_XS": _decode_iq4_
           "Q3_K": _decode_q3_k}
 
 
+def _shared(*static):
+    """jax.jit with these static arguments around a kernel entry point: every call site with the same configuration and
+    shapes shares ONE trace and lowering (XLA inlines the call; same HLO). Without it each call site re-traced and
+    re-lowered its kernel in Python — v6e 2026-10-04, jobs/j125: ~3.6 s per MoE layer per program for the per-slot
+    kernels and ~25 s for the grouped ones (845 s for the five T = 4 verify programs), while the XLA/Mosaic compile
+    of 1 or 4 identical kernels took the same time."""
+    return lambda f: jax.jit(f, static_argnames=static)
+
+
 def _table_arrays(qtype):
     if qtype == "IQ4_XS":
         return jnp.asarray(kv16_table())
@@ -307,6 +316,7 @@ def _offsets(keys, rows_p, e):
     return {k: (lax.rem(e * rows_p[k], SUB) if rows_p[k] % SUB else None) for k in keys}
 
 
+@_shared("qtype", "nblk", "interpret", "lane_block")
 def moe_matvec(planes, qtype, nblk, idx, X, *, interpret=False, lane_block=None):
     """planes: {k: u32 [E*rows_p, R] or [1, E*rows_p, R]}; idx int32 [Nk]; X f32 [Nk, W, C] -> f32 [Nk, R].
 
@@ -364,6 +374,7 @@ def moe_matvec(planes, qtype, nblk, idx, X, *, interpret=False, lane_block=None)
     return fn(idx, *args).reshape(Nk, R)
 
 
+@_shared("qtype", "nblk", "interpret", "k")
 def moe_matvec_gu(planes_g, planes_u, qtype, nblk, idx, X, *, interpret=False, k=1):
     """gate and up of the same expert slots in ONE kernel: planes_{g,u} as in `moe_matvec` (same qtype and shape,
     R <= 1024 rows: all lane vregs unrolled), X f32 [Nk / k, W, C] = one row per TOKEN, whose k consecutive slots
@@ -421,144 +432,309 @@ def moe_matvec_gu(planes_g, planes_u, qtype, nblk, idx, X, *, interpret=False, k
 
 
 # ---------------------------------------------------------------- grouped slots (a multi-token step of one sequence)
-# A verify of T tokens of ONE sequence routes T*k slots, and neighbouring tokens share experts (v6e j64: ~24 distinct
-# of 32 slots at T = 4). These variants take one grid step per DISTINCT expert: its weights are decoded once and
-# multiplied into the accumulators of every token routed to it (up to tm), each in exactly the per-slot kernel's
-# order (bit-identical results). Groups past n_groups repeat the last expert id (no new plane DMA) and skip compute.
-def _fill_bx_multi(x_ref, bx_ref, nb, C, tm):
-    """`_fill_bx` for the tm tokens of a group: bx[(t*nb + b)*C + c] = X[t, 8b:8b+8, c] broadcast along lanes."""
-    for t in range(tm):
-        for b in range(nb):
-            xb = x_ref[t, SUB * b:SUB * (b + 1), :]
-            for c in range(C):
-                bx_ref[(t * nb + b) * C + c] = jnp.broadcast_to(xb[:, c:c + 1], (SUB, LANES))
+# A verify of T tokens of ONE sequence routes S = T*k slots, and neighbouring tokens share experts (v6e j64: ~24
+# distinct of 32 slots at T = 4). These variants take one grid step per DISTINCT expert: its weights are decoded once
+# and multiplied into the accumulators of every slot routed to it, each in exactly the per-slot kernel's order
+# (bit-identical results). The step runs the body of the smallest size class >= its slot count (the classes are
+# unrolled bodies of 1..tm accumulators; a group below its class repeats its last slot, which recomputes and rewrites
+# the same values), so a single-token group pays one MAC per weight, not tm. Activations and outputs stay whole in
+# VMEM (dynamic slot indices, no reordering outside the kernel); gate+up broadcasts every token's activation once for
+# the whole call. Groups past n_groups have count 0: they repeat the last expert id (no new plane DMA) and skip compute.
+# (The first version, 2026-10-04, ran every group at tm = T with per-group broadcasts: 21.9 vs 17.3 ms per DFlash step.)
+def group_plan(idx):
+    """idx int32 [T, k] (a token's k experts distinct) -> eids int32 [S] (the distinct experts in first-slot order,
+    then the last one repeated), cnt int32 [S] (slots per group, 0 past the distinct count), slots int32 [S * T]
+    (row g = the slots of group g in slot order; entries past cnt repeat the group's last slot). Exact integer ops on
+    S x S compares (no sort, no gather)."""
+    T, k = idx.shape
+    S = T * k
+    flat = idx.reshape(-1)
+    eq = flat[:, None] == flat[None, :]
+    earlier = jnp.tril(eq, -1)
+    first = ~jnp.any(earlier, axis=1)                                   # the first slot of each expert
+    gid = jnp.cumsum(first.astype(jnp.int32)) - 1
+    g_of = jnp.sum(jnp.where(eq & first[None, :], gid[None, :], 0), axis=1)     # [S] the group of every slot
+    rank = jnp.sum(earlier, axis=1, dtype=jnp.int32)                    # [S] its place in the group
+    n_groups = jnp.sum(first, dtype=jnp.int32)
+    ga = jnp.arange(S, dtype=jnp.int32)
+    member = g_of[None, :] == ga[:, None]                               # [G, S]
+    cnt = jnp.sum(member, axis=1, dtype=jnp.int32)
+    eids = jnp.sum(jnp.where(member & first[None, :], flat[None, :], 0), axis=1)
+    last = jnp.sum(jnp.where(ga == n_groups - 1, eids, 0))
+    eids = jnp.where(ga < n_groups, eids, last)
+    want = jnp.minimum(jnp.arange(T, dtype=jnp.int32)[None, :], jnp.maximum(cnt - 1, 0)[:, None])     # [G, T]
+    hit = member[:, None, :] & (rank[None, None, :] == want[:, :, None])                              # [G, T, S]
+    slots = jnp.sum(jnp.where(hit, ga[None, None, :], 0), axis=2)
+    return eids.astype(jnp.int32), cnt, slots.reshape(-1).astype(jnp.int32)
 
 
-def _matvec_lanes_multi(decode, rows, tb, bx_ref, nb, C, tm):
-    """`_matvec_lanes` for tm tokens sharing the expert: each weight vreg decoded once, tm accumulators -> tm x (1, 128)."""
-    outs = [jnp.zeros((SUB, LANES), jnp.float32) for _ in range(tm)]
+def _class_bodies(classes, cnt, body):
+    """Run body(c) for the size class c that holds `cnt` slots (classes ascending; cnt 0 runs nothing)."""
+    lo = 1
+    for c in classes:
+        pl.when((cnt >= lo) & (cnt <= c))(functools.partial(body, c))
+        lo = c + 1
+
+
+def _fill_bx_at(x_ref, xi, bx_ref, base, nb, C):
+    """`_fill_bx` for row xi of a whole-array X ref into bx_ref[base:base + nb*C]."""
+    for b in range(nb):
+        xb = x_ref[xi, SUB * b:SUB * (b + 1), :]
+        for c in range(C):
+            bx_ref[base + (b * C + c)] = jnp.broadcast_to(xb[:, c:c + 1], (SUB, LANES))
+
+
+def _matvec_lanes_grouped(decode, rows, tb, bx_ref, bases, nb, C):
+    """`_matvec_lanes` for the slots sharing the expert: each weight vreg decoded once, one accumulator per slot whose
+    activation broadcasts start at bx_ref[bases[j]] -> len(bases) x (1, 128), each in `_matvec_lanes`' order."""
+    n = len(bases)
+    outs = [jnp.zeros((SUB, LANES), jnp.float32) for _ in range(n)]
     for b in range(nb):
         for scale, items in decode(b, rows, tb):
-            accs = [jnp.zeros((SUB, LANES), jnp.float32) for _ in range(tm)]
+            accs = [jnp.zeros((SUB, LANES), jnp.float32) for _ in range(n)]
             for c, val in items:
-                for t in range(tm):
-                    accs[t] = accs[t] + val * bx_ref[(t * nb + b) * C + c]
-            for t in range(tm):
-                outs[t] = outs[t] + accs[t] * scale
+                for j in range(n):
+                    accs[j] = accs[j] + val * bx_ref[bases[j] + (b * C + c)]
+            for j in range(n):
+                outs[j] = outs[j] + accs[j] * scale
     return [jnp.sum(o, axis=0, keepdims=True) for o in outs]
 
 
-def moe_matvec_gu_multi(planes_g, planes_u, qtype, nblk, eids, n_groups, X, *, interpret=False):
-    """`moe_matvec_gu` over grouped slots: eids int32 [G] (distinct experts first; the rest repeat the last), n_groups
-    int32 [1], X f32 [G, tm, W, C] (the tokens of each group, zero rows past its size) -> (g, u) f32 [G, tm, R] each
-    (rows of groups >= n_groups are undefined)."""
+def _decode_store(decode, rows, tb, w_ref, s_ref, wi, si, nb):
+    """Decode one lane vreg's weights once into VMEM: values to w_ref[wi:], scales to s_ref[si:], in `_matvec_lanes`'
+    order -> (wi, si) after them and the static plan [(b, [c, ...]) per scale] for `_mac_stored`."""
+    plan = []
+    for b in range(nb):
+        for scale, items in decode(b, rows, tb):
+            s_ref[si] = scale
+            si += 1
+            for c, val in items:
+                w_ref[wi] = val
+                wi += 1
+            plan.append((b, [c for c, _ in items]))
+    return wi, si, plan
+
+
+def _mac_stored(w_ref, s_ref, wi, si, plan, bx_ref, base, C):
+    """`_matvec_lanes` of one slot from the values `_decode_store` wrote (same products and sums, same order)."""
+    out = jnp.zeros((SUB, LANES), jnp.float32)
+    for b, cs in plan:
+        acc = jnp.zeros((SUB, LANES), jnp.float32)
+        for c in cs:
+            acc = acc + w_ref[wi] * bx_ref[base + (b * C + c)]
+            wi += 1
+        out = out + acc * s_ref[si]
+        si += 1
+    return jnp.sum(out, axis=0, keepdims=True)
+
+
+def _n_values(qtype, nb):
+    """(values, scales) that DECODE[qtype] produces for one lane vreg of nb word blocks (an abstract trace)."""
+    counts = []
+
+    def f():
+        z = lambda k, r0, n: jnp.zeros((n, LANES), jnp.uint32)                             # noqa: E731
+        tbl = _table_arrays(qtype)
+        tb = [jnp.zeros((SUB, LANES), tbl.dtype)] * (1 if qtype == "IQ4_XS" else tbl.shape[0])
+        out = []
+        for b in range(nb):
+            for scale, items in DECODE[qtype](b, z, tb):
+                counts.append(len(items))
+                out.append(scale)
+        return out
+    jax.eval_shape(f)
+    return sum(counts), len(counts)
+
+
+def _n_steps(cnt, G, dynamic):
+    return jnp.sum(cnt > 0, dtype=jnp.int32) if dynamic else G
+
+
+def _grouped_geometry(planes, qtype, nblk, eids, cnt, slots, classes, loop):
+    """Shapes of a grouped call; classes = the fused (unrolled) body sizes: without `loop` up to tm (default 1..tm),
+    with `loop` the listed ones below tm (default (1,)) and larger counts take the decode-once loop."""
     keys = PL.PLANE_KEYS[qtype]
     rows_p = PL.plane_rows(qtype, nblk)
-    W = PL.WORDS_PER_BLOCK[qtype] * nblk
-    C = PL.PLANES_PER_WORD[qtype]
-    first = planes_g[keys[0]]
-    lead = first.ndim == 3
-    R = first.shape[-1]
-    G, tm = X.shape[:2]
-    assert X.shape == (G, tm, W, C), (X.shape, (G, tm, W, C))
+    G = eids.shape[0]
+    assert cnt.shape == (G,) and slots.shape[0] % G == 0, (eids.shape, cnt.shape, slots.shape)
+    tm = slots.shape[0] // G
+    classes = tuple(classes) or ((1,) if loop else tuple(range(1, tm)))
+    classes = tuple(sorted(set(c for c in classes if c < tm))) + (() if loop else (tm,))
+    first = planes[keys[0]]
+    return (keys, rows_p, PL.WORDS_PER_BLOCK[qtype] * nblk, PL.PLANES_PER_WORD[qtype], first.ndim == 3,
+            first.shape[-1], G, tm, classes, {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys})
+
+
+@_shared("qtype", "nblk", "k", "classes", "interpret", "dynamic_grid", "loop")
+def moe_matvec_gu_grouped(planes_g, planes_u, qtype, nblk, eids, cnt, slots, X, *, k, classes=(), interpret=False,
+                          dynamic_grid=False, loop=False):
+    """`moe_matvec_gu` over grouped slots (`group_plan`): X f32 [T, W, C] one row per TOKEN (slot s is token s // k)
+    -> (g, u) f32 [S, R] each, in slot order. classes: the unrolled body sizes below tm (= T, always one); () = all.
+    dynamic_grid: one grid step per distinct expert (a traced grid bound) instead of G with empty steps at the end.
+    loop: groups above the fused classes decode the expert once into VMEM and run one MAC pass per slot from it (a
+    fori_loop over the group's slots: the kernel's code no longer grows with the class sizes; compile time)."""
+    keys, rows_p, W, C, lead, R, G, tm, classes, blocks = _grouped_geometry(planes_g, qtype, nblk, eids, cnt, slots,
+                                                                            classes, loop)
+    T = X.shape[0]
+    S = T * k
+    assert X.shape == (T, W, C) and tm <= T, (X.shape, (T, W, C), tm)
     assert R % LANES == 0 and R <= 1024 and W % SUB == 0, (R, W)
+    assert all(planes_u[kk].shape == planes_g[kk].shape for kk in keys)
     n_vreg = R // LANES
     nb = W // SUB
     nk = len(keys)
     tbl = _table_arrays(qtype)
-    blocks = {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys}
     decode = DECODE[qtype]
 
-    def kernel(eid_ref, ng_ref, *refs):
-        g_refs, u_refs = dict(zip(keys, refs[:nk])), dict(zip(keys, refs[nk:2 * nk]))
-        tbl_ref, x_ref, o_ref, bx_ref = refs[2 * nk:]
-        g = pl.program_id(0)                       # (read outside pl.when: interpret mode cannot inside a branch)
-        offs = _offsets(keys, rows_p, eid_ref[g])
+    nv, ns = _n_values(qtype, nb)
 
-        @pl.when(g < ng_ref[0])
-        def _():
+    def kernel(eid_ref, cnt_ref, slot_ref, *refs):
+        g_refs, u_refs = dict(zip(keys, refs[:nk])), dict(zip(keys, refs[nk:2 * nk]))
+        tbl_ref, x_ref, o_ref, bx_ref = refs[2 * nk:2 * nk + 4]
+        g = pl.program_id(0)                       # (scalars read outside pl.when: interpret mode cannot inside)
+        offs = _offsets(keys, rows_p, eid_ref[g])
+        n = cnt_ref[g]
+        sl = [slot_ref[g * tm + j] for j in range(tm)]
+        bases = [(s // k) * (nb * C) for s in sl]
+
+        @pl.when(g == 0)
+        def _():                                   # every token's broadcasts, once for the call
+            for t in range(T):
+                _fill_bx_at(x_ref, t, bx_ref, t * nb * C, nb, C)
+
+        def body(c):
             tb = _table_rows(tbl_ref, qtype)
-            _fill_bx_multi(x_ref, bx_ref, nb, C, tm)
             for m, prefs in enumerate((g_refs, u_refs)):
                 for v in range(n_vreg):
                     lanes = slice(v * LANES, (v + 1) * LANES)
-                    res = _matvec_lanes_multi(decode, _rows_fn(prefs, offs, lanes), tb, bx_ref, nb, C, tm)
-                    for t in range(tm):
-                        o_ref[t, m:m + 1, lanes] = res[t]
+                    res = _matvec_lanes_grouped(decode, _rows_fn(prefs, offs, lanes), tb, bx_ref, bases[:c], nb, C)
+                    for j in range(c):
+                        o_ref[sl[j], m:m + 1, lanes] = res[j]
+        _class_bodies(classes, n, body)
 
-    def plane_spec(k):
-        B = blocks[k]
+        def decode_once_loop():
+            w_ref, s_ref = refs[2 * nk + 4:]
+            tb = _table_rows(tbl_ref, qtype)
+            plans, wi, si = [], 0, 0
+            for m, prefs in enumerate((g_refs, u_refs)):
+                for v in range(n_vreg):
+                    wi0, si0 = wi, si
+                    wi, si, plan = _decode_store(decode, _rows_fn(prefs, offs, slice(v * LANES, (v + 1) * LANES)),
+                                                 tb, w_ref, s_ref, wi, si, nb)
+                    plans.append((m, v, wi0, si0, plan))
+
+            def one_slot(j, carry):
+                s_ = slot_ref[g * tm + j]
+                base = (s_ // k) * (nb * C)
+                for m, v, wi0, si0, plan in plans:
+                    o_ref[s_, m:m + 1, v * LANES:(v + 1) * LANES] = _mac_stored(w_ref, s_ref, wi0, si0, plan, bx_ref,
+                                                                                 base, C)
+                return carry
+            lax.fori_loop(0, n, one_slot, 0)
+        if loop:
+            pl.when(n > (classes[-1] if classes else 0))(decode_once_loop)
+
+    def plane_spec(kk):
+        B = blocks[kk]
         if lead:
-            return pl.BlockSpec((None, B, R), lambda i, eid_ref, ng_ref: (0, (eid_ref[i] * rows_p[k]) // B, 0))
-        return pl.BlockSpec((B, R), lambda i, eid_ref, ng_ref: ((eid_ref[i] * rows_p[k]) // B, 0))
+            return pl.BlockSpec((None, B, R), lambda i, e, c, s: (0, (e[i] * rows_p[kk]) // B, 0))
+        return pl.BlockSpec((B, R), lambda i, e, c, s: ((e[i] * rows_p[kk]) // B, 0))
 
-    in_specs = [plane_spec(k) for k in keys] * 2
-    in_specs += [pl.BlockSpec(tbl.shape, lambda i, eid_ref, ng_ref: (0, 0)),
-                 pl.BlockSpec((None, tm, W, C), lambda i, eid_ref, ng_ref: (i, 0, 0, 0))]
-    grid_spec = pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=2, grid=(G,), in_specs=in_specs,
-                                             out_specs=pl.BlockSpec((None, tm, 2, R), lambda i, eid_ref, ng_ref: (i, 0, 0, 0)),
-                                             scratch_shapes=[pltpu.VMEM((tm * nb * C, SUB, LANES), jnp.float32)])
-    fn = pl.pallas_call(kernel, grid_spec=grid_spec, out_shape=jax.ShapeDtypeStruct((G, tm, 2, R), jnp.float32),
-                        interpret=interpret, compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)))
-    out = fn(eids, n_groups, *[planes_g[k] for k in keys], *[planes_u[k] for k in keys], tbl, X)
-    return out[:, :, 0], out[:, :, 1]
+    in_specs = [plane_spec(kk) for kk in keys] * 2
+    in_specs += [pl.BlockSpec(tbl.shape, lambda i, e, c, s: (0, 0)),
+                 pl.BlockSpec((T, W, C), lambda i, e, c, s: (0, 0, 0))]
+    grid_spec = pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=3, grid=(_n_steps(cnt, G, dynamic_grid),),
+                                             in_specs=in_specs,
+                                             out_specs=pl.BlockSpec((S, 2, R), lambda i, e, c, s: (0, 0, 0)),
+                                             scratch_shapes=[pltpu.VMEM((T * nb * C, SUB, LANES), jnp.float32)] + (
+                                                 [pltpu.VMEM((2 * n_vreg * nv, SUB, LANES), jnp.float32),
+                                                  pltpu.VMEM((2 * n_vreg * ns, SUB, LANES), jnp.float32)] if loop else []))
+    fn = pl.pallas_call(kernel, grid_spec=grid_spec, out_shape=jax.ShapeDtypeStruct((S, 2, R), jnp.float32),
+                        interpret=interpret,
+                        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",),
+                                                             vmem_limit_bytes=32 * 2 ** 20))
+    out = fn(eids, cnt, slots, *[planes_g[kk] for kk in keys], *[planes_u[kk] for kk in keys], tbl, X)
+    return out[:, 0], out[:, 1]
 
 
-def moe_matvec_multi(planes, qtype, nblk, eids, n_groups, X, *, interpret=False, lane_block=None):
-    """`moe_matvec` over grouped slots (see `moe_matvec_gu_multi`): X f32 [G, tm, W, C] -> f32 [G, tm, R]."""
-    keys = PL.PLANE_KEYS[qtype]
-    rows_p = PL.plane_rows(qtype, nblk)
-    W = PL.WORDS_PER_BLOCK[qtype] * nblk
-    C = PL.PLANES_PER_WORD[qtype]
-    first = planes[keys[0]]
-    lead = first.ndim == 3
-    R = first.shape[-1]
-    G, tm = X.shape[:2]
-    assert X.shape == (G, tm, W, C), (X.shape, (G, tm, W, C))
-    assert R % LANES == 0 and W % SUB == 0, (R, W)
-    LB = lane_block or min(R, 4096)
-    assert R % LB == 0 and LB % LANES == 0, (R, LB)
-    n_lb = R // LB
-    n_vreg = LB // LANES
+@_shared("qtype", "nblk", "classes", "interpret", "dynamic_grid", "loop")
+def moe_matvec_grouped(planes, qtype, nblk, eids, cnt, slots, X, *, classes=(), interpret=False, dynamic_grid=False,
+                       loop=False):
+    """`moe_matvec` over grouped slots (`group_plan`): X f32 [S, W, C] one row per SLOT -> f32 [S, R] in slot order
+    (all R rows in one grid step per group; the group's slots are broadcast at the start of its step; `loop`: see
+    `moe_matvec_gu_grouped`, each slot's broadcasts made in its pass)."""
+    keys, rows_p, W, C, lead, R, G, tm, classes, blocks = _grouped_geometry(planes, qtype, nblk, eids, cnt, slots,
+                                                                            classes, loop)
+    S = X.shape[0]
+    assert X.shape == (S, W, C), (X.shape, (S, W, C))
+    assert R % LANES == 0 and R <= 4096 and W % SUB == 0, (R, W)
+    n_vreg = R // LANES
     nb = W // SUB
     tbl = _table_arrays(qtype)
-    blocks = {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys}
     decode = DECODE[qtype]
 
-    def kernel(eid_ref, ng_ref, *refs):
-        plane_refs = dict(zip(keys, refs[:len(keys)]))
-        tbl_ref, x_ref, o_ref, bx_ref = refs[len(keys):]
-        g, first_lb = pl.program_id(0), pl.program_id(1) == 0
-        offs = _offsets(keys, rows_p, eid_ref[g])
+    nv, ns = _n_values(qtype, nb)
 
-        @pl.when(g < ng_ref[0])
-        def _():
+    def kernel(eid_ref, cnt_ref, slot_ref, *refs):
+        plane_refs = dict(zip(keys, refs[:len(keys)]))
+        tbl_ref, x_ref, o_ref, bx_ref = refs[len(keys):len(keys) + 4]
+        g = pl.program_id(0)
+        offs = _offsets(keys, rows_p, eid_ref[g])
+        n = cnt_ref[g]
+        sl = [slot_ref[g * tm + j] for j in range(tm)]
+
+        def body(c):
+            for j in range(c):
+                _fill_bx_at(x_ref, sl[j], bx_ref, j * nb * C, nb, C)
             tb = _table_rows(tbl_ref, qtype)
-            pl.when(first_lb)(lambda: _fill_bx_multi(x_ref, bx_ref, nb, C, tm))
+            bases = [j * nb * C for j in range(c)]
             for v in range(n_vreg):
                 lanes = slice(v * LANES, (v + 1) * LANES)
-                res = _matvec_lanes_multi(decode, _rows_fn(plane_refs, offs, lanes), tb, bx_ref, nb, C, tm)
-                for t in range(tm):
-                    o_ref[t, :, lanes] = res[t]
+                res = _matvec_lanes_grouped(decode, _rows_fn(plane_refs, offs, lanes), tb, bx_ref, bases, nb, C)
+                for j in range(c):
+                    o_ref[sl[j], :, lanes] = res[j]
+        _class_bodies(classes, n, body)
 
-    def plane_spec(k):
-        B = blocks[k]
+        def decode_once_loop():
+            w_ref, s_ref = refs[len(keys) + 4:]
+            tb = _table_rows(tbl_ref, qtype)
+            plans, wi, si = [], 0, 0
+            for v in range(n_vreg):
+                wi0, si0 = wi, si
+                wi, si, plan = _decode_store(decode, _rows_fn(plane_refs, offs, slice(v * LANES, (v + 1) * LANES)),
+                                             tb, w_ref, s_ref, wi, si, nb)
+                plans.append((v, wi0, si0, plan))
+
+            def one_slot(j, carry):
+                s_ = slot_ref[g * tm + j]
+                _fill_bx_at(x_ref, s_, bx_ref, 0, nb, C)
+                for v, wi0, si0, plan in plans:
+                    o_ref[s_, :, v * LANES:(v + 1) * LANES] = _mac_stored(w_ref, s_ref, wi0, si0, plan, bx_ref, 0, C)
+                return carry
+            lax.fori_loop(0, n, one_slot, 0)
+        if loop:
+            pl.when(n > (classes[-1] if classes else 0))(decode_once_loop)
+
+    def plane_spec(kk):
+        B = blocks[kk]
         if lead:
-            return pl.BlockSpec((None, B, LB), lambda i, cb, eid_ref, ng_ref: (0, (eid_ref[i] * rows_p[k]) // B, cb))
-        return pl.BlockSpec((B, LB), lambda i, cb, eid_ref, ng_ref: ((eid_ref[i] * rows_p[k]) // B, cb))
+            return pl.BlockSpec((None, B, R), lambda i, e, c, s: (0, (e[i] * rows_p[kk]) // B, 0))
+        return pl.BlockSpec((B, R), lambda i, e, c, s: ((e[i] * rows_p[kk]) // B, 0))
 
-    in_specs = [plane_spec(k) for k in keys]
-    in_specs += [pl.BlockSpec(tbl.shape, lambda i, cb, eid_ref, ng_ref: (0, 0)),
-                 pl.BlockSpec((None, tm, W, C), lambda i, cb, eid_ref, ng_ref: (i, 0, 0, 0))]
-    out_spec = pl.BlockSpec((None, tm, 1, LB), lambda i, cb, eid_ref, ng_ref: (i, 0, 0, cb))
-    grid_spec = pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=2, grid=(G, n_lb), in_specs=in_specs,
-                                             out_specs=out_spec,
-                                             scratch_shapes=[pltpu.VMEM((tm * nb * C, SUB, LANES), jnp.float32)])
-    fn = pl.pallas_call(kernel, grid_spec=grid_spec, out_shape=jax.ShapeDtypeStruct((G, tm, 1, R), jnp.float32),
+    in_specs = [plane_spec(kk) for kk in keys]
+    in_specs += [pl.BlockSpec(tbl.shape, lambda i, e, c, s: (0, 0)),
+                 pl.BlockSpec((S, W, C), lambda i, e, c, s: (0, 0, 0))]
+    grid_spec = pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=3, grid=(_n_steps(cnt, G, dynamic_grid),),
+                                             in_specs=in_specs,
+                                             out_specs=pl.BlockSpec((S, 1, R), lambda i, e, c, s: (0, 0, 0)),
+                                             scratch_shapes=[pltpu.VMEM((tm * nb * C, SUB, LANES), jnp.float32)] + (
+                                                 [pltpu.VMEM((n_vreg * nv, SUB, LANES), jnp.float32),
+                                                  pltpu.VMEM((n_vreg * ns, SUB, LANES), jnp.float32)] if loop else []))
+    fn = pl.pallas_call(kernel, grid_spec=grid_spec, out_shape=jax.ShapeDtypeStruct((S, 1, R), jnp.float32),
                         interpret=interpret,
-                        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary", "arbitrary")))
-    args = [planes[k] for k in keys] + [tbl, X]
-    return fn(eids, n_groups, *args).reshape(G, tm, R)
+                        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",),
+                                                             vmem_limit_bytes=32 * 2 ** 20))
+    return fn(eids, cnt, slots, *[planes[kk] for kk in keys], tbl, X).reshape(S, R)
 
 
 def moe_matvec_ref(planes, qtype, nblk, idx, X):
@@ -867,6 +1043,7 @@ def _ragged_call(kernel, planes_list, keys, rows_p, blocks, tbl, act, out_dtype,
     return fn(be, n_blocks, *args)
 
 
+@_shared("qtype", "nblk", "limit", "tm", "interpret", "lane_block", "vmem_mb")
 def moe_ragged_gateup(planes_g, planes_u, qtype, nblk, blk_expert, n_blocks, xs, limit, *, tm=32, interpret=False,
                       lane_block=None, vmem_mb=48):
     """Grouped prefill GEMM, gate + up. xs [Rp, n_in] in pm_mxu order, rows sorted by expert in blocks of `tm` rows
@@ -934,6 +1111,7 @@ def moe_ragged_gateup(planes_g, planes_u, qtype, nblk, blk_expert, n_blocks, xs,
                         interpret, vmem_mb, blk_expert, n_blocks)
 
 
+@_shared("qtype", "nblk", "tm", "interpret", "lane_block", "vmem_mb", "out_dtype")
 def moe_ragged_down(planes, qtype, nblk, blk_expert, n_blocks, hs, *, tm=32, interpret=False, lane_block=None,
                     vmem_mb=48, out_dtype=None):
     """Grouped prefill GEMM, down. hs [Rp, n_in] (pm_mxu order, sorted rows as in `moe_ragged_gateup`) ->

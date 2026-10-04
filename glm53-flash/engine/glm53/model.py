@@ -465,6 +465,21 @@ def latent_dequant(q, s, dtype):
     return (q.astype(jnp.float32) * s.astype(jnp.float32)[..., None]).astype(dtype)
 
 
+def gather_scalars(a, idx):
+    """a [B, S] (per-row latent scales), idx [B, Tq, W] in-range int32 -> a[b, idx] [B, Tq, W]: the 128-value rows
+    holding them (a row gather, like the latent rows' own) and a lane select — exact. An element gather of scalars is
+    slower on the TPU (v6e 2026-10-04, jobs/j127, gather + dequant per MLA layer: Tq = 1 34 -> 27 us, Tq = 4 67 -> 35
+    us in isolation; but in the T = 4 verify the 4 MB of rows per layer made the step's other fusions slower: used
+    for single-query steps only)."""
+    B, S = a.shape
+    if S % 128:
+        return jnp.take_along_axis(a[:, None], idx, axis=2, mode="promise_in_bounds")
+    rows = jnp.take_along_axis(a.reshape(B, 1, S // 128, 128), (idx // 128)[..., None], axis=2,
+                               mode="promise_in_bounds")                                     # [B, Tq, W, 128]
+    lane = jnp.arange(128, dtype=idx.dtype) == (idx % 128)[..., None]
+    return jnp.sum(jnp.where(lane, rows, jnp.zeros((), rows.dtype)), -1)
+
+
 def write_latent(cache, new_c, pos0, cfg: Cfg, chip=None):
     """New latents [B,T,kvr] into the cache at pos0 -> the updated {"c"} (or {"c", "cs"}: per-token absmax int8)."""
     if not cfg.cache_q8:
@@ -523,6 +538,27 @@ def indexer_pool(ix, keys, gates, cfg: Cfg):
     return (probs * kpad).sum(2), tok_valid.all(-1)
 
 
+def top_k(x, k, chunk=None):
+    """`lax.top_k` over the last axis with a chunked first stage: the top k of every chunk of `chunk` values (default
+    max(4k, 256)), then the top k of those candidates. Same values and ids as lax.top_k (the k largest are among their
+    chunks' k largest; ties keep lower indices first), but much cheaper on the TPU, where a top_k over a long axis is
+    one full sort (v6e 2026-10-04, jobs/j122: 8192 values k = 512: 37 -> 18 us; 4 x 8192 k = 128: 37 -> 30 us;
+    3 x 19360 k = 16: 462 -> 26 us). Float inputs (the last chunk is padded with -inf)."""
+    n = x.shape[-1]
+    c = chunk or max(4 * k, 256)
+    if n <= 2 * c or 2 * k > c:
+        return lax.top_k(x, k)
+    pad = (-n) % c
+    if pad:
+        x = jnp.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, pad)], constant_values=-jnp.inf)
+    xc = x.reshape(x.shape[:-1] + (-1, c))
+    v, i = lax.top_k(xc, k)                                                           # [..., n/c, k]
+    i = i + (jnp.arange(xc.shape[-2], dtype=i.dtype) * c)[:, None]
+    v, i = v.reshape(x.shape[:-1] + (-1,)), i.reshape(x.shape[:-1] + (-1,))
+    v, j = lax.top_k(v, k)
+    return v, jnp.take_along_axis(i, j, -1)
+
+
 def indexer_select(scores, pool_valid, qpos, cfg: Cfg, chip=None):
     """scores [B,Tq,P_local] f32 (this chip's pools); qpos [Tq] global query positions -> (pools [B,Tq,K] global pool
     ids, valid [B,Tq,K]): the top-K pools per query (two-stage top-k across chips when the cache is sharded: local
@@ -537,17 +573,18 @@ def indexer_select(scores, pool_valid, qpos, cfg: Cfg, chip=None):
     scores = jnp.where(visible[None], scores, lo)
     K = min(cfg.idx_topk // kp, P_local)
     if n == 1:
-        vals, sel = lax.top_k(scores, K)
+        vals, sel = top_k(scores, K)
         return sel, vals > lo
     off = chip
 
     def two_stage(k_local):
         """local top-k_local -> all-gather -> global top-K; also returns whether any chip's list was cut short of
         the global threshold (then the result may be inexact)."""
-        v, j = lax.top_k(scores, k_local)                                             # [B,Tq,k_local]
+        v, j = top_k(scores, k_local)                                                 # [B,Tq,k_local]
         j = j * n + off
-        va = lax.all_gather(v, cfg.tp_axis, axis=-1, tiled=True)                      # [B,Tq,n*k_local]
-        ca = lax.all_gather(j, cfg.tp_axis, axis=-1, tiled=True)
+        both = lax.all_gather(jnp.stack([lax.bitcast_convert_type(v, jnp.int32), j]), cfg.tp_axis, axis=-1,
+                              tiled=True)                                             # one collective, not two
+        va, ca = lax.bitcast_convert_type(both[0], jnp.float32), both[1]              # [B,Tq,n*k_local]
         kk = min(cfg.idx_topk // kp, n * k_local)
         neg, ca = lax.sort((-va, ca), dimension=-1, num_keys=1)                       # descending by score, ids carried
         vs, ss = -neg[..., :kk], ca[..., :kk]
@@ -732,7 +769,11 @@ def mla_core(p, proj, cfg: Cfg, cache=None, pos0=0, sparse=None, cap=None, lengt
         slot = jnp.where(valid, slot, 0)
         c_sel = jnp.take_along_axis(c_all[:, None], slot[..., None], axis=2, mode="promise_in_bounds")
         if q8:
-            s_sel = jnp.take_along_axis(cs_all[:, None], slot, axis=2, mode="promise_in_bounds")   # [B,Tq,W]
+            # [B,Tq,W]; rows + lane select for one query (decode), element gather for a verify (`gather_scalars`)
+            if slot.shape[1] == 1:
+                s_sel = gather_scalars(cs_all, slot)
+            else:
+                s_sel = jnp.take_along_axis(cs_all[:, None], slot, axis=2, mode="promise_in_bounds")
             c_sel = latent_dequant(c_sel, s_sel, dtype)
         return _attend(q_b, c_sel, valid, cfg, True)
 

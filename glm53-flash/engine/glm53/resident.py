@@ -109,10 +109,14 @@ class ResidentFetch:
     verify_tm = 16             # rows per block (a verify has <= T rows per expert; 16 = the bf16 minimum)
     verify_lane_block = 4096   # lane block (the down kernel in one grid step per block: j66 -19 % MoE at T=8)
     verify_max_rows = 256
-    group_min_seq = 0          # >= 2: multi-token steps below ragged_min_seq decode slots that share an expert once
-                               # (`_apply_kernel_grouped`). OFF: bit-identical but slower on the v6e (j115 2026-10-04:
-                               # DFlash step 21.9 vs 17.3 ms at T = 4 — every group pays tm = T token slots of
-                               # activation fill and MACs although most groups hold one or two tokens)
+    group_min_seq = 2          # multi-token steps (2..ragged_min_seq-1 tokens of one sequence: the DFlash verify) decode
+                               # each distinct expert once for all its slots (`_apply_kernel_grouped`, bit-identical).
+                               # v6e 2026-10-04 (j126): DFlash step 15.95 -> 14.59 ms at T = 4 (with the chunked
+                               # top-k). 0 = per slot.
+    group_classes = ()         # unrolled body sizes below T (T itself is always one); () = 1..T
+    group_dynamic_grid = True  # one kernel grid step per distinct expert (traced grid bound), no empty steps (j120b)
+    group_loop = False         # groups above the fused classes: decode once into VMEM + a MAC loop over their slots
+                               # (fixed code size; j120c: ~2 % slower than the classes at the same compile cost)
 
     def apply(self, p, x, idx, w, layer, limit, seq_tokens=1):
         """x [N,D]; idx [N,k] int32 into E; w [N,k] fp32 -> partial MoE output [N,D] (TP-reduced by the caller).
@@ -144,41 +148,21 @@ class ResidentFetch:
 
     def _apply_kernel_grouped(self, x, idx, w, layer, gate_q, up_q, down_q, limit):
         """`_apply_kernel` for the T tokens of ONE sequence (a verify): the T*k slots are grouped by expert (a token's k
-        experts are distinct, so a group holds at most T tokens) and each distinct expert is decoded once for all its
-        tokens (`moe_matvec_gu_multi` / `moe_matvec_multi`; bit-identical to the per-slot kernels). The grouping and the
-        moves between slot and group order are tiny exact one-hot products (no XLA gathers)."""
+        experts are distinct, so a group holds at most T slots) and each distinct expert is decoded once for all its
+        slots (`pallas_moe.group_plan`, `moe_matvec_gu_grouped` / `moe_matvec_grouped`: bit-identical to the per-slot
+        kernels, outputs already in slot order)."""
         N, k = idx.shape
-        S, f32 = N * k, jnp.float32
-        flat = idx.reshape(-1)
         qt_gu, qt_dn = self.qtypes[layer]["gate_q"], self.qtypes[layer]["down_q"]
-        eq = flat[:, None] == flat[None, :]
-        earlier = jnp.tril(eq, -1)
-        first = ~jnp.any(earlier, axis=1)                                   # the first slot of each expert
-        gid = jnp.cumsum(first.astype(jnp.int32)) - 1
-        g_of = gid[jnp.argmax(eq, axis=1)]                                  # [S] the group of every slot
-        rank = jnp.sum(earlier, axis=1, dtype=jnp.int32)                    # [S] its place in the group
-        n_groups = jnp.sum(first, dtype=jnp.int32)
-        G, tm = S, N
-        cell = g_of * tm + rank                                             # [S] (group, rank) cell, distinct
-        to_cell = (cell[:, None] == jnp.arange(G * tm)[None, :]).astype(f32)   # [S, G*tm] one-hot
-        eids = jnp.sum(jnp.where(g_of[:, None] == jnp.arange(G)[None, :], flat[:, None], 0) * first[:, None], 0)
-        eids = jnp.where(jnp.arange(G) < n_groups, eids, jnp.take(eids, jnp.maximum(n_groups - 1, 0)))
-        hi = lax.Precision.HIGHEST                                          # one-hot products: exact in f32
-
-        def to_groups(a):                                                   # [S, ...] -> [G, tm, ...] (empty cells 0)
-            return jnp.einsum("sc,s...->c...", to_cell, a, precision=hi).reshape((G, tm) + a.shape[1:])
-
-        live = (jnp.arange(G) < n_groups)[:, None, None]                    # (skipped groups' rows are never written)
-
-        def to_slots(a):                                                    # [G, tm, R] -> [S, R]
-            return jnp.einsum("sc,cr->sr", to_cell, jnp.where(live, a, 0.0).reshape(G * tm, -1), precision=hi)
-        Xs = jnp.repeat(PL.pm_x(qt_gu, x.astype(f32)), k, axis=0)                     # [S, W, C]
-        g, u = K.moe_matvec_gu_multi(gate_q, up_q, qt_gu, self.nblk["gate_q"], eids, n_groups[None], to_groups(Xs),
-                                     interpret=self.interpret)
-        h = M.swiglu_clamped(to_slots(g), to_slots(u), limit)                           # [S, ml]
-        y = K.moe_matvec_multi(down_q, qt_dn, self.nblk["down_q"], eids, n_groups[None], to_groups(PL.pm_x(qt_dn, h)),
-                               interpret=self.interpret)
-        return jnp.einsum("nkd,nk->nd", to_slots(y).reshape(N, k, -1), w)
+        eids, cnt, slots = K.group_plan(idx)
+        g, u = K.moe_matvec_gu_grouped(gate_q, up_q, qt_gu, self.nblk["gate_q"], eids, cnt, slots,
+                                       PL.pm_x(qt_gu, x.astype(jnp.float32)), k=k, classes=self.group_classes,
+                                       interpret=self.interpret, dynamic_grid=self.group_dynamic_grid,
+                                       loop=self.group_loop)
+        h = M.swiglu_clamped(g, u, limit)                                               # [Nk, ml]
+        y = K.moe_matvec_grouped(down_q, qt_dn, self.nblk["down_q"], eids, cnt, slots, PL.pm_x(qt_dn, h),
+                                 classes=self.group_classes, interpret=self.interpret,
+                                 dynamic_grid=self.group_dynamic_grid, loop=self.group_loop).reshape(N, k, -1)
+        return jnp.einsum("nkd,nk->nd", y, w)
 
     def _apply_gather(self, x, idx, w, layer, gate_q, up_q, down_q, limit):
         """XLA decode path on the planar tables (no Pallas): per-expert dynamic slices + dequant + einsum."""

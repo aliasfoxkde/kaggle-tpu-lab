@@ -291,7 +291,7 @@ def logits_local(lm_head_local, h, cfg: DCfg):
 def topk_vocab(z_local, k, cfg: DCfg):
     """Exact top-k over vocab-sharded logits: (values, global ids) [..., k], descending (each chip's top-k,
     all-gathered, then the top-k of those)."""
-    v, i = lax.top_k(z_local, k)
+    v, i = M.top_k(z_local, k)                     # (chunked: one XLA sort over the vocab shard cost ~0.17 ms)
     if cfg.tp_axis is None:
         return v, i
     i = i + lax.axis_index(cfg.tp_axis) * z_local.shape[-1]
