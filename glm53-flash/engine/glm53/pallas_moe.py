@@ -565,14 +565,15 @@ def _grouped_geometry(planes, qtype, nblk, eids, cnt, slots, classes, loop):
             first.shape[-1], G, tm, classes, {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys})
 
 
-@_shared("qtype", "nblk", "k", "classes", "interpret", "dynamic_grid", "loop")
+@_shared("qtype", "nblk", "k", "classes", "interpret", "dynamic_grid", "loop", "vmem_mb")
 def moe_matvec_gu_grouped(planes_g, planes_u, qtype, nblk, eids, cnt, slots, X, *, k, classes=(), interpret=False,
-                          dynamic_grid=False, loop=False):
+                          dynamic_grid=False, loop=False, vmem_mb=32):
     """`moe_matvec_gu` over grouped slots (`group_plan`): X f32 [T, W, C] one row per TOKEN (slot s is token s // k)
     -> (g, u) f32 [S, R] each, in slot order. classes: the unrolled body sizes below tm (= T, always one); () = all.
     dynamic_grid: one grid step per distinct expert (a traced grid bound) instead of G with empty steps at the end.
     loop: groups above the fused classes decode the expert once into VMEM and run one MAC pass per slot from it (a
-    fori_loop over the group's slots: the kernel's code no longer grows with the class sizes; compile time)."""
+    fori_loop over the group's slots: the kernel's code no longer grows with the class sizes; compile time).
+    vmem_mb: the scoped VMEM limit (every token's activation broadcasts stay in VMEM: 2 MB per token at D = 4096)."""
     keys, rows_p, W, C, lead, R, G, tm, classes, blocks = _grouped_geometry(planes_g, qtype, nblk, eids, cnt, slots,
                                                                             classes, loop)
     T = X.shape[0]
@@ -652,14 +653,14 @@ def moe_matvec_gu_grouped(planes_g, planes_u, qtype, nblk, eids, cnt, slots, X, 
     fn = pl.pallas_call(kernel, grid_spec=grid_spec, out_shape=jax.ShapeDtypeStruct((S, 2, R), jnp.float32),
                         interpret=interpret,
                         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",),
-                                                             vmem_limit_bytes=32 * 2 ** 20))
+                                                             vmem_limit_bytes=vmem_mb * 2 ** 20))
     out = fn(eids, cnt, slots, *[planes_g[kk] for kk in keys], *[planes_u[kk] for kk in keys], tbl, X)
     return out[:, 0], out[:, 1]
 
 
-@_shared("qtype", "nblk", "classes", "interpret", "dynamic_grid", "loop")
+@_shared("qtype", "nblk", "classes", "interpret", "dynamic_grid", "loop", "vmem_mb")
 def moe_matvec_grouped(planes, qtype, nblk, eids, cnt, slots, X, *, classes=(), interpret=False, dynamic_grid=False,
-                       loop=False):
+                       loop=False, vmem_mb=32):
     """`moe_matvec` over grouped slots (`group_plan`): X f32 [S, W, C] one row per SLOT -> f32 [S, R] in slot order
     (all R rows in one grid step per group; the group's slots are broadcast at the start of its step; `loop`: see
     `moe_matvec_gu_grouped`, each slot's broadcasts made in its pass)."""
@@ -733,7 +734,7 @@ def moe_matvec_grouped(planes, qtype, nblk, eids, cnt, slots, X, *, classes=(), 
     fn = pl.pallas_call(kernel, grid_spec=grid_spec, out_shape=jax.ShapeDtypeStruct((S, 1, R), jnp.float32),
                         interpret=interpret,
                         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",),
-                                                             vmem_limit_bytes=32 * 2 ** 20))
+                                                             vmem_limit_bytes=vmem_mb * 2 ** 20))
     return fn(eids, cnt, slots, *[planes[kk] for kk in keys], tbl, X).reshape(S, R)
 
 

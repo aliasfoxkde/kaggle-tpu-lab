@@ -160,3 +160,75 @@ def test_decode_rows_fills_the_ring(setup):
         for k in ("k", "v"):
             a, b = np.asarray(sets[r][n][k]), np.asarray(fresh[n][k])
             np.testing.assert_allclose(a, b, rtol=1e-3, atol=1e-3 * np.abs(b).max())
+
+
+def run_rows(eng, prompts, n, T=4, oracles=None, stop=()):
+    """DFlash for all prompts at once (`dflash_start_rows` / `dflash_step_rows`) -> (tokens per row, last state)."""
+    toks, sets, pos = [], [], []
+    for p in prompts:
+        lg, cc, ps = eng.prefill(np.asarray(p)[None])
+        toks.append(int(jnp.argmax(lg[0]))); sets.append(cc); pos.append(ps)
+    outs = [[t] for t in toks]
+    st = eng.dflash_start_rows(np.array(toks), sets, pos, T=T)
+    while min(len(o) for o in outs) < n:
+        ov = None if oracles is None else [(list(o_[len(o):len(o) + T - 1]) + [0] * T)[:T - 1]
+                                           for o_, o in zip(oracles, outs)]
+        em, st = eng.dflash_step_rows(st, stop_ids=stop, draft_override=ov)
+        for o, e in zip(outs, em):
+            assert not any(t in stop for t in e[:-1]), (e, stop)       # a stop token is only ever the last one
+            o.extend(e)
+    eng.dflash_end()
+    return outs, st
+
+
+def test_dflash_rows_match_greedy(setup):
+    """Three streams at different positions in one batched DFlash step: every row emits exactly its own greedy
+    tokens (random drafts: per-row rollbacks; oracle drafts with errors at different places per row: different
+    accepted lengths in the same step), each row's device position = the host's, and each row's ring = the ring a
+    fresh prefill of that stream's committed tokens builds."""
+    eng, cfg, ids, _ = setup
+    n = eng.cfg.n_layers
+    prompts = [list(ids[0, :45]), list(ids[0, 5:38]), list(ids[0, 12:30])]
+    refs = [greedy(eng, np.asarray(p)[None], 14) for p in prompts]
+    for T in (4, 8):
+        outs, _ = run_rows(eng, prompts, 14, T)
+        assert [o[:14] for o in outs] == refs, (T, outs, refs)
+        oracles = [[t if i % (3 + r) != 2 else (t + 1) % (cfg.vocab_size - 1) for i, t in enumerate(ref)]
+                   for r, ref in enumerate(refs)]
+        outs, st = run_rows(eng, prompts, 14, T, oracles=oracles)
+        assert [o[:14] for o in outs] == refs, (T, outs, refs)
+    assert [int(x) for x in np.asarray(st["pos"])] == st["pos_h"]
+    for r, p in enumerate(prompts):
+        committed = st["pos_h"][r] - len(p)
+        _, fresh, _ = eng.prefill(np.asarray(p + outs[r][:committed])[None])
+        np.testing.assert_array_equal(np.asarray(st["rings"][r]["p"]), np.asarray(fresh[n]["p"]))
+        for k in ("k", "v"):
+            a, b = np.asarray(st["rings"][r][k]), np.asarray(fresh[n][k])
+            np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-4 * np.abs(b).max())
+
+
+def test_dflash_rows_stop_token(setup):
+    """A drafted stop token ends that row's accepted run (it is emitted last, unfed: `run_rows` checks every step);
+    the row goes on from it next step like plain decoding, and the other rows are not cut."""
+    eng, cfg, ids, _ = setup
+    prompts = [list(ids[0, :45]), list(ids[0, 5:38])]
+    refs = [greedy(eng, np.asarray(p)[None], 14) for p in prompts]
+    outs, st = run_rows(eng, prompts, 14, 4, oracles=refs, stop=(refs[0][5],))
+    assert [o[:14] for o in outs] == refs, (outs, refs)
+
+
+def test_dflash_rows_seq_shard():
+    """The served layout (latent cache sharded over the chips by position: the attention's collectives per row):
+    three streams in one batched DFlash step still emit exactly their own greedy tokens."""
+    eng, cfg, rng = build(True, mtp=False)
+    dcfg, dp = random_drafter(rng, cfg.hidden_size, cfg.vocab_size)
+    eng.set_dflash(dp, dcfg)
+    ids = rng.integers(0, cfg.vocab_size - 1, size=(1, 45))
+    prompts = [list(ids[0, :45]), list(ids[0, 5:38]), list(ids[0, 12:30])]
+    refs = [greedy(eng, np.asarray(p)[None], 12) for p in prompts]
+    outs, _ = run_rows(eng, prompts, 12, 4)
+    assert [o[:12] for o in outs] == refs, (outs, refs)
+    oracles = [[t if i % (3 + r) != 2 else (t + 1) % (cfg.vocab_size - 1) for i, t in enumerate(ref)]
+               for r, ref in enumerate(refs)]
+    outs, _ = run_rows(eng, prompts, 12, 4, oracles=oracles)
+    assert [o[:12] for o in outs] == refs, (outs, refs)

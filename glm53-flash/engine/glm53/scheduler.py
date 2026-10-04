@@ -8,12 +8,15 @@ contexts are parked in host memory (`SnapStore`) and resumed when a later prompt
 sampled ids cross to the host: token ids, positions and the sampler state stay on the device.
 
 DFlash 2 (`spec`, with a drafter installed on the engine: `ResidentLayerEngine.set_dflash`): a stream that runs ALONE
-decodes speculatively (`dflash_start` / `dflash_step`: a block of T-1 drafts verified per step); as soon as a second
-stream is active, every stream is decoded in the batched plain steps again (its DFlash state hands its caches back).
-The block size is picked per stream and step from an EMA of the tokens per step (`DFlashPolicy`). Batched steps write
-every stream's positions into its own drafter ring too (`decode_rows` captures the features), so a stream that goes
-back to DFlash drafts with its full context. With temperature > 0 the drafts are accepted by rejection sampling
-against the target's distribution (every token distributed as plain sampling).
+decodes speculatively (`dflash_start` / `dflash_step`: a block of T-1 drafts verified per step); the block size is
+picked per stream and step from an EMA of the tokens per step (`DFlashPolicy`). Several active streams decode together:
+either speculatively in ONE batched step (`dflash_start_rows` / `dflash_step_rows`: every stream verifies its own block
+of the smallest size on its own caches, accepted per row) when the policy's measured step costs (`rows`: B -> ms of a
+B-row DFlash step and of a plain batched step) and the streams' EMAs say it yields more tokens per ms, or in the
+batched plain steps (`decode_rows`, which also write every stream's positions into its own drafter ring, so a stream
+that goes back to DFlash drafts with its full context). A DFlash state owns its streams' caches and hands them back
+when the membership or the mode changes. With temperature > 0 the drafts are accepted by rejection sampling against
+the target's distribution (every token distributed as plain sampling).
 """
 import collections
 import threading
@@ -163,12 +166,32 @@ class DFlashPolicy:
     the stream's EMA of tokens per step for each T picks the T with the least ms per token. A step of T also tells
     what a smaller T' would have accepted (min(tokens, T')), and a run cut before T what a larger one would have
     (the same tokens); only a fully accepted block leaves the larger T unknown — a T without news for `probe` steps
-    is tried once. `prior` = the EMAs' start values."""
+    is tried once. `prior` = the EMAs' start values. `rows` = {B: (ms of a DFlash step of B streams at the smallest
+    block, ms of a plain batched step of B)}: B streams decode speculatively together when the sum of their EMAs per
+    DFlash ms beats B tokens per plain ms (`pick_rows`); no entry for B = always plain. Plain steps measure no
+    acceptance, so the choice is sticky: a batched DFlash state, once started (by the costs or by a probe after
+    `probe` plain steps), runs at least `hold` steps and ends only below `stay` x the plain rate (at temperature 1.0 the
+    EMAs of prose sit near the break-even: without it one dip kept a pair of streams plain, v6e 2026-10-04 j131)."""
 
-    def __init__(self, cost, prior=None, alpha=0.15, probe=32):
+    def __init__(self, cost, prior=None, alpha=0.15, probe=32, rows=None, hold=8, stay=0.9):
         self.cost = {int(t): float(c) for t, c in cost.items()}
         self.prior = prior or {t: 1.0 + 0.5 * (t - 1) ** 0.5 for t in self.cost}
         self.alpha, self.probe = alpha, probe
+        self.rows = {int(b): (float(c[0]), float(c[1])) for b, c in (rows or {}).items()}
+        self.hold, self.stay = hold, stay
+
+    @property
+    def rows_T(self):
+        """The block size of batched DFlash steps (one for all rows: the smallest compiled)."""
+        return min(self.cost)
+
+    def pick_rows(self, streams, margin=1.0):
+        """True when B streams decoding speculatively together (each `start`ed) yield more tokens per ms than
+        margin x plain."""
+        c = self.rows.get(len(streams))
+        if c is None:
+            return False
+        return sum(s.tau["ema"][self.rows_T] for s in streams) / c[0] > margin * len(streams) / c[1]
 
     def start(self, s):
         s.tau = {"ema": dict(self.prior), "last": {t: 0 for t in self.cost}, "n": 0}
@@ -229,6 +252,9 @@ class Scheduler:
         self.seed = seed
         self._buf_cache = None                           # (sets on the chips, live buffer bytes on chip 0): free_gb
         self._grave = None                               # the last batched step's consumed caches (deferred release)
+        self._rows = None                                # DFlash of several streams: {"streams", "st", "sampler"}
+        self._rows_skip = 0                              # plain batched steps since the policy last chose DFlash rows
+        self._rows_hold = 0                              # steps the running batched DFlash state still runs regardless
 
     # ---- client side
     def submit(self, req: Request):
@@ -513,7 +539,11 @@ class Scheduler:
         if not act:
             return
         if len(act) == 1 and self._spec_ok(act[0]):
+            self._rows_end()
             return self._spec_step(act[0])
+        if len(act) > 1 and self._rows_ok(act):
+            return self._rows_step(act)
+        self._rows_end()
         for s in act:                                                   # batched again: DFlash states hand back
             self._spec_end(s)
         B = len(act)
@@ -570,7 +600,10 @@ class Scheduler:
 
     def _spec_end(self, s):
         """Leave DFlash mode: the stream takes its caches (the drafter's ring included) and position back; the queued
-        draft is dropped (it only wrote committed positions into the ring)."""
+        draft is dropped (it only wrote committed positions into the ring). A stream of a batched DFlash state ends
+        that state for all its streams."""
+        if self._rows is not None and any(x is s for x in self._rows["streams"]):
+            self._rows_end()
         if s.spec is None:
             return
         s.caches, s.pos, s.spec = s.spec["caches"], s.spec["pos_h"], None
@@ -609,6 +642,79 @@ class Scheduler:
             if s not in self.active:                                    # finished mid-block (length / cancelled)
                 break
             self._emit(s, tok)
+
+    # ---- DFlash for several streams at once (one batched verify per step)
+    def _rows_ok(self, act):
+        """Batched DFlash for these streams now: every one could run DFlash alone (`_spec_ok`), the policy has costs for
+        this B, and their EMAs say it pays — or `probe` plain batched steps passed without (to measure again). A
+        running state stays for its `hold` steps, then while it pays `stay` x plain (`DFlashPolicy`)."""
+        pol = self.spec
+        if pol is None or len(act) not in pol.rows or not all(self._spec_ok(s) for s in act):
+            return False
+        for s in act:
+            if s.tau is None:
+                pol.start(s)
+        if self._rows is not None and [id(x) for x in self._rows["streams"]] == [id(x) for x in act]:
+            self._rows_hold -= 1                       # (the running state)
+            ok = self._rows_hold >= 0 or pol.pick_rows(act, pol.stay)
+        else:
+            ok = pol.pick_rows(act) or self._rows_skip >= pol.probe
+            self._rows_hold = pol.hold
+        self._rows_skip = 0 if ok else self._rows_skip + 1
+        return ok
+
+    def _rows_end(self):
+        """Leave batched DFlash: every stream of the state takes its caches (ring included) and position back."""
+        R = self._rows
+        if R is None:
+            return
+        st = R["st"]
+        for b, s in enumerate(R["streams"]):
+            s.caches, s.pos = st["sets"][b] + [st["rings"][b]], st["pos_h"][b]
+        self._rows = None
+        self.eng.dflash_end()
+        self._members = None
+
+    def _rows_step(self, act):
+        st = self.state
+        if self._rows is None or [id(x) for x in self._rows["streams"]] != [id(x) for x in act]:
+            self._rows_end()                                            # membership changed: a new state
+            for s in act:
+                self._spec_end(s)
+            samp = DeviceSampler([s.req.temperature for s in act], [s.req.top_p for s in act], seed=self.seed)
+            rs = self.eng.dflash_start_rows([s.tok for s in act], [s.caches for s in act], [s.pos for s in act],
+                                            T=self.spec.rows_T, sampler=samp)
+            for s in act:
+                s.caches = None
+            self._rows = {"streams": list(act), "st": rs, "sampler": samp}
+            self._members = None
+            st["rows_starts"] = st.get("rows_starts", 0) + 1
+        R = self._rows
+        T = R["st"]["T"]
+        t0 = time.perf_counter()
+        emitted, R["st"] = self.eng.dflash_step_rows(R["st"], R["sampler"], tuple(sorted(self.stop_ids)))
+        t1 = time.perf_counter()
+        n_tok = sum(len(e) for e in emitted)
+        self.steps += 1
+        st["steps"] = self.steps
+        st["step_tokens"] = st.get("step_tokens", 0) + n_tok
+        st["rows_steps"] = st.get("rows_steps", 0) + 1
+        st["rows_tokens"] = st.get("rows_tokens", 0) + n_tok
+        st["decode_s"] = st.get("decode_s", 0.0) + (t1 - t0)
+        if self._t_step is not None:
+            st["step_s"] = st.get("step_s", 0.0) + (t1 - self._t_step)
+            st["steps_busy"] = st.get("steps_busy", 0) + 1
+        self._t_step = t1
+        for b, s in enumerate(act):                     # every row's bookkeeping first (a finish ends the state)
+            em = emitted[b]
+            self.spec.update(s, T, len(em))
+            s.seen.extend([s.tok] + em[:-1])
+            s.tok, s.pos, s.logits = em[-1], R["st"]["pos_h"][b], None
+        for b, s in enumerate(act):
+            for tok in emitted[b]:
+                if s not in self.active:                                # finished mid-block (length / cancelled)
+                    break
+                self._emit(s, tok)
 
     # ---- warm-up
     def warmup(self, max_B=None, token=0):

@@ -74,6 +74,11 @@ DEFAULTS = {
                                      # {"4": ..., "8": ...} also drafts 8 (2026-10-03: math-like text x1.97 instead of
                                      # x1.64, no gain overall at temperature 1.0; its programs only add warm-up)
     "dflash_prior": {"4": 2.8, "8": 3.3},    # tokens per step a new stream assumes until it has measured its own
+    "dflash_rows": {"2": [22.9, 12.2], "3": [32.5, 14.9]},   # DFlash for B streams at once: {"B": [ms of a B-stream
+                                     # DFlash step (block = the smallest of dflash_cost), ms of a plain batched step of
+                                     # B]} = the B compiled (v6e-8, 2026-10-04; served at temperature 1.0 x1.2 at 2 and
+                                     # 3 streams; ~3-6 min of warm-up each); the scheduler picks DFlash or plain per
+                                     # step from these and the streams' tokens per step; {} = plain batched steps
     "dflash_draft_temp": 0.7,        # drafts are drawn at this x the request's temperature; the verify accepts them by
                                      # rejection sampling (output distributed exactly as plain sampling)
     "served_model_name": "glm-5.3-flash",
@@ -360,6 +365,7 @@ if DFLASH_DIR and getattr(eng, "dflash", None) is None:
     log(f"   DFlash 2 drafter ({_dcfg.n_layers} layers, block {_dcfg.block}) from {DFLASH_DIR}: "
         f"{eng.dflash.nbytes_per_chip() / 1e6:.0f} MB per chip in {time.time() - t:.0f}s; HBM chip0 {hbm()[0]:.2f} GB")
 DFLASH_COST = {int(k): float(v) for k, v in CFG["dflash_cost"].items()}
+DFLASH_ROWS = {int(k): tuple(float(x) for x in v) for k, v in CFG["dflash_rows"].items() if 1 < int(k) <= CFG["streams"]}
 
 # ----------------------------------------------------------------------------- 4. the server
 from glm53.resident import ResidentLayerEngine as _RLE   # noqa: E402
@@ -540,7 +546,7 @@ SCHED = Scheduler(eng, STOP_IDS, MAX_STREAMS, MAX_SETS, feed=sched_feed, match_l
                   first_sample=lambda z, t, p: sample(z, t, p, RNG), snaps=SNAPS, log=log, state=STATE,
                   base_min=BASE_MIN, snap_min=SNAP_MIN, piece=SCHED_PIECE, min_free_gb=MIN_FREE_GB, max_wait_s=MAX_WAIT_S,
                   spec=DFlashPolicy(DFLASH_COST, {int(k): float(v) for k, v in CFG["dflash_prior"].items()
-                                                  if int(k) in DFLASH_COST})
+                                                  if int(k) in DFLASH_COST}, rows=DFLASH_ROWS)
                   if getattr(eng, "dflash", None) is not None else None)
 
 
@@ -1186,6 +1192,20 @@ if getattr(eng, "dflash", None) is not None:          # draft (every block-size 
         eng.dflash_end()                              # (the last step's arrays, kept for a deferred release)
         log(f"   DFlash block {T0}: {time.time() - t:.0f}s, {grew()}")
         publish("compiling", what=f"dflash T={T0}", secs=int(time.time() - t))
+    for B in sorted(DFLASH_ROWS):                     # B streams at once: batched verify, draft, head, rollback
+        t = time.time()
+        _sets, _tok, _pp = [], [], []
+        for _ in range(B):
+            _lg, _cc, _p = eng.prefill(ids); _sets.append(_cc); _tok.append(0); _pp.append(_p)
+        _st = eng.dflash_start_rows(_tok, _sets, _pp, T=min(DFLASH_COST),
+                                    sampler=DeviceSampler([1.0] * B, [0.95] * B, seed=0))
+        _sm = DeviceSampler([1.0] * B, [0.95] * B, seed=0)
+        for _ in range(2):
+            _e, _st = eng.dflash_step_rows(_st, _sm, tuple(sorted(STOP_IDS)))
+        del _lg, _sets, _st
+        eng.dflash_end()
+        log(f"   DFlash {B} streams: {time.time() - t:.0f}s, {grew()}")
+        publish("compiling", what=f"dflash B={B}", secs=int(time.time() - t))
 n_shard = max(eng.lcfg.seq_shard, 1)
 for n_tok in range(SNAP_ROWS * n_shard, SNAP_WARM + 1, SNAP_ROWS * n_shard):
     cc = eng.alloc_caches(1)

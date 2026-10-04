@@ -264,30 +264,51 @@ def kda_chunked(q, k, v, g, beta, state0=None, chunk=64):
     return jnp.swapaxes(out, 1, 2), S
 
 
+def kda_state_step(S, k_i, v_i, g_i, b_i):
+    """The KDA state update of one token (f32; k_i l2-normed): S [B,H,dk,dv], k/v/g [B,H,d], b [B,H]."""
+    S = S * jnp.exp(g_i)[..., None]
+    kv_mem = jnp.einsum("bhkv,bhk->bhv", S, k_i)
+    delta = (v_i - kv_mem) * b_i[..., None]
+    return S + k_i[..., None] * delta[..., None, :]
+
+
 def kda_recurrent(q, k, v, g, beta, state, hist=False):
     """One (or a few) tokens, recurrent form. Shapes as kda_chunked; state [B,H,dk,dv] fp32.
-    hist=True also returns the state after every token ([T,B,H,dk,dv]; speculative-decoding rollback)."""
+    hist=True also returns the state after every token ([T,B,H,dk,dv]; speculative-decoding rollback); hist="kin"
+    instead returns every token's state-update inputs [T,B,H,4,d] f32 (k, v, g, beta broadcast over d: `kda_replay`
+    recomputes the state after any prefix from them, 4/dv of the states' bytes)."""
     f32 = jnp.float32
     B, T, H, dk = k.shape
     q = l2norm(q.astype(f32)) * (dk ** -0.5)
     k = l2norm(k.astype(f32))
     v, g, beta = v.astype(f32), g.astype(f32), beta.astype(f32)
+    keep = hist is True
 
     def step(S, xs):
         q_i, k_i, v_i, g_i, b_i = xs                                          # [B,H,d] / [B,H]
-        S = S * jnp.exp(g_i)[..., None]
-        kv_mem = jnp.einsum("bhkv,bhk->bhv", S, k_i)
-        delta = (v_i - kv_mem) * b_i[..., None]
-        S = S + k_i[..., None] * delta[..., None, :]
+        S = kda_state_step(S, k_i, v_i, g_i, b_i)
         o = jnp.einsum("bhkv,bhk->bhv", S, q_i)
-        return S, ((o, S) if hist else o)
+        return S, ((o, S) if keep else o)
 
     xs = tuple(jnp.moveaxis(t, 1, 0) for t in (q, k, v, g, beta))
     S, out = lax.scan(step, state.astype(f32), xs)
-    if hist:
+    if keep:
         out, states = out
         return jnp.moveaxis(out, 0, 1), S, states
+    if hist == "kin":
+        kin = jnp.stack([k, v, g, jnp.broadcast_to(beta[..., None], k.shape)], axis=3)     # [B,T,H,4,d]
+        return jnp.moveaxis(out, 0, 1), S, jnp.moveaxis(kin, 1, 0)
     return jnp.moveaxis(out, 0, 1), S
+
+
+def kda_replay(state, kin, n_keep):
+    """The KDA state after the first n_keep (traced, 0..T) tokens of a verify, from the state before it [B,H,dk,dv]
+    and the tokens' update inputs kin [T,B,H,4,d] (`kda_recurrent(hist="kin")`): the same step, unrolled and masked."""
+    S = state.astype(jnp.float32)
+    for t in range(kin.shape[0]):
+        S = jnp.where(t < n_keep, kda_state_step(S, kin[t, :, :, 0], kin[t, :, :, 1], kin[t, :, :, 2],
+                                                 kin[t, :, :, 3, 0]), S)
+    return S
 
 
 def kda_project(p, x, cfg: Cfg):
@@ -306,7 +327,9 @@ def kda_core(proj, cfg: Cfg, cache=None, use_recurrent=False, length=None, hist=
     """Conv + KDA recurrence of `proj` (kda_project; any B in lockstep, ONE cache) -> (core [B,T,H,hd] f32,
     new_cache). cache: None or {"conv": [B,K-1,3C], "state": [B,H,dk,dv]}. `length`: number of real tokens (rest
     is padding: beta=0, g=0 so the state ignores them). hist=True (recurrent, T > 1: speculative verify) adds
-    "state_hist" [T,B,H,dk,dv] and "conv_hist" [T,B,K-1,3C] = the cache after each token, for `rollback_caches`."""
+    "state_hist" [T,B,H,dk,dv] and "conv_hist" [T,B,K-1,3C] = the cache after each token, for `rollback_caches`;
+    hist="kin": "kin_hist" [T,B,H,4,d] (the tokens' state-update inputs) instead of "state_hist", and the returned
+    "state" is the one BEFORE the tokens (the rollback replays the accepted ones: `kda_replay`)."""
     qkv_raw, conv_w, g, beta = proj["qkv"], proj["conv_w"], proj["g"], proj["beta"]
     B, T, _ = qkv_raw.shape
     H, hd = cfg.kda_heads, cfg.kda_hd
@@ -325,10 +348,13 @@ def kda_core(proj, cfg: Cfg, cache=None, use_recurrent=False, length=None, hist=
     if use_recurrent:
         assert state is not None
         if hist:
-            core, new_state, states = kda_recurrent(q, k, v, g, beta, state, hist=True)
+            core, new_state, states = kda_recurrent(q, k, v, g, beta, state, hist=hist)
             K = conv_w.shape[-1]
             full = jnp.concatenate([conv_state.astype(qkv_raw.dtype), qkv_raw], axis=1)       # [B,K-1+T,3C]
-            extra = {"state_hist": states, "conv_hist": jnp.stack([full[:, t + 1:t + K] for t in range(T)])}
+            extra = {"kin_hist" if hist == "kin" else "state_hist": states,
+                     "conv_hist": jnp.stack([full[:, t + 1:t + K] for t in range(T)])}
+            if hist == "kin":
+                new_state = state                              # (replayed to the accepted prefix by the rollback)
         else:
             core, new_state = kda_recurrent(q, k, v, g, beta, state)
     else:
@@ -353,14 +379,15 @@ def kda_attention(p, x, cfg: Cfg, cache=None, use_recurrent=False, length=None, 
     return kda_out(p, core, proj["gate"], cfg, x.dtype), new_cache
 
 
-def kda_attention_rows(p, x, cfg: Cfg, caches):
+def kda_attention_rows(p, x, cfg: Cfg, caches, hist=False):
     """Recurrent (decode) step of B INDEPENDENT streams: x [B,T,D], caches[b] = row b's own cache (batch dim 1).
-    The projections and the output run batched, the conv/recurrence per row -> (y [B,T,D], [new cache per row])."""
+    The projections and the output run batched, the conv/recurrence per row -> (y [B,T,D], [new cache per row]);
+    hist=True (T > 1: a speculative verify of every row) adds each row's per-token histories (kda_core)."""
     proj = kda_project(p, x, cfg)
     cores, new = [], []
     for b, c in enumerate(caches):
         pr = {k: (v if k == "conv_w" else v[b:b + 1]) for k, v in proj.items()}
-        core, nc = kda_core(pr, cfg, c, True, None, False)
+        core, nc = kda_core(pr, cfg, c, True, None, hist)
         cores.append(core); new.append(nc)
     return kda_out(p, jnp.concatenate(cores, 0), proj["gate"], cfg, x.dtype), new
 
@@ -560,7 +587,7 @@ def top_k(x, k, chunk=None):
 
 
 def indexer_select(scores, pool_valid, qpos, cfg: Cfg, chip=None):
-    """scores [B,Tq,P_local] f32 (this chip's pools); qpos [Tq] global query positions -> (pools [B,Tq,K] global pool
+    """scores [B,Tq,P_local] f32 (this chip's pools); qpos [Tq] (or [B,Tq]) global query positions -> (pools [B,Tq,K] global pool
     ids, valid [B,Tq,K]): the top-K pools per query (two-stage top-k across chips when the cache is sharded: local
     top-K, all-gather the candidates, global top-K)."""
     B, Tq, P_local = scores.shape
@@ -569,8 +596,11 @@ def indexer_select(scores, pool_valid, qpos, cfg: Cfg, chip=None):
     j = jnp.arange(P_local)
     gpool = j * n + (chip if n > 1 else 0)                                            # global pool ids [P_local]
     pool_end = gpool * kp + kp - 1
-    visible = (pool_end[None, :] <= qpos[:, None]) & pool_valid[None, :]              # [Tq,P_local]
-    scores = jnp.where(visible[None], scores, lo)
+    if qpos.ndim == 1:
+        visible = (pool_end[None, :] <= qpos[:, None]) & pool_valid[None, :]          # [Tq,P_local]
+        scores = jnp.where(visible[None], scores, lo)
+    else:                                                                             # qpos [B,Tq]: positions per row
+        scores = jnp.where((pool_end <= qpos[..., None]) & pool_valid, scores, lo)
     K = min(cfg.idx_topk // kp, P_local)
     if n == 1:
         vals, sel = top_k(scores, K)
@@ -702,6 +732,119 @@ def mla_project(p, x, cfg: Cfg):
     return out
 
 
+def _mla_write(p, proj, cfg: Cfg, cache, pos0, chip, length, hist):
+    """`mla_core`'s cache update (cfg.cache_cap set) -> new cache: the new latents at pos0; with an indexer its pooled
+    keys and tails (+ the tails after each token with hist)."""
+    new_cache = write_latent(cache, proj["new_c"], pos0, cfg, chip)
+    if "indexer" in p:
+        ix = p["indexer"]
+        res = pool_new_keys(ix, cache["tk"], cache["tg"], proj["nk"], proj["ng"], pos0, cfg, length, hist)
+        pooled, complete, pool0, tk2, tg2 = res[:5]
+        pcfg = dataclasses.replace(cfg, idx_kpool=1)                             # pool-level slots: pool % n, pool // n
+        new_cache["pk"] = cache_write(cache["pk"], pooled, pool0, pcfg, chip, valid=complete)
+        new_cache["tk"], new_cache["tg"] = tk2.astype(cache["tk"].dtype), tg2.astype(cache["tg"].dtype)
+        if hist:
+            new_cache["tk_hist"] = res[5][0].astype(cache["tk"].dtype)
+            new_cache["tg_hist"] = res[5][1].astype(cache["tg"].dtype)
+    return new_cache
+
+
+def _indexer_scores(qi, wts, pool_keys, cfg: Cfg):
+    """The indexer's score of every (query, local pool): qi [B,Tq,IH,ihd], wts [B,Tq,IH], pool_keys [B,P,ihd] f32
+    -> [B,Tq,P]."""
+    sc = jax.nn.relu(jnp.einsum("bthd,bpd->bthp", qi, pool_keys) * (cfg.idx_hd ** -0.5))
+    return jnp.einsum("bth,bthp->btp", wts, sc)
+
+
+def _per_query_keys(c_all, cs_all, pools, pvalid, qpos, cfg: Cfg, chip, dtype):
+    """The latents of every query's selected tokens that live on this chip (cfg.cache_cap set): (keys [B,Tq,W,kvr],
+    valid [B,Tq,W])."""
+    n, kp = cfg.seq_shard, cfg.idx_kpool
+    tok = select_tokens(pools, pvalid, qpos, cfg)                                  # [B,Tq,W] global positions
+    valid = (tok >= 0) & (tok <= qpos[None, :, None])
+    if n > 1:
+        owner, slot = _pos_to_slot(jnp.maximum(tok, 0), kp, n)
+        valid = valid & (owner == chip)
+    else:
+        slot = tok
+    slot = jnp.where(valid, slot, 0)
+    c_sel = jnp.take_along_axis(c_all[:, None], slot[..., None], axis=2, mode="promise_in_bounds")
+    if cfg.cache_q8:
+        # [B,Tq,W]; rows + lane select for one query (decode), element gather for a verify (`gather_scalars`)
+        if slot.shape[1] == 1:
+            s_sel = gather_scalars(cs_all, slot)
+        else:
+            s_sel = jnp.take_along_axis(cs_all[:, None], slot, axis=2, mode="promise_in_bounds")
+        c_sel = latent_dequant(c_sel, s_sel, dtype)
+    return c_sel, valid
+
+
+def _attend_rows(q, keys, masks, cfg: Cfg):
+    """`_attend` with per-query keys for B rows whose keys stay separate (keys[b] [1,Tq,W,r], masks[b] [1,Tq,W]; no
+    concatenation of the gathered latents): the scores and products per row, the cross-chip max and the two
+    reduce-scatters once for all rows. Per row the same operations as `_attend`."""
+    lo = jnp.finfo(jnp.float32).min
+    scale = cfg.qk_nope ** -0.5
+    pv = "bhtw,btwr->bthr"
+    ss = [jnp.where(m[:, None], jnp.einsum("bthr,btwr->bhtw", q[b:b + 1], k).astype(jnp.float32) * scale, lo)
+          for b, (k, m) in enumerate(zip(keys, masks))]
+    if cfg.seq_shard == 1:
+        return jnp.concatenate([jnp.einsum(pv, jax.nn.softmax(s, -1).astype(k.dtype), k) for s, k in zip(ss, keys)], 0)
+    m = lax.pmax(jnp.concatenate([s.max(-1) for s in ss], 0), cfg.tp_axis)          # [B,Hq,Tq] global max
+    es = [jnp.exp(s - m[b:b + 1, ..., None]) for b, s in enumerate(ss)]
+    l = jnp.concatenate([jnp.sum(e, -1) for e in es], 0)                             # [B,Hq,Tq]
+    o = jnp.concatenate([jnp.einsum(pv, e.astype(k.dtype), k, preferred_element_type=jnp.float32)
+                         for e, k in zip(es, keys)], 0)                              # [B,Tq,Hq,r]
+    o = lax.psum_scatter(o, cfg.tp_axis, scatter_dimension=2, tiled=True)
+    l = lax.psum_scatter(l, cfg.tp_axis, scatter_dimension=1, tiled=True)
+    return (o / jnp.swapaxes(l, 1, 2)[..., None]).astype(keys[0].dtype)
+
+
+ROWS_SHARED_MIN = 3        # mla_core_rows shares the collectives from this many queries over all rows (B*T; 0 = never;
+                           # read at trace). v6e 2026-10-04 (j135, same engine, shared vs per row): plain decode B=2
+                           # 12.53 vs 12.19 ms, B=3 14.90 vs 15.67; DFlash step of 2 / 3 streams 22.86 / 32.5 vs
+                           # 23.47 / 32.8
+
+
+def mla_core_rows(p, proj, cfg: Cfg, caches, pos, sparse="auto", cap=None, hist=False):
+    """`mla_core` for B INDEPENDENT rows (caches[b] = row b's own cache, batch 1, at position pos[b]: traced scalars)
+    -> (o_lat [B,T,H_local,kvr], [new cache per row]). On the DSA path of decode and short verifies (sparse, at most
+    per_query_max queries) every row updates and gathers from its own cache, but the query all-gather, the indexer's
+    selection (top-k, the candidates' all-gather) and the softmax combine across the chips run once for all rows:
+    latency-bound collectives and sorts (~10-20 us each, about six per row and MLA layer; v6e 2026-10-04). Otherwise
+    (one row, fewer than `ROWS_SHARED_MIN` queries in all: two decode rows ran faster apart) `mla_core` per row."""
+    B = len(caches)
+    q_lat = proj["q_lat"]
+    T = q_lat.shape[1]
+    n = cfg.seq_shard
+    S = caches[0]["c"].shape[1] * n
+    use_sparse = sparse == "always" or (sparse == "auto" and S > cfg.idx_topk)
+    if (B == 1 or not ROWS_SHARED_MIN or B * T < ROWS_SHARED_MIN
+            or not (use_sparse and "indexer" in p and T <= min(cfg.per_query_max, cfg.q_block))):
+        outs, new = [], []
+        for b, (c, pb) in enumerate(zip(caches, pos)):
+            o_b, nc = mla_core(p, {k: v[b:b + 1] for k, v in proj.items()}, cfg, c, pb, sparse, cap, None, hist)
+            outs.append(o_b); new.append(nc)
+        return jnp.concatenate(outs, 0), new
+    chip = lax.axis_index(cfg.tp_axis) if n > 1 else None
+    cfg = dataclasses.replace(cfg, cache_cap=S)
+    dtype = proj["new_c"].dtype
+    new, scores, qpos = [], [], []
+    for b, (c, pb) in enumerate(zip(caches, pos)):
+        pr = {k: v[b:b + 1] for k, v in proj.items()}
+        nc = _mla_write(p, pr, cfg, c, pb, chip, T, hist)
+        new.append(nc)
+        scores.append(_indexer_scores(pr["qi"], pr["wts"], nc["pk"].astype(jnp.float32), cfg))
+        qpos.append(pb + jnp.arange(T))
+    qpos = jnp.stack(qpos)                                                          # [B,T]
+    pools, pvalid = indexer_select(jnp.concatenate(scores, 0), jnp.ones((new[0]["pk"].shape[1],), bool), qpos, cfg,
+                                   chip)                                            # [B,T,K]
+    kv = [_per_query_keys(nc["c"], nc.get("cs"), pools[b:b + 1], pvalid[b:b + 1], qpos[b], cfg, chip, dtype)
+          for b, nc in enumerate(new)]
+    q = lax.all_gather(q_lat, cfg.tp_axis, axis=2, tiled=True) if n > 1 else q_lat   # all heads [B,T,H*n,kvr]
+    return _attend_rows(q, [k for k, _ in kv], [v for _, v in kv], cfg), new
+
+
 def mla_core(p, proj, cfg: Cfg, cache=None, pos0=0, sparse=None, cap=None, length=None, hist=False):
     """Position-dependent part of an MLA layer for ONE cache (all rows in lockstep at pos0): cache update, DSA
     selection and attention -> (o_lat [B,T,H_local,kvr], new_cache). Arguments as in `mla_attention`."""
@@ -722,18 +865,7 @@ def mla_core(p, proj, cfg: Cfg, cache=None, pos0=0, sparse=None, cap=None, lengt
                 cache["cs"] = cache["cs"][:, :S]
     S = cache["c"].shape[1] * n                                                    # global capacity
     cfg = dataclasses.replace(cfg, cache_cap=S)
-    new_cache = write_latent(cache, new_c, pos0, cfg, chip)
-    if has_ix:
-        ix = p["indexer"]
-        res = pool_new_keys(ix, cache["tk"], cache["tg"], proj["nk"], proj["ng"], pos0, cfg,
-                            T if length is None else length, hist)
-        pooled, complete, pool0, tk2, tg2 = res[:5]
-        pcfg = dataclasses.replace(cfg, idx_kpool=1)                             # pool-level slots: pool % n, pool // n
-        new_cache["pk"] = cache_write(cache["pk"], pooled, pool0, pcfg, chip, valid=complete)
-        new_cache["tk"], new_cache["tg"] = tk2.astype(cache["tk"].dtype), tg2.astype(cache["tg"].dtype)
-        if hist:
-            new_cache["tk_hist"] = res[5][0].astype(cache["tk"].dtype)
-            new_cache["tg_hist"] = res[5][1].astype(cache["tg"].dtype)
+    new_cache = _mla_write(p, proj, cfg, cache, pos0, chip, T if length is None else length, hist)
     c_all = new_cache["c"]                                                         # [B,S_local,kvr] (int8 under q8)
     cs_all = new_cache.get("cs")                                                   # [B,S_local] scales under q8
     dtype = new_c.dtype
@@ -742,8 +874,7 @@ def mla_core(p, proj, cfg: Cfg, cache=None, pos0=0, sparse=None, cap=None, lengt
     if use_sparse:
         pool_keys = new_cache["pk"].astype(jnp.float32)                            # [B,P_local,ihd] cached pooled keys
         pool_valid = jnp.ones((pool_keys.shape[1],), bool)                         # only complete pools are written;
-        ihd = cfg.idx_hd                                                           # later ones are masked by position
-        qi, wts = proj["qi"], proj["wts"]
+        qi, wts = proj["qi"], proj["wts"]                                          # later ones are masked by position
     if n > 1 and not use_sparse:
         kpos = _slot_to_pos(jnp.arange(c_all.shape[1]), kp, n, chip)               # global position per local slot
     elif not use_sparse:
@@ -759,22 +890,7 @@ def mla_core(p, proj, cfg: Cfg, cache=None, pos0=0, sparse=None, cap=None, lengt
 
     def per_query_attend(q_b, pools, pvalid, qpos_b):
         """Per-query gather of the selected keys that live on this chip (the pre-dedup path; decode + fallback)."""
-        tok = select_tokens(pools, pvalid, qpos_b, cfg)                            # [B,Tq,W] global positions
-        valid = (tok >= 0) & (tok <= qpos_b[None, :, None])
-        if n > 1:
-            owner, slot = _pos_to_slot(jnp.maximum(tok, 0), kp, n)
-            valid = valid & (owner == chip)
-        else:
-            slot = tok
-        slot = jnp.where(valid, slot, 0)
-        c_sel = jnp.take_along_axis(c_all[:, None], slot[..., None], axis=2, mode="promise_in_bounds")
-        if q8:
-            # [B,Tq,W]; rows + lane select for one query (decode), element gather for a verify (`gather_scalars`)
-            if slot.shape[1] == 1:
-                s_sel = gather_scalars(cs_all, slot)
-            else:
-                s_sel = jnp.take_along_axis(cs_all[:, None], slot, axis=2, mode="promise_in_bounds")
-            c_sel = latent_dequant(c_sel, s_sel, dtype)
+        c_sel, valid = _per_query_keys(c_all, cs_all, pools, pvalid, qpos_b, cfg, chip, dtype)
         return _attend(q_b, c_sel, valid, cfg, True)
 
     def block(q_lat_b, qi_b, wts_b, qpos_b):
@@ -782,8 +898,7 @@ def mla_core(p, proj, cfg: Cfg, cache=None, pos0=0, sparse=None, cap=None, lengt
         if n > 1:
             q_lat_b = lax.all_gather(q_lat_b, cfg.tp_axis, axis=2, tiled=True)      # all heads [B,Tq,H*n,kvr]
         if use_sparse:
-            sc = jax.nn.relu(jnp.einsum("bthd,bpd->bthp", qi_b, pool_keys) * (ihd ** -0.5))
-            sc = jnp.einsum("bth,bthp->btp", wts_b, sc)                             # [B,Tq,P_local]
+            sc = _indexer_scores(qi_b, wts_b, pool_keys, cfg)                       # [B,Tq,P_local]
             pools, pvalid = indexer_select(sc, pool_valid, qpos_b, cfg, chip)      # [B,Tq,K] global pools
             if qpos_b.shape[0] <= cfg.per_query_max or cfg.union_pools == 0:       # decode / spec verify / dedup off
                 return per_query_attend(q_lat_b, pools, pvalid, qpos_b)             # (no union bookkeeping, no conds)
@@ -847,17 +962,14 @@ def mla_attention(p, x, cfg: Cfg, cache=None, pos0=0, sparse=None, cap=None, len
     return mla_out(p, o_lat, cfg), new_cache
 
 
-def mla_attention_rows(p, x, cfg: Cfg, caches, pos, sparse="auto", cap=None):
+def mla_attention_rows(p, x, cfg: Cfg, caches, pos, sparse="auto", cap=None, hist=False):
     """Decode step of B INDEPENDENT streams: x [B,T,D]; caches[b] = row b's own cache (batch dim 1) at position
-    pos[b] (traced scalars). Projections and the output run batched, the cache update / DSA selection / attention
-    per row -> (y [B,T,D], [new cache per row])."""
+    pos[b] (traced scalars). Projections and the output run batched, the cache updates and key gathers per row, the
+    DSA selection's and the attention's collectives batched (`mla_core_rows`) -> (y [B,T,D], [new cache per row]);
+    hist=True (T > 1, a verify per row): the pool-tail histories."""
     proj = mla_project(p, x, cfg)
-    outs, new = [], []
-    for b, (c, pb) in enumerate(zip(caches, pos)):
-        pr = {k: v[b:b + 1] for k, v in proj.items()}
-        o_b, nc = mla_core(p, pr, cfg, c, pb, sparse, cap, None, False)
-        outs.append(o_b); new.append(nc)
-    return mla_out(p, jnp.concatenate(outs, 0), cfg), new
+    o_lat, new = mla_core_rows(p, proj, cfg, caches, pos, sparse, cap, hist)
+    return mla_out(p, o_lat, cfg), new
 
 
 # ----------------------------------------------------------------------------- MoE
@@ -942,16 +1054,18 @@ def decoder_layer(p, streams, cfg: Cfg, ltype, mtype, cache=None, pos0=0, use_re
     return streams, new_cache
 
 
-def decoder_layer_rows(p, streams, cfg: Cfg, ltype, mtype, caches, pos, fetch=None, sparse="auto", layer=0, cap=None):
-    """Recurrent (decode) step of B INDEPENDENT streams: streams [B,T,hc,D]; caches[b] = row b's own cache (batch
-    dim 1), pos[b] its position (traced scalar). Attention runs per row on its own cache, everything else (mHC,
-    projections, MoE) batched over the rows. Returns (streams, [new cache per row])."""
+def decoder_layer_rows(p, streams, cfg: Cfg, ltype, mtype, caches, pos, fetch=None, sparse="auto", layer=0, cap=None,
+                       hist=False):
+    """Recurrent step of B INDEPENDENT streams: streams [B,T,hc,D] (T = 1: decode; T > 1 with hist=True: every row
+    verifies its own T-token block); caches[b] = row b's own cache (batch dim 1), pos[b] its position (traced
+    scalar). Attention runs per row on its own cache, everything else (mHC, projections, MoE: T consecutive tokens
+    per row) batched over the rows. Returns (streams, [new cache per row], with the *_hist entries when hist)."""
     post, comb, h = hc_pre(p["hc_attn"], streams, cfg)
     h = rmsnorm(h, p["ln1"], cfg.eps)
     if ltype == "linear_attention":
-        h, new = kda_attention_rows(p["attn"], h, cfg, caches)
+        h, new = kda_attention_rows(p["attn"], h, cfg, caches, hist)
     else:
-        h, new = mla_attention_rows(p["attn"], h, cfg, caches, pos, sparse, cap)
+        h, new = mla_attention_rows(p["attn"], h, cfg, caches, pos, sparse, cap, hist)
     streams = hc_post(post, comb, h, streams)
     post, comb, h = hc_pre(p["hc_ffn"], streams, cfg)
     h = rmsnorm(h, p["ln2"], cfg.eps)
@@ -994,7 +1108,7 @@ def layer_post(p, streams, h, post, comb, cfg: Cfg, mtype, gu_w=None, dn_w=None,
     return hc_post(post, comb, y, streams)
 
 
-HIST_KEYS = {"state_hist": "state", "conv_hist": "conv", "tk_hist": "tk", "tg_hist": "tg"}
+HIST_KEYS = {"state_hist": "state", "conv_hist": "conv", "tk_hist": "tk", "tg_hist": "tg", "kin_hist": "state"}
 
 
 def split_hist(cache):
@@ -1003,16 +1117,25 @@ def split_hist(cache):
     return {k: v for k, v in cache.items() if k not in HIST_KEYS}, (hist or None)
 
 
-def rollback_states(hists, n_keep, dtypes):
+def rollback_states(hists, n_keep, dtypes, cur=None):
     """Speculative verify of T tokens produced `hists` (per layer: the recurrent/tail state after each token, or
     None); return per layer the small state entries as after the first `n_keep` (traced, 1..T) tokens (the
-    positional cache rows beyond are overwritten later). `dtypes`: per layer {key: dtype} of the cache entries."""
+    positional cache rows beyond are overwritten later). `dtypes`: per layer {key: dtype} of the cache entries.
+    A "kin_hist" (the KDA tokens' update inputs) replays the accepted tokens from cur[layer]["state"] (the state the
+    verify left unchanged)."""
     out = []
-    for h, dt in zip(hists, dtypes):
+    for i, (h, dt) in enumerate(zip(hists, dtypes)):
         if not h:
             out.append(None); continue
-        out.append({k: lax.dynamic_index_in_dim(h[hk], n_keep - 1, axis=0, keepdims=False).astype(dt[k])
-                    for hk, k in HIST_KEYS.items() if hk in h})
+        o = {}
+        for hk, k in HIST_KEYS.items():
+            if hk not in h:
+                continue
+            if hk == "kin_hist":
+                o[k] = kda_replay(cur[i][k], h[hk], n_keep).astype(dt[k])
+            else:
+                o[k] = lax.dynamic_index_in_dim(h[hk], n_keep - 1, axis=0, keepdims=False).astype(dt[k])
+        out.append(o)
     return out
 
 

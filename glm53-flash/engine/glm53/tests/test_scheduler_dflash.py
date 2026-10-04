@@ -72,3 +72,37 @@ def test_policy_picks_the_cheaper_block():
     for _ in range(30):
         pol.update(s, 4, 2)
     assert pol.pick(s) == 4
+
+
+@pytest.mark.parametrize("rows", [{2: (1.0, 9.0), 3: (1.0, 9.0)}, {2: (9.0, 1.0), 3: (9.0, 1.0)}])
+def test_dflash_rows_scheduler_matches_greedy(eng, rows):
+    """Three concurrent requests of different lengths: with batched DFlash cheaper than plain (first case) the streams
+    decode speculatively together — membership changes as they finish and the last one runs alone — and every output
+    equals its own single-stream greedy generation; with plain cheaper (second case) the batched steps stay plain
+    (probe disabled) and the outputs are the same."""
+    rng = np.random.default_rng(3)
+    V = eng.cfg.vocab
+    ps = [rng.integers(8, V - 1, size=(n,)).tolist() for n in (40, 28, 33)]
+    reqs = [Request(p, m, 0.0, 1.0, rid=str(i)) for i, (p, m) in enumerate(zip(ps, (30, 9, 18)))]
+    sched, state = run_sched(eng, DFlashPolicy({4: 1.0}, probe=10 ** 6, rows=rows), reqs, max_streams=3)
+    for r, p in zip(reqs, ps):
+        assert r.out == reference(eng, p, r.max_new), (r.rid, r.out, reference(eng, p, r.max_new))
+    if rows[3][0] < rows[3][1]:
+        assert state.get("rows_steps", 0) > 0 and state.get("rows_starts", 0) >= 2, state
+    else:
+        assert state.get("rows_steps", 0) == 0, state
+
+
+def test_policy_rows():
+    pol = DFlashPolicy({4: 14.6}, prior={4: 2.8}, rows={3: (30.0, 15.7)})
+
+    class S:
+        pass
+    ss = [S() for _ in range(3)]
+    for s in ss:
+        pol.start(s)
+    assert pol.pick_rows(ss) and not pol.pick_rows(ss[:2])        # 8.4 tok / 30 ms > 3 / 15.7; no costs for B = 2
+    for _ in range(40):
+        for s in ss:
+            pol.update(s, 4, 1)                                   # nothing accepted: plain pays
+    assert not pol.pick_rows(ss)

@@ -216,14 +216,27 @@ def ingest(params, ring, feats, pos0, length, cfg: DCfg):
 
 def block_attention(p, x, ring_k, ring_v, ring_p, start, cfg: DCfg):
     """x [B, T, D] (the block after norm + conv) at positions start + t; ring_k/v [B, W, kvl, hd] this layer's context
-    (positions < start), ring_p [B, W] their positions + 1. Bidirectional inside the block, window |q - k| <
-    cfg.window to the context. -> [B, T, D]."""
+    (positions < start), ring_p [B, W] their positions + 1 — or lists of B per-row arrays (batch 1 each: every stream
+    its own ring; the projections stay batched). Bidirectional inside the block, window |q - k| < cfg.window to the
+    context. -> [B, T, D]."""
     B, T, _ = x.shape
     hd = cfg.hd
     pos = start[:, None] + jnp.arange(T)[None, :]
     q = rope(M.rmsnorm((x @ p["q"]).reshape(B, T, -1, hd), p["q_norm"], cfg.eps), pos, cfg.theta)
     k = rope(M.rmsnorm((x @ p["k"]).reshape(B, T, -1, hd), p["k_norm"], cfg.eps), pos, cfg.theta)
     v = (x @ p["v"]).reshape(B, T, -1, hd)
+    if isinstance(ring_k, (list, tuple)):
+        o = jnp.concatenate([_block_attend(q[b:b + 1], k[b:b + 1], v[b:b + 1], ring_k[b], ring_v[b], ring_p[b],
+                                           pos[b:b + 1], cfg) for b in range(B)], 0)
+    else:
+        o = _block_attend(q, k, v, ring_k, ring_v, ring_p, pos, cfg)
+    return cfg.reduce(o @ p["o"])
+
+
+def _block_attend(q, k, v, ring_k, ring_v, ring_p, pos, cfg: DCfg):
+    """The block's queries against [the ring's context, the block] -> [B, T, H_local * hd] (before o)."""
+    B, T = q.shape[:2]
+    hd = cfg.hd
     kvl = k.shape[2]
     keys = jnp.concatenate([ring_k.astype(k.dtype), k], 1)
     vals = jnp.concatenate([ring_v.astype(v.dtype), v], 1)
@@ -234,21 +247,25 @@ def block_attention(p, x, ring_k, ring_v, ring_p, start, cfg: DCfg):
     s = jnp.einsum("btgrd,bsgd->bgrts", qg, keys, preferred_element_type=jnp.float32) * hd ** -0.5
     s = jnp.where(mask[:, None, None], s, -jnp.inf)
     a = jax.nn.softmax(s, -1).astype(vals.dtype)
-    o = jnp.einsum("bgrts,bsgd->btgrd", a, vals).reshape(B, T, -1)
-    return cfg.reduce(o @ p["o"])
+    return jnp.einsum("bgrts,bsgd->btgrd", a, vals).reshape(B, T, -1)
 
 
 def draft_hidden(params, emb, ring, start, cfg: DCfg):
     """emb [B, T, D] = embedding rows of [anchor, MASK...] (x emb_scale) at positions start + t -> final-norm hidden
-    [B, T, D] (the reference's `DFlashDraftModel.forward` over the block)."""
+    [B, T, D] (the reference's `DFlashDraftModel.forward` over the block). `ring`: one ring of batch B or a list of B
+    per-row rings."""
     x = emb.astype(cfg.dtype)
     g = cfg.conv_group
+    rows = isinstance(ring, (list, tuple))
     for li, p in enumerate(params["layers"]):
         ca, cm = p["conv_a"], p["conv_m"]
         h = M.rmsnorm(x, p["ln1"], cfg.eps)
         dk = conv_kernels(ca, h, cfg)
-        a = block_attention(p, dyn_conv(h, dk[:, :, 0], ca["base"][0], g), ring["k"][li], ring["v"][li],
-                            ring["p"], start, cfg)
+        if rows:
+            rk, rv, rp = [r["k"][li] for r in ring], [r["v"][li] for r in ring], [r["p"] for r in ring]
+        else:
+            rk, rv, rp = ring["k"][li], ring["v"][li], ring["p"]
+        a = block_attention(p, dyn_conv(h, dk[:, :, 0], ca["base"][0], g), rk, rv, rp, start, cfg)
         x = x + dyn_conv(a, dk[:, :, 1], ca["base"][1], g)
         h = M.rmsnorm(x, p["ln2"], cfg.eps)
         dk = conv_kernels(cm, h, cfg)
@@ -334,10 +351,16 @@ def select(sel, hidden, z_local, anchor, cfg: DCfg, temperature=None, key=None):
 
 def draft(params, ring, feats, pos0, n_new, anchor, embed, lm_head, cfg: DCfg, T=None, temperature=None, key=None):
     """One draft: write the n_new new context positions' features (feats [B, N, nF*D] at pos0 + i, i < n_new) into
-    the ring, then draft the block [anchor, MASK x (T-1)] at position start = pos0 + n_new.
+    the ring, then draft the block [anchor, MASK x (T-1)] at position start = pos0 + n_new. `ring` = one ring of batch
+    B, or a list of B per-row rings (batch 1 each; returned as a list).
     -> (path [B, T-1], candidates, q, scores, ring, hidden [B, T, D])."""
     T = cfg.block if T is None else T
-    ring = ingest(params, ring, feats, pos0, n_new, cfg)
+    if isinstance(ring, (list, tuple)):              # per-row rings: the context K/V batched, written row by row
+        N = _rows(feats)[1]
+        k, v = context_kv(params, fuse_features(params, feats, cfg), pos0[:, None] + jnp.arange(N)[None, :], cfg)
+        ring = [ring_write(r, k[:, b:b + 1], v[:, b:b + 1], pos0[b:b + 1], n_new[b:b + 1]) for b, r in enumerate(ring)]
+    else:
+        ring = ingest(params, ring, feats, pos0, n_new, cfg)
     start = pos0 + n_new
     B = anchor.shape[0]
     ids = jnp.concatenate([anchor[:, None], jnp.full((B, T - 1), cfg.mask_id, anchor.dtype)], 1)
@@ -395,8 +418,9 @@ class Drafter:
             self._progs[key] = jax.jit(sm, donate_argnums=(1,))
         return self._progs[key]
 
-    def _prog_draft(self, B, N, T, sample, feat_index=None):
-        key = ("draft", B, N, T, sample) + ((feat_index,) if feat_index is not None else ())
+    def _prog_draft(self, B, N, T, sample, feat_index=None, rows=False):
+        """rows=True: B per-row rings (a list, each batch 1, donated) instead of one ring of batch B."""
+        key = ("draft", B, N, T, sample) + ((feat_index,) if feat_index is not None else ()) + (("rows",) if rows else ())
         if key not in self._progs:
             def prog(params, ring, feats, pos0, n_new, anchor, embed, lm_head, *samp):
                 if feat_index is not None:      # stacked per layer group (the engine's verify): pick the target layers
@@ -408,12 +432,13 @@ class Drafter:
                     temp = temp * self.temp_scale   # (a sharper q than the target's accepts more: v6e 2026-10-04)
                 path, cand, q, scores, ring, _ = draft(params, ring, feats, pos0, n_new, anchor, embed, lm_head,
                                                        self.lcfg, T, temp, k)
-                out = {"path": path, "cand": cand, "scores": scores, "ring": ring,
+                out = {"path": path, "cand": cand, "scores": scores, "rings" if rows else "ring": ring,
                        "seq": jnp.concatenate([anchor[:, None].astype(path.dtype), path], 1)}
                 return {**out, "q": q} if sample else out
-            rs = RING_SPECS
+            rs = [RING_SPECS] * B if rows else RING_SPECS
             in_specs = (self.specs, rs, R, R, R, R, self.embed_spec, self.lm_head_spec) + ((R, R) if sample else ())
-            out_specs = {"path": R, "cand": R, "scores": R, "ring": rs, "seq": R, **({"q": R} if sample else {})}
+            out_specs = {"path": R, "cand": R, "scores": R, "rings" if rows else "ring": rs, "seq": R,
+                         **({"q": R} if sample else {})}
             sm = shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
             self._progs[key] = jax.jit(sm, donate_argnums=(1,))
         return self._progs[key]
@@ -438,3 +463,16 @@ class Drafter:
         if temperature is not None:              # (a device scalar, e.g. DeviceSampler.bind's, passes through)
             args += (temperature if isinstance(temperature, jax.Array) else jnp.float32(temperature), key)
         return self._prog_draft(B, N, T, temperature is not None, feat_index)(*args)
+
+    def draft_rows(self, rings, feats, pos0, n_new, anchor, embed, lm_head, T=None, temperature=None, key=None,
+                   feat_index=None):
+        """`draft` for B streams that each keep their own ring (`rings`: a list of B rings of batch 1, donated; the
+        engine's per-stream cache sets) -> the same dict with "rings" (the new list) instead of "ring"."""
+        B = len(rings)
+        N = (_rows(feats) if feat_index is None else feats[0].shape[1:3])[1]
+        T = self.cfg.block if T is None else T
+        args = (self.params, list(rings), feats, jnp.asarray(pos0, jnp.int32), jnp.asarray(n_new, jnp.int32),
+                jnp.asarray(anchor, jnp.int32), embed, lm_head)
+        if temperature is not None:
+            args += (temperature if isinstance(temperature, jax.Array) else jnp.float32(temperature), key)
+        return self._prog_draft(B, N, T, temperature is not None, feat_index, rows=True)(*args)
