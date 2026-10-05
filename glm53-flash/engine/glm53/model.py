@@ -19,6 +19,7 @@ Parameter layout (all Linear weights stored as [in, out], i.e. y = x @ W):
 from __future__ import annotations
 
 import dataclasses
+import functools
 from typing import Any
 
 import jax
@@ -78,6 +79,17 @@ class Cfg:
     topk_local: int = 128             # first-stage local top-k per chip (exact: falls back to the full K when a chip's list was cut short)
     cache_cap: int = 0                # set inside mla_attention: global cache capacity
     cache_q8: bool = False            # MLA latent cache stored as int8 rows + a per-token f32 scale ("cs"): half the HBM
+    pool_gather: int = 0              # per-query key gathers by whole k-pools ((kp, kvr) windows, one per selected pool,
+                                      # instead of a row per token; the scales as 128-lane rows + a lane select) from this
+                                      # many queries per block (1 = decode too; 0 = never). OFF: in a micro-benchmark a
+                                      # T = 4 verify's layer gather fell from 16.7 + 50.8 us (token rows + element-
+                                      # gathered scales) to 11.4 + 9.7 (j148), but inside the programs XLA re-lays the
+                                      # whole per-layer cache out for the window gather ({2,0,1:T(1,128)}, a copy per
+                                      # call: j150 2026-10-05, plain B = 3 +0.6 ms per step, the verify's gain eaten)
+    select_buckets: tuple = ()        # indexer selection (sharded cache): the local top-k over the smallest of these
+                                      # pool counts holding every pool visible from the block's positions, chosen by a
+                                      # lax.switch. OFF: the conditional per MLA layer cost more than the sorts it saved
+                                      # (v6e 2026-10-05, j143: one-stream DFlash step +0.5 ms with (512, 2048))
 
     def reduce(self, y):
         return y if self.tp_reduce is None else self.tp_reduce(y)
@@ -278,6 +290,12 @@ def kda_chunked(q, k, v, g, beta, state0=None, chunk=64):
     return jnp.swapaxes(out, 1, 2), S
 
 
+KDA_UNROLL = 0             # kda_recurrent unrolls its token loop for 2..KDA_UNROLL tokens instead of a lax.scan (a
+                           # while loop: 0.19 ms per one-stream DFlash step on the v6e). OFF: unrolled, the step's
+                           # device time ROSE 13.16 -> 13.63 ms (j150 2026-10-05: loop fusions +0.25, all-reduces
+                           # +0.15, the while gone) — the scan body is the better-fused form. Results agree to an ulp.
+
+
 def kda_state_step(S, k_i, v_i, g_i, b_i):
     """The KDA state update of one token (f32; k_i l2-normed): S [B,H,dk,dv], k/v/g [B,H,d], b [B,H]."""
     S = S * jnp.exp(g_i)[..., None]
@@ -305,7 +323,15 @@ def kda_recurrent(q, k, v, g, beta, state, hist=False):
         return S, ((o, S) if keep else o)
 
     xs = tuple(jnp.moveaxis(t, 1, 0) for t in (q, k, v, g, beta))
-    S, out = lax.scan(step, state.astype(f32), xs)
+    if 2 <= T <= KDA_UNROLL:              # a verify of a few tokens: straight-line code, no while loop (T = 1: XLA
+        # inlines the one-iteration scan already; its bits are the plain decode fingerprint's)
+        S, outs = state.astype(f32), []
+        for t in range(T):
+            S, o = step(S, tuple(x[t] for x in xs))
+            outs.append(o)
+        out = jax.tree.map(lambda *a: jnp.stack(a), *outs) if T > 1 else jax.tree.map(lambda a: a[None], outs[0])
+    else:
+        S, out = lax.scan(step, state.astype(f32), xs)
     if keep:
         out, states = out
         return jnp.moveaxis(out, 0, 1), S, states
@@ -621,10 +647,14 @@ def indexer_select(scores, pool_valid, qpos, cfg: Cfg, chip=None):
         return sel, vals > lo
     off = chip
 
-    def two_stage(k_local):
+    def two_stage(k_local, L=P_local):
         """local top-k_local -> all-gather -> global top-K; also returns whether any chip's list was cut short of
-        the global threshold (then the result may be inexact)."""
-        v, j = top_k(scores, k_local)                                                 # [B,Tq,k_local]
+        the global threshold (then the result may be inexact). L = the local pools that can be visible (static):
+        only the first L are scored (the rest sit beyond every query's position)."""
+        if k_local >= L:                           # every candidate pool goes to the global stage: no local sort
+            v, j = scores[..., :L], jnp.broadcast_to(jnp.arange(L, dtype=jnp.int32), (B, Tq, L))
+        else:
+            v, j = top_k(scores[..., :L], k_local)                                    # [B,Tq,k_local]
         j = j * n + off
         both = lax.all_gather(jnp.stack([lax.bitcast_convert_type(v, jnp.int32), j]), cfg.tp_axis, axis=-1,
                               tiled=True)                                             # one collective, not two
@@ -638,9 +668,23 @@ def indexer_select(scores, pool_valid, qpos, cfg: Cfg, chip=None):
         return vs, ss, cut
 
     k_fast = min(cfg.topk_local, K) if Tq > 1 else K       # a single query (decode) gains nothing from the fallback dance
-    vs, ss, cut = two_stage(k_fast)
-    if k_fast < K:
-        vs, ss = lax.cond(cut, lambda _: two_stage(K)[:2], lambda _: (vs, ss), None)
+
+    def select(L):
+        vs, ss, cut = two_stage(k_fast, L)
+        if k_fast < K:
+            vs, ss = lax.cond(cut, lambda _: two_stage(K, L)[:2], lambda _: (vs, ss), None)
+        return vs, ss
+
+    # the local pools a query at position q can see are the first (q + 1) // (n * kp) + 1 (interleaved layout): the
+    # sorts run over that bucket of the P_local scores, not all of them (a 262k cache scores 8,192 pools per chip at
+    # any context; the TPU-v5e paper's "blocks sized for the max context" cost). Every chip takes the same branch.
+    Ls = [L for L in cfg.select_buckets if L < P_local] + [P_local]
+    if len(Ls) == 1:
+        vs, ss = select(P_local)
+    else:
+        nv = (jnp.max(qpos) + 1) // (n * kp) + 1
+        idx = sum((nv > L).astype(jnp.int32) for L in Ls[:-1])
+        vs, ss = lax.switch(idx, [functools.partial(select, L) for L in Ls])
     return ss, vs > lo
 
 
@@ -793,6 +837,86 @@ def _per_query_keys(c_all, cs_all, pools, pvalid, qpos, cfg: Cfg, chip, dtype):
     return c_sel, valid
 
 
+POOL_GATHER_WINDOWS = True    # `_per_query_pool_keys` gathers (kp, kvr) windows (lax.gather) instead of rows of a
+                              # pool-major reshape of the cache (read at trace time)
+
+
+def _per_query_pool_keys(c_all, cs_all, pools, pvalid, qpos, cfg: Cfg, chip, dtype):
+    """`_per_query_keys` with the latents gathered by whole k-pools: one gathered row of kp tokens per selected pool
+    (plus the query's incomplete tail pool) instead of one row per token — the same keys and per-token validity, in
+    pool-major order, from 4x fewer gather rows (a TPU gather pays per row, not per byte). The q8 scales come as the
+    128-value rows holding each pool's kp consecutive scales plus a lane select (`gather_scalars`). -> (keys
+    [B,Tq,W,kvr], valid [B,Tq,W]) with W = (K + 1) * kp padded to a multiple of 32."""
+    B, Tq, K = pools.shape
+    n, kp = cfg.seq_shard, cfg.idx_kpool
+    S_local, R = c_all.shape[1], c_all.shape[2]
+    P_local = -(-S_local // kp)
+    tail = (qpos // kp)[None, :, None]                                                # [1,Tq,1] the query's own pool
+    tail_on = ((qpos + 1) % kp != 0)[None, :, None]                                   # incomplete: not in pk, its tokens <= qpos
+    gpool = jnp.concatenate([pools, jnp.broadcast_to(tail, (B, Tq, 1))], -1)          # [B,Tq,K+1] global pool ids
+    ok = jnp.concatenate([pvalid, jnp.broadcast_to(tail_on, (B, Tq, 1))], -1)
+    if n > 1:
+        ok = ok & (gpool % n == chip)
+        local = gpool // n
+    else:
+        local = gpool
+    local = jnp.where(ok, local, 0)
+    tok = gpool[..., None] * kp + jnp.arange(kp, dtype=gpool.dtype)                   # [B,Tq,K+1,kp] global positions
+    valid = (ok[..., None] & (tok <= qpos[None, :, None, None])).reshape(B, Tq, (K + 1) * kp)
+    if POOL_GATHER_WINDOWS and S_local % kp == 0:
+        # (kp, R) windows straight from the token-major cache: no pool-major reshape (a relayout copy of the whole
+        # per-layer cache per call on the TPU)
+        bidx = jnp.broadcast_to(jnp.arange(B, dtype=jnp.int32)[:, None, None], local.shape)
+        start = jnp.stack([bidx, local * kp], -1)                                                    # [B,Tq,K+1,2]
+        dn = lax.GatherDimensionNumbers(offset_dims=(3, 4), collapsed_slice_dims=(0,), start_index_map=(0, 1))
+        rows = lax.gather(c_all, start, dn, slice_sizes=(1, kp, R), mode="promise_in_bounds")        # [B,Tq,K+1,kp,R]
+        c_sel = rows.reshape(B, Tq, (K + 1) * kp, R)
+        if cfg.cache_q8:                     # (a (1, kp) window gather of the scales is 6x slower than this, j148)
+            c_sel = latent_dequant(c_sel, _pool_scales(cs_all, local, kp).reshape(B, Tq, (K + 1) * kp), dtype)
+        W = c_sel.shape[2]
+        pad = (-W) % 32
+        if pad:
+            c_sel = jnp.pad(c_sel, ((0, 0), (0, 0), (0, pad), (0, 0)))
+            valid = jnp.pad(valid, ((0, 0), (0, 0), (0, pad)))
+        return c_sel, valid
+    c_pools = jnp.pad(c_all, ((0, 0), (0, P_local * kp - S_local), (0, 0))) if S_local % kp else c_all
+    c_view = c_pools.reshape(B, P_local, kp * R)
+    rows = jnp.take_along_axis(c_view[:, None], local[..., None], axis=2, mode="promise_in_bounds")   # [B,Tq,K+1,kp*R]
+    c_sel = rows.reshape(B, Tq, (K + 1) * kp, R)
+    if cfg.cache_q8:
+        c_sel = latent_dequant(c_sel, _pool_scales(cs_all, local, kp).reshape(B, Tq, (K + 1) * kp), dtype)
+    W = c_sel.shape[2]
+    pad = (-W) % 32
+    if pad:
+        c_sel = jnp.pad(c_sel, ((0, 0), (0, 0), (0, pad), (0, 0)))
+        valid = jnp.pad(valid, ((0, 0), (0, 0), (0, pad)))
+    return c_sel, valid
+
+
+def _pool_scales(cs_all, local, kp):
+    """The kp consecutive per-token scales of every pool in `local` [B,Tq,P] from cs_all [B,S_local] -> [B,Tq,P,kp]:
+    the 128-value rows holding them (a row gather) and a lane select per position (`gather_scalars`' way; v6e
+    2026-10-05, j148: 9.7 us per MLA layer at 4 x 520 pools vs 50.8 for the element gather of the 4 x 2080 scalars)."""
+    B, S_local = cs_all.shape
+    Tq, P = local.shape[1:]
+    if S_local % 128 or 128 % kp:
+        slot = (local[..., None] * kp + jnp.arange(kp)).reshape(B, Tq, P * kp)
+        return jnp.take_along_axis(cs_all[:, None], jnp.minimum(slot, S_local - 1), axis=2,
+                                   mode="promise_in_bounds").reshape(B, Tq, P, kp)
+    srows = jnp.take_along_axis(cs_all.reshape(B, 1, S_local // 128, 128), (local * kp // 128)[..., None], axis=2,
+                                mode="promise_in_bounds")                                              # [B,Tq,P,128]
+    lane = jnp.arange(128, dtype=jnp.int32)
+    base = (local * kp % 128)[..., None]
+    return jnp.stack([jnp.sum(jnp.where(lane == base + t, srows, jnp.zeros((), srows.dtype)), -1) for t in range(kp)], -1)
+
+
+def _query_keys(c_all, cs_all, pools, pvalid, qpos, cfg: Cfg, chip, dtype):
+    """The per-query key gather of a block: by pools (`_per_query_pool_keys`) from cfg.pool_gather queries, else by
+    tokens (`_per_query_keys`)."""
+    f = _per_query_pool_keys if cfg.pool_gather and pools.shape[1] >= cfg.pool_gather else _per_query_keys
+    return f(c_all, cs_all, pools, pvalid, qpos, cfg, chip, dtype)
+
+
 def _attend_rows(q, keys, masks, cfg: Cfg):
     """`_attend` with per-query keys for B rows whose keys stay separate (keys[b] [1,Tq,W,r], masks[b] [1,Tq,W]; no
     concatenation of the gathered latents): the scores and products per row, the cross-chip max and the two
@@ -853,7 +977,7 @@ def mla_core_rows(p, proj, cfg: Cfg, caches, pos, sparse="auto", cap=None, hist=
     qpos = jnp.stack(qpos)                                                          # [B,T]
     pools, pvalid = indexer_select(jnp.concatenate(scores, 0), jnp.ones((new[0]["pk"].shape[1],), bool), qpos, cfg,
                                    chip)                                            # [B,T,K]
-    kv = [_per_query_keys(nc["c"], nc.get("cs"), pools[b:b + 1], pvalid[b:b + 1], qpos[b], cfg, chip, dtype)
+    kv = [_query_keys(nc["c"], nc.get("cs"), pools[b:b + 1], pvalid[b:b + 1], qpos[b], cfg, chip, dtype)
           for b, nc in enumerate(new)]
     q = lax.all_gather(q_lat, cfg.tp_axis, axis=2, tiled=True) if n > 1 else q_lat   # all heads [B,T,H*n,kvr]
     return _attend_rows(q, [k for k, _ in kv], [v for _, v in kv], cfg), new
@@ -904,7 +1028,7 @@ def mla_core(p, proj, cfg: Cfg, cache=None, pos0=0, sparse=None, cap=None, lengt
 
     def per_query_attend(q_b, pools, pvalid, qpos_b):
         """Per-query gather of the selected keys that live on this chip (the pre-dedup path; decode + fallback)."""
-        c_sel, valid = _per_query_keys(c_all, cs_all, pools, pvalid, qpos_b, cfg, chip, dtype)
+        c_sel, valid = _query_keys(c_all, cs_all, pools, pvalid, qpos_b, cfg, chip, dtype)
         return _attend(q_b, c_sel, valid, cfg, True)
 
     def block(q_lat_b, qi_b, wts_b, qpos_b):

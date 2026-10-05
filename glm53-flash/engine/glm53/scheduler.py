@@ -669,7 +669,7 @@ class Scheduler:
         R = self._rows
         if R is None:
             return
-        st = R["st"]
+        st = self.eng.dflash_settle_rows(R["st"])                         # the last step's rollbacks were deferred
         for b, s in enumerate(R["streams"]):
             s.caches, s.pos = st["sets"][b] + [st["rings"][b]], st["pos_h"][b]
         self._rows = None
