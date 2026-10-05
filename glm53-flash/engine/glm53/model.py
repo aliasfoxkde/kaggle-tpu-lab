@@ -367,9 +367,10 @@ def kda_core(proj, cfg: Cfg, cache=None, use_recurrent=False, length=None, hist=
     """Conv + KDA recurrence of `proj` (kda_project; any B in lockstep, ONE cache) -> (core [B,T,H,hd] f32,
     new_cache). cache: None or {"conv": [B,K-1,3C], "state": [B,H,dk,dv]}. `length`: number of real tokens (rest
     is padding: beta=0, g=0 so the state ignores them). hist=True (recurrent, T > 1: speculative verify) adds
-    "state_hist" [T,B,H,dk,dv] and "conv_hist" [T,B,K-1,3C] = the cache after each token, for `rollback_caches`;
-    hist="kin": "kin_hist" [T,B,H,4,d] (the tokens' state-update inputs) instead of "state_hist", and the returned
-    "state" is the one BEFORE the tokens (the rollback replays the accepted ones: `kda_replay`)."""
+    "state_hist" [T+1,B,H,dk,dv] and "conv_hist" [T+1,B,K-1,3C] = the cache after 0..T of the tokens (entry 0 =
+    before them), for `rollback_states`; hist="kin": "kin_hist" [T,B,H,4,d] (the tokens' state-update inputs) instead
+    of "state_hist", and the returned "state" is the one BEFORE the tokens (the rollback replays the accepted ones:
+    `kda_replay`)."""
     qkv_raw, conv_w, g, beta = proj["qkv"], proj["conv_w"], proj["g"], proj["beta"]
     B, T, _ = qkv_raw.shape
     H, hd = cfg.kda_heads, cfg.kda_hd
@@ -391,10 +392,14 @@ def kda_core(proj, cfg: Cfg, cache=None, use_recurrent=False, length=None, hist=
             core, new_state, states = kda_recurrent(q, k, v, g, beta, state, hist=hist)
             K = conv_w.shape[-1]
             full = jnp.concatenate([conv_state.astype(qkv_raw.dtype), qkv_raw], axis=1)       # [B,K-1+T,3C]
-            extra = {"kin_hist" if hist == "kin" else "state_hist": states,
-                     "conv_hist": jnp.stack([full[:, t + 1:t + K] for t in range(T)])}
+            # entry t = the conv state after t tokens; entry 0 (before the block) lets a rollback to n_keep = 0 undo
+            # a verify that was dispatched ahead of its tokens (`ResidentLayerEngine.dflash_step`)
+            extra = {"conv_hist": jnp.stack([full[:, t:t + K - 1] for t in range(T + 1)])}
             if hist == "kin":
+                extra["kin_hist"] = states                     # [T,B,H,4,d]: `kda_replay` masks by n_keep
                 new_state = state                              # (replayed to the accepted prefix by the rollback)
+            else:
+                extra["state_hist"] = jnp.concatenate([state.astype(states.dtype)[None], states])   # [T+1,B,H,dk,dv]
         else:
             core, new_state = kda_recurrent(q, k, v, g, beta, state)
     else:
@@ -581,8 +586,8 @@ def pool_new_keys(ix, tail_k, tail_g, new_k, new_g, pos0, cfg: Cfg, length, hist
     start = ((a + length) // kp) * kp                                         # first row of the (incomplete) last pool
     tail_k2 = lax.dynamic_slice_in_dim(kb, start, kp, axis=1)
     tail_g2 = lax.dynamic_slice_in_dim(gb, start, kp, axis=1)
-    if hist:                                                                  # tails after each of the T tokens
-        st = [((a + t + 1) // kp) * kp for t in range(T)]
+    if hist:                                                                  # tails after 0..T of the tokens
+        st = [((a + t) // kp) * kp for t in range(T + 1)]                     # (entry 0 = before them)
         th_k = jnp.stack([lax.dynamic_slice_in_dim(kb, s_, kp, axis=1) for s_ in st])
         th_g = jnp.stack([lax.dynamic_slice_in_dim(gb, s_, kp, axis=1) for s_ in st])
         return pooled, complete, pos0 // kp, tail_k2, tail_g2, (th_k, th_g)
@@ -1293,11 +1298,11 @@ def split_hist(cache):
 
 
 def rollback_states(hists, n_keep, dtypes, cur=None):
-    """Speculative verify of T tokens produced `hists` (per layer: the recurrent/tail state after each token, or
-    None); return per layer the small state entries as after the first `n_keep` (traced, 1..T) tokens (the
-    positional cache rows beyond are overwritten later). `dtypes`: per layer {key: dtype} of the cache entries.
-    A "kin_hist" (the KDA tokens' update inputs) replays the accepted tokens from cur[layer]["state"] (the state the
-    verify left unchanged)."""
+    """Speculative verify of T tokens produced `hists` (per layer: the recurrent/tail state after 0..T of the tokens
+    (entry 0 = before them), or None); return per layer the small state entries as after the first `n_keep` (traced,
+    0..T; 0 undoes the whole verify) tokens (the positional cache rows beyond are overwritten later). `dtypes`: per
+    layer {key: dtype} of the cache entries. A "kin_hist" (the KDA tokens' update inputs, T entries) replays the
+    accepted tokens from cur[layer]["state"] (the state the verify left unchanged)."""
     out = []
     for i, (h, dt) in enumerate(zip(hists, dtypes)):
         if not h:
@@ -1309,7 +1314,7 @@ def rollback_states(hists, n_keep, dtypes, cur=None):
             if hk == "kin_hist":
                 o[k] = kda_replay(cur[i][k], h[hk], n_keep).astype(dt[k])
             else:
-                o[k] = lax.dynamic_index_in_dim(h[hk], n_keep - 1, axis=0, keepdims=False).astype(dt[k])
+                o[k] = lax.dynamic_index_in_dim(h[hk], n_keep, axis=0, keepdims=False).astype(dt[k])
         out.append(o)
     return out
 

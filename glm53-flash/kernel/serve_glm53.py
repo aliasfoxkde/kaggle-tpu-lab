@@ -1185,13 +1185,14 @@ for B in range(1, MAX_STREAMS + 1):
     jax.block_until_ready(_ids); del _sets, _lg, _ids, _pos
     log(f"   batched decode B={B}: {time.time() - t:.0f}s, {grew()}")
     publish("compiling", what=f"decode B={B}", secs=int(time.time() - t))
-if getattr(eng, "dflash", None) is not None:          # draft (every block-size pair), verify + capture, head, rollback
+if getattr(eng, "dflash", None) is not None:          # draft (every block-size pair), verify + capture, head, settle
     for T0 in sorted(DFLASH_COST):
         t = time.time()
         _lg, _cc, _p = eng.prefill(ids)
         _st = eng.dflash_start(np.array([0]), _cc, _p, T=T0)
         for _nt in sorted(DFLASH_COST):
             _e, _st = eng.dflash_step(_st, DeviceSampler(1.0, 0.95, seed=0), tuple(sorted(STOP_IDS)), next_T=_nt)
+        _st = eng.dflash_settle(_st)                  # the stream's end: the verify run ahead undone (its program)
         del _lg, _cc, _st
         eng.dflash_end()                              # (the last step's arrays, kept for a deferred release)
         log(f"   DFlash block {T0}: {time.time() - t:.0f}s, {grew()}")
@@ -1206,6 +1207,7 @@ if getattr(eng, "dflash", None) is not None:          # draft (every block-size 
         _sm = DeviceSampler([1.0] * B, [0.95] * B, seed=0)
         for _ in range(2):
             _e, _st = eng.dflash_step_rows(_st, _sm, tuple(sorted(STOP_IDS)))
+        _st = eng.dflash_settle_rows(_st)             # (the state's end: every row's undo)
         del _lg, _sets, _st
         eng.dflash_end()
         log(f"   DFlash {B} streams: {time.time() - t:.0f}s, {grew()}")

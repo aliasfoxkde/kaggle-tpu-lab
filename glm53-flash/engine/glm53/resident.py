@@ -417,11 +417,12 @@ class ResidentLayerEngine(Engine):
 
     def _prog_group(self, layers, B, T, has_cache, use_recurrent, hist=False, capture=(), pend=None, embed=False):
         """capture = positions j in the group whose output's stream mean is returned as a last output, stacked
-        [len(capture), B, T, D] (DFlash features); hist=True returns the per-token histories stacked per key
-        (`_hist_layout`). pend = T of the previous verify whose rollback is still pending (`dflash_step`): the program
-        then also takes that verify's histories of this group (DONATED: this verify's histories reuse their buffers)
-        and its n_keep, and first rolls the small state entries of its layers back to the accepted prefix (the
-        rollback program's own op, `M.rollback_states`), so no separate rollback program runs between the steps.
+        [len(capture), B, T, D] (DFlash features); hist=True / "kin" returns the per-token histories stacked per key
+        (`_hist_layout`; "kin": the KDA layers return their tokens' update inputs and leave their states as before the
+        block, `M.kda_core`). pend = T of the previous verify whose rollback is still pending (`dflash_step`): the
+        program then also takes that verify's histories of this group (DONATED: this verify's histories reuse their
+        buffers) and its n_keep, and first rolls the small state entries of its layers back to the accepted prefix
+        (the rollback program's own op, `M.rollback_states`), so no separate rollback program runs between the steps.
         embed=True: the streams argument is (embedding table, tokens [B,T]) and the program embeds them itself (the
         step's first group: no separate embed program and its output between the dispatches)."""
         kinds = tuple(self._kind(i) for i in layers)
@@ -431,8 +432,9 @@ class ResidentLayerEngine(Engine):
             lts = [self.cfg.layer_types[i] for i in layers]
             mts = [self.cfg.mlp_types[i] for i in layers]
             css = [self._cache_spec(i) for i in layers]
-            lay = self._hist_layout(layers)
-            hss = {k: P(None, *self._hist_spec(layers[js[0]])[k]) for k, js in lay.items()}
+            kin = hist == "kin"
+            lay = self._hist_layout(layers, kin)
+            hss = {k: P(None, *self._hist_spec(layers[js[0]], kin)[k]) for k, js in lay.items()}
             rep = list(layers)                     # representative layer ids (only used to look up expert qtypes)
 
             from glm53 import quant8 as Q8
@@ -445,7 +447,7 @@ class ResidentLayerEngine(Engine):
                     caches = list(caches)
                     roll = M.rollback_states([{k: hg[k][js.index(j)] for k, js in lay.items() if j in js} or None
                                               for j in range(len(ps))], nk,
-                                             [{k_: c[k_].dtype for k_ in c} for c in caches])
+                                             [{k_: c[k_].dtype for k_ in c} for c in caches], caches)
                     caches = [c if r_ is None else {**c, **r_} for c, r_ in zip(caches, roll)]
                 for j, p in enumerate(ps):
                     p = Q8.dequant_tree(p, self.lcfg.dtype)          # int8 non-expert matrices -> bf16 (fused into dots)
@@ -518,17 +520,18 @@ class ResidentLayerEngine(Engine):
                                                  out_specs=(R, R, R, R) if sample else (R, R), check_vma=False))
         return self._progs[key]
 
-    def _prog_rollback(self, B, T):
-        """the per-group stacked histories of a T-token verify (`_verify_layers`) + n_keep + the current small state
-        entries (`_hist_cur`, DONATED: the outputs reuse their buffers, so the dispatch allocates nothing) -> the small
-        state entries (KDA state/conv, pool tails) as after the first n_keep tokens, per layer; spliced into the caches
-        by the caller (the big positional arrays are not touched)."""
-        key = ("rollback", B, T)
+    def _prog_rollback(self, B, T, kin=False):
+        """the per-group stacked histories of a T-token verify (`_verify_layers`) + n_keep (0..T; 0 undoes the verify)
+        + the current small state entries (`_hist_cur`, DONATED: the outputs reuse their buffers, so the dispatch
+        allocates nothing) -> the small state entries (KDA state/conv, pool tails) as after the first n_keep tokens,
+        per layer; spliced into the caches by the caller (the big positional arrays are not touched). kin=True: the
+        histories hold the KDA tokens' update inputs and the KDA states are those before the block (replayed)."""
+        key = ("rollback", B, T) + (("kin",) if kin else ())
         if key not in self._progs:
             groups = self.groups["decode"]
-            lays = [self._hist_layout(g) for g in groups]
-            hgs = [{k: P(None, *self._hist_spec(g[js[0]])[k]) for k, js in lay.items()} for g, lay in zip(groups, lays)]
-            hss = [self._hist_spec(i) for i in range(self.cfg.n_layers)]
+            lays = [self._hist_layout(g, kin) for g in groups]
+            hgs = [{k: P(None, *self._hist_spec(g[js[0]], kin)[k]) for k, js in lay.items()} for g, lay in zip(groups, lays)]
+            hss = [self._hist_spec(i, kin) for i in range(self.cfg.n_layers)]
             oss = [None if h is None else {M.HIST_KEYS[k]: P(*v[1:]) for k, v in h.items()} for h in hss]   # drop the T axis
             dts = [{M.HIST_KEYS[k]: self.cfg.dtype if M.HIST_KEYS[k] != "state" else jnp.float32 for k in h} if h else None
                    for h in hss]
@@ -539,7 +542,7 @@ class ResidentLayerEngine(Engine):
                     for k, js in lay.items():
                         for s_, j in enumerate(js):
                             per[g[j]] = {**(per[g[j]] or {}), k: h[k][s_]}
-                return M.rollback_states(per, n, dts)
+                return M.rollback_states(per, n, dts, cur)
             sm = shard_map(prog, mesh=self.mesh, in_specs=(hgs, R, oss), out_specs=oss, check_vma=False)
             self._progs[key] = jax.jit(sm, donate_argnums=(2,))
         return self._progs[key]
@@ -557,6 +560,13 @@ class ResidentLayerEngine(Engine):
     reap = True                      # DFlash steps drop the previous step's arrays on a helper thread (`_Reaper`):
                                      # v6e 2026-10-05 (j145) host work per step 12.0 -> 9.9 ms (one stream), 18.5 ->
                                      # 14.0 (3 streams); the wall time was device-bound either way
+    run_ahead = False                # DFlash steps dispatch the NEXT block's verify before the host reads this block's
+                                     # tokens (all its inputs are device arrays), so the device never waits for the
+                                     # host's turnaround; a stream that stops undoes that verify (`dflash_settle`).
+                                     # Off: measured on the v6e 2026-10-05 (j143 / j126 / j102 / j131) the step and the
+                                     # served rates were unchanged (the queued draft already covers the turnaround and
+                                     # the remaining wall - busy gap is ~20 us per program launch), while every stream
+                                     # end wastes one verify and needs the undo program.
 
     def _drop(self, *objs):
         """Release `objs` (the previous step's arrays) now, on the reaper thread when `reap` is set."""
@@ -922,7 +932,7 @@ class ResidentLayerEngine(Engine):
                     s = cur["state"]                                           # [1,H,dk,dv] -> kin [T,1,H,4,dk] f32
                     return jnp.zeros((T, 1, s.shape[1], 4, hd), jnp.float32)
                 a = cur[M.HIST_KEYS[k]]
-                return jnp.broadcast_to(a[None], (T,) + a.shape)
+                return jnp.broadcast_to(a[None], (T + 1,) + a.shape)           # entries 0..T (`M.rollback_states`)
 
             def prog(curs):                                                     # curs[b][layer] -> per group {k: [n,T,B,...]}
                 return [{k: jnp.stack([jnp.concatenate([one(curs[b][g[j]], k) for b in range(B)], axis=1) for j in js])
@@ -932,13 +942,18 @@ class ResidentLayerEngine(Engine):
         return self._progs[key]([self._hist_cur(c, kin=True) for c in sets]), self.device_positions([T] * B), T
 
     def dflash_settle_rows(self, st):
-        """`dflash_settle` for a batched state: its pending rollback applied to every row's caches. Idempotent."""
-        if not st.get("pend"):
+        """`dflash_settle` for a batched state: the verify dispatched ahead undone (every row back to before its block,
+        n_keep = 0) or the pending rollback applied to every row's caches. Idempotent."""
+        B = len(st["sets"])
+        if st.get("ahead") is not None:
+            hists, nk, T = st["ahead"][2], self.device_positions([0] * B), st["T"]
+        elif st.get("pend"):
+            hists, nk, T = st["pend"]
+        else:
             return st
-        hists, nk, T = st["pend"]
-        rolled = self._prog_rollback_rows(len(st["sets"]), T)(hists, nk, [self._hist_cur(c, kin=True) for c in st["sets"]])
+        rolled = self._prog_rollback_rows(B, T)(hists, nk, [self._hist_cur(c, kin=True) for c in st["sets"]])
         new = [[({**c, **x} if x else c) for c, x in zip(cs, rs)] for cs, rs in zip(st["sets"], rolled)]
-        return {**st, "sets": new, "pend": None}
+        return {**{k: v for k, v in st.items() if k != "ahead"}, "sets": new, "pend": None}
 
     def _prog_rollback_rows(self, B, T):
         """`_prog_rollback` for B independent streams: (the per-group histories of `_verify_rows` (rows on the batch
@@ -1161,10 +1176,11 @@ class ResidentLayerEngine(Engine):
 
     def _verify_layers(self, tokens, caches, pos0, capture=False, pend=None):
         """embed + the decode layer groups of a recurrent T-token step with per-token histories -> (final streams,
-        caches, histories (per group, stacked per key: `_prog_rollback` takes them), DFlash features when capture: (the
-        stacked stream means [len(g), B, T, D] of the groups holding drafter target layers, the target positions in
-        each) — the drafter's programs take that pair (`dflash.Drafter.draft(feat_index=...)`)). pend = (histories
-        per group, n_keep, T) of the previous verify whose rollback the groups apply first (`dflash_step`)."""
+        caches, histories (per group, stacked per key, the rows' "kin" form: `_prog_rollback(kin=True)` takes them),
+        DFlash features when capture: (the stacked stream means [len(g), B, T, D] of the groups holding drafter target
+        layers, the target positions in each) — the drafter's programs take that pair
+        (`dflash.Drafter.draft(feat_index=...)`)). pend = (histories per group, n_keep, T) of the previous verify whose
+        rollback the groups apply first (`dflash_step`)."""
         B, T = tokens.shape
         streams = (self.params["embed"], jnp.asarray(tokens))       # the first group program embeds (no embed program)
         new, hists, feats, fidx = [], [], [], []
@@ -1174,7 +1190,7 @@ class ResidentLayerEngine(Engine):
             # with capture, every group program returns the stream mean after EACH of its layers: groups with the same
             # layer kinds then share one program whichever layer they capture (5 verify programs per T instead of 9)
             every = tuple(range(len(g))) if capture else ()
-            prog = self._prog_group(g, B, T, True, True, hist=True, capture=every, pend=pend[2] if pend else None,
+            prog = self._prog_group(g, B, T, True, True, hist="kin", capture=every, pend=pend[2] if pend else None,
                                     embed=gi == 0)
             out = prog([self.params["layers"][i] for i in g], streams, pos0, length, [caches[i] for i in g],
                        *((pend[0][gi], pend[1]) if pend else ()))
@@ -1239,11 +1255,12 @@ class ResidentLayerEngine(Engine):
         a = 0                                                   # a stop token is never fed: it ends the accepted run
         while a < k and preds[a] == drafts_h[a] and drafts_h[a] not in stop_ids:
             a += 1
-        if a < k:
-            rolled = self._prog_rollback(B, k + 1)(hists, self.scalar(a + 1), self._hist_cur(new))
-            new = [({**c, **r} if r else c) for c, r in zip(new, rolled)]
-            if a + 1 < k:                                       # drafts a+1.. were fed rejected tokens: tail as before draft a+1
-                mcache = {**mcache, "tk": tails[a + 1][0], "tg": tails[a + 1][1]}
+        # the verify's KDA states are those before the block (the "kin" histories): replay the a + 1 accepted tokens
+        # (every one of them when all drafts were accepted), the conv states and pool tails to after them
+        rolled = self._prog_rollback(B, k + 1, kin=True)(hists, self.scalar(a + 1), self._hist_cur(new, kin=True))
+        new = [({**c, **r} if r else c) for c, r in zip(new, rolled)]
+        if a + 1 < k:                                           # drafts a+1.. were fed rejected tokens: tail as before draft a+1
+            mcache = {**mcache, "tk": tails[a + 1][0], "tg": tails[a + 1][1]}
         emitted = drafts_h[:a] + [preds[a]]
         h_next = lax.dynamic_index_in_dim(hidden, a, axis=1, keepdims=True)
         return emitted, logits[:, a], new + [{**mcache, "h": h_next}], pos + a + 1
@@ -1344,74 +1361,83 @@ class ResidentLayerEngine(Engine):
         against the target's distribution, `sampler` None = greedy, where a draft is accepted iff it is the argmax; a
         draft in `stop_ids` ends the run and is emitted unfed); the KDA states and pool tails are rolled back to the
         accepted prefix; the NEXT draft (anchor = the emitted token, the accepted positions' features into the ring)
-        is dispatched before the host reads this step's tokens, so the host's bookkeeping overlaps it (it only writes
-        committed positions: stopping after any step leaves a consistent state). `next_T` = the block size of the next
-        draft (default: this one's). `draft_override` (T-1 ids, tests; exact only at temperature 0) replaces this
-        step's drafts. Returns (emitted tokens [1..T] — all but the last were fed to the model, the new state)."""
+        and, with `run_ahead`, the verify of that next block are dispatched before the host reads this step's tokens,
+        so the host's turnaround overlaps them (the draft only writes committed positions; the verify ahead is undone
+        by `dflash_settle` when the stream stops: stopping after any step leaves a consistent state). `next_T` = the
+        block size of the next draft (default: this one's). `draft_override` (T-1 ids, tests; exact only at
+        temperature 0) replaces this step's drafts (a verify dispatched ahead is undone and run again). Returns
+        (emitted tokens [1..T] — all but the last were fed to the model, the new state)."""
         n = self.cfg.n_layers
         T, B = st["T"], 1
         sampler = sampler if sampler is not None else self._dflash_greedy()
         grave = self.__dict__.pop("_grave", None)        # the previous step's dropped arrays (see the end)
         seq = st["seq"]
+        ahead = st.get("ahead")                          # this block's verify, dispatched by the previous step
         if draft_override is not None:
+            if ahead is not None:                        # (tests) the verify ahead saw the real drafts: undo it
+                st, ahead = self.dflash_settle(st), None
             seq = jnp.concatenate([seq[:, :1], jnp.asarray(np.asarray(draft_override, np.int32).reshape(B, T - 1))], 1)
         caches = st["caches"]
-        pend = st.get("pend") or self._pend_identity(caches[:n], T)
-        streams, new, hists, feats = self._verify_layers(seq, caches[:n], st["pos"], capture=True, pend=pend)
+        if ahead is None:
+            pend = st.get("pend") or self._pend_identity(caches[:n], T)
+            ahead = self._verify_layers(seq, caches[:n], st["pos"], capture=True, pend=pend)
+        else:
+            pend = None
+        streams, new, hists, feats = ahead
         self._drop(grave, pend)
-        del grave, pend                                  # released while the device runs the verify
+        del grave, pend, ahead                           # released while the device runs the verify
         temp, top_p, k = sampler.bind(self.mesh)
         r = self._prog_head_accept(B, T, tuple(stop_ids))(self.params["norm"], self.params["lm_head"], streams, seq,
                                                           st["cand"], st["q"], st["pos"], temp, top_p, k)
         sampler.advance(r["key"])
-        # the rollback of this verify to its accepted prefix is deferred: the next step's group programs apply it
+        # the rollback of this verify to its accepted prefix is deferred: the next verify's group programs apply it
         # first (or `dflash_settle`, when the stream leaves DFlash): no rollback program, its ~90 outputs and their
         # release between the steps (the one-stream step was host-bound, j141 2026-10-04). The draft stays a program
-        # of its own, queued behind the head: the host wakes when the head ends and dispatches the next verify while
-        # the device drafts — merged into the head program (2026-10-05, j143 / j150) the device idled through the
-        # host's turnaround instead (+0.5 ms per step, host dispatch -0.4).
+        # of its own, queued behind the head (merged into the head program, 2026-10-05 j143 / j150, the device idled
+        # through the host's turnaround: +0.5 ms per step).
         next_T = T if next_T is None else next_T
         nseq, cand, q, ring = self._dflash_draft(caches[n], feats, r["pos_b"], r["n_new_b"], r["bonus"], next_T, temp,
                                                  r["key"])
-        emitted = [int(x) for x in np.asarray(r["emitted"])[0] if x >= 0]     # the host waits here, the draft queued
+        out = {"caches": new + [ring], "pend": (hists, r["n_keep"], T), "pos": r["pos_next"], "seq": nseq, "cand": cand,
+               "q": q, "T": next_T}
+        # run ahead: the next block's verify (its inputs — the drafted block, the position, the caches, this verify's
+        # histories and n_keep — are all on the device) is queued behind the draft, so the device has ~a step of work
+        # when the host wakes up below; only when this block and the next both fit the context
+        if self.run_ahead and st["pos_h"] + T + next_T <= self.max_len:
+            out["ahead"] = self._verify_layers(nseq, new, r["pos_next"], capture=True, pend=out.pop("pend"))
+            out["caches"] = out["ahead"][1] + [ring]
+        emitted = [int(x) for x in np.asarray(r["emitted"])[0] if x >= 0]     # the host waits here
+        out["pos_h"] = st["pos_h"] + len(emitted)
         # Dropping a jax array costs ~11-20 us of host time on the 8-chip mesh (j107) and a step leaves ~300 behind (the
         # consumed caches, the pre-rollback states, histories, ...): keep them until the next step has dispatched its
-        # verify, so the release happens while the device works instead of between the steps (`dflash_end` frees them;
+        # head, so the release happens while the device works instead of between the steps (`dflash_end` frees them;
         # with `reap` the drop itself runs on the reaper thread).
         self._grave = (st, feats, streams, r)
-        return emitted, {"caches": new + [ring], "pend": (hists, r["n_keep"], T), "pos": r["pos_next"],
-                         "pos_h": st["pos_h"] + len(emitted), "seq": nseq, "cand": cand, "q": q, "T": next_T}
+        return emitted, out
 
     def _pend_identity(self, caches, T):
-        """A pending rollback that changes nothing (the first step of a DFlash run): every history entry = the
-        current state, n_keep = T; the same group programs then serve every step."""
-        key = ("pend_identity", T)
-        if key not in self._progs:
-            groups = self.groups["decode"]
-            lays = [self._hist_layout(g) for g in groups]
-            hgs = [{k: P(None, *self._hist_spec(g[js[0]])[k]) for k, js in lay.items()} for g, lay in zip(groups, lays)]
-            cur_specs = [None if h is None else {M.HIST_KEYS[k]: P(*v[1:]) for k, v in h.items()}
-                         for h in (self._hist_spec(i) for i in range(self.cfg.n_layers))]
-
-            def prog(cur):
-                return [{k: jnp.stack([jnp.broadcast_to(cur[g[j]][M.HIST_KEYS[k]][None],
-                                                        (T,) + cur[g[j]][M.HIST_KEYS[k]].shape) for j in js])
-                         for k, js in lay.items()} for g, lay in zip(groups, lays)]
-            self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=(cur_specs,), out_specs=hgs,
-                                                 check_vma=False))
-        return self._progs[key](self._hist_cur(caches)), self.scalar(T), T
+        """A pending rollback that changes nothing (the first step of a DFlash run): the rows' form for one stream
+        (`_pend_identity_rows`: zero KDA update inputs, the current conv states and pool tails) with a scalar
+        n_keep = T; the same group programs then serve every step."""
+        hists, _, _ = self._pend_identity_rows([caches], T)
+        return hists, self.scalar(T), T
 
     def dflash_settle(self, st):
-        """The state with its pending rollback applied (call before using st["caches"] outside DFlash steps: a stream
-        leaving DFlash mode, tests). Idempotent."""
-        if not st.get("pend"):
-            return st
+        """The state with its deferred work resolved — a verify dispatched ahead of its tokens (`run_ahead`) undone,
+        since its block is never accepted (the small state entries back to before it: n_keep = 0), or the last step's
+        pending rollback applied. Call before using st["caches"] outside DFlash steps (a stream leaving DFlash mode,
+        tests). Idempotent."""
         n = self.cfg.n_layers
-        hists, nk, T = st["pend"]
         caches = st["caches"]
-        rolled = self._prog_rollback(1, T)(hists, nk, self._hist_cur(caches[:n]))
+        if st.get("ahead") is not None:
+            hists, nk, T = st["ahead"][2], self.scalar(0), st["T"]
+        elif st.get("pend"):
+            hists, nk, T = st["pend"]
+        else:
+            return st
+        rolled = self._prog_rollback(1, T, kin=True)(hists, nk, self._hist_cur(caches[:n], kin=True))
         new = [({**c, **x} if x else c) for c, x in zip(caches[:n], rolled)]
-        return {**st, "caches": new + list(caches[n:]), "pend": None}
+        return {**{k: v for k, v in st.items() if k != "ahead"}, "caches": new + list(caches[n:]), "pend": None}
 
     def dflash_end(self):
         """Release what the last `dflash_step` kept for a deferred release (call when a stream leaves DFlash mode)."""
@@ -1448,32 +1474,45 @@ class ResidentLayerEngine(Engine):
         groups each row's T tokens by expert), the acceptance per row on the chips, each row's states rolled back to
         its own accepted prefix, then the next draft of every row (its accepted positions into its ring) queued before
         the host reads the tokens. Rows are independent: at temperature 0 each row emits exactly what that stream's
-        own greedy decoding would. draft_override [B, T-1] (tests). Returns (emitted tokens per row, the new state)."""
+        own greedy decoding would. draft_override [B, T-1] (tests). With `run_ahead` the next blocks' verify is
+        dispatched too (undone by `dflash_settle_rows` when the state ends). Returns (emitted tokens per row, the new
+        state)."""
         T, B = st["T"], len(st["sets"])
         sampler = sampler if sampler is not None else self._dflash_greedy()
         grave = self.__dict__.pop("_grave", None)        # the previous step's dropped arrays (as in dflash_step)
         seq = st["seq"]
+        ahead = st.get("ahead")                          # this step's verify, dispatched by the previous step
         if draft_override is not None:
+            if ahead is not None:                        # (tests) the verify ahead saw the real drafts: undo it
+                st, ahead = self.dflash_settle_rows(st), None
             seq = jnp.concatenate([seq[:, :1], jnp.asarray(np.asarray(draft_override, np.int32).reshape(B, T - 1))], 1)
-        pend = st.get("pend") or self._pend_identity_rows(st["sets"], T)
-        streams, new, hists, feats = self._verify_rows(seq, st["sets"], st["pos"], pend)
+        if ahead is None:
+            pend = st.get("pend") or self._pend_identity_rows(st["sets"], T)
+            ahead = self._verify_rows(seq, st["sets"], st["pos"], pend)
+        else:
+            pend = None
+        streams, new, hists, feats = ahead
         self._drop(grave, pend)
-        del grave, pend
+        del grave, pend, ahead
         temp, top_p, k = sampler.bind(self.mesh)
         r = self._prog_head_accept(B, T, tuple(stop_ids), per_row=True)(self.params["norm"], self.params["lm_head"],
                                                                       streams, seq, st["cand"], st["q"], st["pos"],
                                                                       temp, top_p, k)
         sampler.advance(r["key"])
-        # the rollback of every row to its accepted prefix is deferred to the next step's group programs (or
+        # the rollback of every row to its accepted prefix is deferred to the next verify's group programs (or
         # `dflash_settle_rows`), as in `dflash_step`; the draft is queued behind the head (see there)
         next_T = T if next_T is None else next_T
         nseq, cand, q, rings = self._dflash_draft_rows(st["rings"], feats, r["pos_b"], r["n_new_b"], r["bonus"], next_T,
                                                        temp, r["key"])
+        out = {"sets": new, "rings": rings, "pos": r["pos_next"], "pend": (hists, r["n_keep"], T), "seq": nseq,
+               "cand": cand, "q": q, "T": next_T}
+        if self.run_ahead and max(st["pos_h"]) + T + next_T <= self.max_len:     # run ahead (see dflash_step)
+            out["ahead"] = self._verify_rows(nseq, new, r["pos_next"], out.pop("pend"))
+            out["sets"] = out["ahead"][1]
         emitted = [[int(x) for x in row if x >= 0] for row in np.asarray(r["emitted"])]   # the host waits here
+        out["pos_h"] = [p + len(e) for p, e in zip(st["pos_h"], emitted)]
         self._grave = (st, feats, streams, r)
-        return emitted, {"sets": new, "rings": rings, "pos": r["pos_next"], "pend": (hists, r["n_keep"], T),
-                         "pos_h": [p + len(e) for p, e in zip(st["pos_h"], emitted)], "seq": nseq, "cand": cand, "q": q,
-                         "T": next_T}
+        return emitted, out
 
     def _dflash_greedy(self):
         if getattr(self, "_greedy_sampler", None) is None:

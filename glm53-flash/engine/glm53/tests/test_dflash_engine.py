@@ -137,6 +137,48 @@ def test_stop_token_ends_the_run(setup):
     assert st["pos_h"] == ids.shape[1] + first and int(np.asarray(st["pos"])) == st["pos_h"]
 
 
+def small_entries(cache, pos, kp):
+    """The small state entries a rollback restores: KDA state / conv whole, the pool tails' committed rows only (rows
+    from pos % kp on hold stale keys that `pool_new_keys` masks: don't-care)."""
+    out = {k: np.asarray(cache[k]) for k in ("state", "conv") if k in cache}
+    if pos % kp:
+        out.update({k: np.asarray(cache[k])[:, :pos % kp] for k in ("tk", "tg") if k in cache})
+    return out
+
+
+def test_run_ahead_undone_when_the_stream_stops(setup):
+    """With `run_ahead` every step dispatches the next block's verify before the host reads this block's tokens; when
+    the stream leaves DFlash that verify is undone (`dflash_settle`: a rollback to n_keep = 0). The
+    settled caches' small state entries (KDA states / conv states, pool tails) equal a fresh prefill's of the committed
+    tokens, the device position = the host's, and plain greedy decoding continues exactly as the reference."""
+    eng, cfg, ids, _ = setup
+    ref = greedy(eng, ids, 20)
+    eng.run_ahead = True
+    try:
+        out, _, st = run(eng, ids, 8, T=4)                  # random drafts, no override: the verify ahead stays
+    finally:
+        del eng.run_ahead                                   # (back to the class default)
+    assert st.get("ahead") is not None and "pend" not in st
+    st = eng.dflash_settle(st)
+    eng.dflash_end()
+    assert st.get("ahead") is None and st["pend"] is None
+    assert int(np.asarray(st["pos"])) == st["pos_h"]
+    fed = out[:st["pos_h"] - ids.shape[1]]
+    assert fed == out[:-1]
+    _, fresh, _ = eng.prefill(np.concatenate([ids[0], np.asarray(fed)])[None])
+    kp = eng.cfg.idx_kpool
+    for i in range(eng.cfg.n_layers):
+        for k, b in small_entries(fresh[i], st["pos_h"], kp).items():
+            a = small_entries(st["caches"][i], st["pos_h"], kp)[k]
+            np.testing.assert_allclose(a, b, rtol=1e-3, atol=1e-3 * max(np.abs(b).max(), 1e-6), err_msg=f"layer {i} {k}")
+    caches, pos, tok = st["caches"], st["pos_h"], out[-1]
+    for _ in range(4):
+        lg, caches, pos = eng.decode(np.array([tok]), caches, pos)
+        tok = int(jnp.argmax(lg[0])); out.append(tok)
+    assert out == ref[:len(out)], (out, ref)
+    assert eng.dflash_settle(st) is st or eng.dflash_settle(st)["pend"] is None     # idempotent
+
+
 def test_decode_rows_fills_the_ring(setup):
     """Batched plain steps (decode_rows, two streams at different positions) write every stream's positions into its
     own drafter ring: afterwards each ring equals the ring a fresh prefill of that stream's tokens builds (no holes
@@ -215,6 +257,41 @@ def test_dflash_rows_stop_token(setup):
     refs = [greedy(eng, np.asarray(p)[None], 14) for p in prompts]
     outs, st = run_rows(eng, prompts, 14, 4, oracles=refs, stop=(refs[0][5],))
     assert [o[:14] for o in outs] == refs, (outs, refs)
+
+
+def test_dflash_rows_run_ahead_undone(setup):
+    """`test_run_ahead_undone_when_the_stream_stops` for the batched state: the verify ahead of two streams is undone by
+    `dflash_settle_rows`, every row's small state entries equal a fresh prefill's of its committed tokens, and plain
+    batched decoding (`decode_rows`) continues every row exactly as its own greedy reference."""
+    eng, cfg, ids, _ = setup
+    prompts = [list(ids[0, :45]), list(ids[0, 5:38])]
+    refs = [greedy(eng, np.asarray(p)[None], 20) for p in prompts]
+    eng.run_ahead = True
+    try:
+        outs, st = run_rows(eng, prompts, 8, 4)              # random drafts: the verify ahead stays
+    finally:
+        del eng.run_ahead
+    assert st.get("ahead") is not None and "pend" not in st
+    st = eng.dflash_settle_rows(st)
+    assert st.get("ahead") is None and st["pend"] is None
+    assert [int(x) for x in np.asarray(st["pos"])] == st["pos_h"]
+    for b, p in enumerate(prompts):
+        fed = outs[b][:st["pos_h"][b] - len(p)]
+        assert fed == outs[b][:-1]
+        _, fresh, _ = eng.prefill(np.asarray(p + fed)[None])
+        for i in range(eng.cfg.n_layers):
+            for k, ref in small_entries(fresh[i], st["pos_h"][b], eng.cfg.idx_kpool).items():
+                a = small_entries(st["sets"][b][i], st["pos_h"][b], eng.cfg.idx_kpool)[k]
+                np.testing.assert_allclose(a, ref, rtol=1e-3, atol=1e-3 * max(np.abs(ref).max(), 1e-6), err_msg=f"row {b} layer {i} {k}")
+    sets = [st["sets"][b] + [st["rings"][b]] for b in range(2)]
+    toks, pos = np.array([o[-1] for o in outs], np.int32), list(st["pos_h"])
+    for _ in range(4):
+        _, logits, sets, _ = eng.decode_rows(toks, sets, pos)
+        toks = np.asarray(jnp.argmax(logits, -1)).astype(np.int32)
+        for b in range(2):
+            outs[b].append(int(toks[b]))
+        pos = [p + 1 for p in pos]
+    assert all(outs[b] == refs[b][:len(outs[b])] for b in range(2)), (outs, refs)
 
 
 def test_dflash_rows_seq_shard():
