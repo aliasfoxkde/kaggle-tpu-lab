@@ -3,7 +3,7 @@
 Sharding (mesh axis "x"):
   * attention heads (KDA 64, MLA 64) and MLP/expert intermediate columns are split across devices;
     every row-parallel matmul output is `psum`'d via `Cfg.tp_reduce`, so activations/streams stay replicated.
-  * embed rows and lm_head columns are vocab-sharded.
+  * embed rows and lm_head rows (stored transposed, [V, D]: `lm_head_t`) are vocab-sharded.
   * routed experts are NOT on device: `HostExperts.fetch` gathers each device's slice of the selected experts on the
     host (NumPy) and ships it through `jax.pure_callback` inside the jitted `shard_map` program.
 
@@ -33,7 +33,7 @@ R = P()  # replicated
 
 
 # ----------------------------------------------------------------------------- device-side sampling
-SAMPLE_IMPL = "approx"          # "approx": TPU-native approx_max_k candidates + bisection top-p (no sorts); "sort": exact top_k + sort
+SAMPLE_IMPL = "approx"          # "approx": chunked exact top-k candidates + bisection top-p (no full sorts); "sort": top_k + sort
 
 
 def _candidates(z_local, temperature, top_p, n_cand, impl):
@@ -47,13 +47,9 @@ def _candidates(z_local, temperature, top_p, n_cand, impl):
     if impl == "sort" or kc >= Vl:
         vals, idx = lax.top_k(z, kc)                                             # [N, kc] per chip
     else:
-        vals, idx = lax.approx_max_k(z, kc, recall_target=0.99)
-        am = jnp.argmax(z, axis=1)                                               # force the exact argmax in
-        present = jnp.any(idx == am[:, None], axis=1)
-        last = jnp.arange(kc)[None, :] == kc - 1
-        repl = (~present)[:, None] & last
-        idx = jnp.where(repl, am[:, None], idx)
-        vals = jnp.where(repl, jnp.take_along_axis(z, am[:, None], axis=1), vals)
+        # the exact chunked top-k (model.top_k): v6e 2026-10-05 (j151, [4, 19360] rows, k = 256) 74 us against 122 for
+        # lax.approx_max_k (recall 0.99 + the argmax forced in) and 122 for the plain lax.top_k
+        vals, idx = M.top_k(z, kc)
     gidx = idx.astype(jnp.int32) + lax.axis_index(AXIS).astype(jnp.int32) * Vl
     vals = lax.all_gather(vals, AXIS, axis=1, tiled=True)                        # [N, n*kc], replicated
     gidx = lax.all_gather(gidx, AXIS, axis=1, tiled=True)
@@ -200,8 +196,29 @@ def layer_specs(cfg: M.Cfg, i: int, p: dict) -> dict:
     return s
 
 
+def lm_head_t(w):
+    """The lm_head as the engine stores it: [V, D] (vocab rows) instead of the checkpoint's [D, V]. The TPU dot wants
+    the contracted dim minor in its weight, so a [D, V] weight was copied into that layout on EVERY call (the head
+    and the draft programs: 50 us each per step for the 79 MB int8 shard, v6e 2026-10-05 j152); stored transposed
+    and read with `dot_t` nothing is copied. Accepts an array or a q8 dict {q, s [V]} (left alone when q already has
+    V rows)."""
+    from glm53 import quant8 as Q8
+    if Q8.is_q8(w):                                       # the base store's {q [D, V] int8, s [1, V]} (per-column scales)
+        q, sc = np.asarray(w["q"]), np.asarray(w["s"])
+        if q.shape[0] == sc.size and q.shape[0] != q.shape[1]:   # already [V, D] with s [V, 1]
+            return {"q": q, "s": sc.reshape(-1, 1)}
+        return {"q": np.ascontiguousarray(q.T), "s": np.ascontiguousarray(sc.reshape(-1, 1))}   # -> q [V, D], s [V, 1]
+    return np.ascontiguousarray(np.asarray(w).T)
+
+
+def dot_t(h, w_t, preferred_element_type=jnp.float32):
+    """h [..., D] x w_t [N, D] -> [..., N] f32: the dot with its weight given transposed (the MXU's natural weight
+    layout: no relayout copy of the weight)."""
+    return lax.dot_general(h, w_t, (((h.ndim - 1,), (1,)), ((), ())), preferred_element_type=preferred_element_type)
+
+
 def param_specs(cfg: M.Cfg, params: dict) -> dict:
-    return {"embed": P(AXIS, None), "norm": R, "lm_head": P(None, AXIS),
+    return {"embed": P(AXIS, None), "norm": R, "lm_head": P(AXIS, None),      # lm_head stored [V, D] (`lm_head_t`)
             "layers": [layer_specs(cfg, i, params["layers"][i]) for i in range(cfg.n_layers)]}
 
 
@@ -342,6 +359,7 @@ class Engine:
         self.lcfg = local_cfg(cfg, self.n, seq_shard, q_block, cfg.cache_q8)
         self.host_experts = host_experts
         params = dict(params)
+        params["lm_head"] = lm_head_t(params["lm_head"])
         if host_experts is not None:   # drop on-device expert tables
             params["layers"] = [{**L, "mlp": {k: v for k, v in L["mlp"].items() if k not in ("gate_up", "down")}}
                                 if cfg.mlp_types[i] == "sparse" else L for i, L in enumerate(params["layers"])]
@@ -363,7 +381,8 @@ class Engine:
             self.specs = {**self.specs, "layers": lspecs}
             if int8_nonexpert == "all":           # + the vocab-sharded embedding (per-row scales) and lm_head (per-column),
                 q = Q8.quantize_array_host             # quantized on the host (a device pass OOMed at 262k)
-                params = {**params, "embed": q(params["embed"], 0), "lm_head": q(params["lm_head"], 1)}
+                params = {**params, "embed": q(params["embed"], 0),
+                          "lm_head": params["lm_head"] if Q8.is_q8(params["lm_head"]) else q(params["lm_head"], 0)}
         self.specs = Q8.expand_specs(params, self.specs)   # params already holding q8 nodes (hot-swapped on device)
         self.params = jax.tree.map(lambda a, s: jax.device_put(a, NamedSharding(self.mesh, s)), params, self.specs,
                                    is_leaf=lambda x: isinstance(x, P))
@@ -395,12 +414,13 @@ class Engine:
         return lax.psum(jnp.where(ok[..., None], e, 0), AXIS)
 
     def _logits_local(self, lm_head_local, h):
-        """This chip's vocab columns of the logits [..., V/n] (the shard `_logits` all-gathers)."""
+        """This chip's vocab columns of the logits [..., V/n] (the shard `_logits` all-gathers). The weight is stored
+        [V/n, D] (`lm_head_t`) and read as the dot's transposed operand."""
         from glm53 import quant8 as Q8
-        if Q8.is_q8(lm_head_local):                         # int8 columns: the convert fuses into the dot, scales after
-            z = jnp.dot(h, lm_head_local["q"].astype(h.dtype), preferred_element_type=jnp.float32) * lm_head_local["s"]
+        if Q8.is_q8(lm_head_local):                         # int8 rows: the convert fuses into the dot, scales after
+            z = dot_t(h, lm_head_local["q"].astype(h.dtype)) * lm_head_local["s"].reshape(-1)    # s [V, 1] -> [V]
             return z.astype(h.dtype)
-        return h @ lm_head_local
+        return dot_t(h, lm_head_local).astype(h.dtype)
 
     def _logits(self, lm_head_local, h):
         return lax.all_gather(self._logits_local(lm_head_local, h), AXIS, axis=-1, tiled=True)

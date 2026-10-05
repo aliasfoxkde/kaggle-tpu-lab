@@ -114,7 +114,7 @@ def tiny(tmp_path_factory):
     cfg, params = D.load_params(str(d))
     V, Dm = c["vocab_size"], c["hidden_size"]
     E = torch.randn(V, Dm)                                  # the target's embedding and lm_head (random here)
-    W = torch.randn(V, Dm) / Dm ** 0.5
+    W = torch.randn(V, Dm) / Dm ** 0.5                     # [V, D]: the layout the engine stores the lm_head in
     return m, cfg, params, E, W
 
 
@@ -160,7 +160,7 @@ def test_tiny_matches_reference(tiny, n_dev):
     s0 = make_steps(rng, cfg, [3, 8, 1, 6, 8, 2, 8], prompt=21)
     s1 = make_steps(rng, cfg, [8, 8, 5, 1, 4, 8, 7], prompt=6)
     drafter = D.Drafter(cfg, params, Mesh(np.array(jax.devices()[:n_dev]), (AXIS,)))
-    mine = run_mine(drafter, cfg, jnp.asarray(E.numpy()), jnp.asarray(W.numpy().T), [s0, s1])
+    mine = run_mine(drafter, cfg, jnp.asarray(E.numpy()), jnp.asarray(W.numpy()), [s0, s1])
     for b, s in enumerate((s0, s1)):
         for i, ref in enumerate(ref_steps(m, E, W, s)):
             check_step(tuple(x[b] for x in mine[i][:3]), ref)
@@ -173,7 +173,7 @@ def test_tiny_hidden_and_sampled_q(tiny):
     rng = np.random.default_rng(2)
     steps = make_steps(rng, cfg, [8, 2, 8, 5], prompt=19)
     p = jax.tree.map(jnp.asarray, params)
-    embed, lm_head = jnp.asarray(E.numpy()), jnp.asarray(W.numpy().T)
+    embed, lm_head = jnp.asarray(E.numpy()), jnp.asarray(W.numpy())
     F = len(cfg.target_layers) * cfg.hidden
     ring = {"k": jnp.zeros((cfg.n_layers, 1, cfg.window, cfg.kv_heads, cfg.hd)),
             "v": jnp.zeros((cfg.n_layers, 1, cfg.window, cfg.kv_heads, cfg.hd)), "p": jnp.zeros((1, cfg.window), jnp.int32)}
@@ -228,7 +228,7 @@ def test_real_weights_match_reference(window):
     En = E.numpy()
     rng = np.random.default_rng(4)
     steps = make_steps(rng, cfg, [8, 3, 8, 5], prompt=40)
-    mine = run_mine(drafter, cfg, jnp.asarray(En), jnp.asarray(En.T), [steps])
+    mine = run_mine(drafter, cfg, jnp.asarray(En), jnp.asarray(En), [steps])
     refs = ref_steps(m, E, E, steps)
     for i, ref in enumerate(refs):
         check_step(tuple(x[0] for x in mine[i][:3]), ref, tol=1e-3)
@@ -247,7 +247,7 @@ def test_tiny_int8_plumbing(tiny):
     q8 = D.Drafter(cfg, params, mesh, int8=True)
     f32 = D.Drafter(cfg, {**params, "layers": deq(jax.device_get(q8.params["layers"])),
                           "fc": deq(jax.device_get(q8.params["fc"]))}, mesh)
-    embed, lm_head = jnp.asarray(E.numpy()), jnp.asarray(W.numpy().T)
+    embed, lm_head = jnp.asarray(E.numpy()), jnp.asarray(W.numpy())
     for a, b in zip(run_mine(q8, cfg, embed, lm_head, [steps]), run_mine(f32, cfg, embed, lm_head, [steps])):
         np.testing.assert_array_equal(np.asarray(a[1]), np.asarray(b[1]))
         np.testing.assert_allclose(np.asarray(a[2]), np.asarray(b[2]), rtol=1e-5, atol=1e-5)

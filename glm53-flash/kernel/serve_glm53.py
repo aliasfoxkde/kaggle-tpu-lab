@@ -73,11 +73,11 @@ DEFAULTS = {
                                      # dataset (config.json + model.safetensors of incoai/GLM-5.3-Flash-DFlash2: CC BY-NC-ND
                                      # 4.0, research only -> attach it yourself); "" = off
     "dflash_int8": True,             # the drafter's big matrices as int8 (159 instead of 295 MB per chip, same acceptance)
-    "dflash_cost": {"4": 13.4},      # ms per DFlash step by block size (v6e-8, 2026-10-05 evening) = the block sizes compiled:
+    "dflash_cost": {"4": 13.3},      # ms per DFlash step by block size (v6e-8, 2026-10-05 night) = the block sizes compiled:
                                      # {"4": ..., "8": ...} also drafts 8 (2026-10-03: math-like text x1.97 instead of
                                      # x1.64, no gain overall at temperature 1.0; its programs only add warm-up)
     "dflash_prior": {"4": 2.8, "8": 3.3},    # tokens per step a new stream assumes until it has measured its own
-    "dflash_rows": {"2": [21.6, 11.6], "3": [30.3, 13.7]},   # DFlash for B streams at once: {"B": [ms of a B-stream
+    "dflash_rows": {"2": [21.4, 11.6], "3": [28.9, 13.7]},   # DFlash for B streams at once: {"B": [ms of a B-stream
                                      # DFlash step (block = the smallest of dflash_cost), ms of a plain batched step of
                                      # B]} = the B compiled (v6e-8, 2026-10-05; served at temperature 1.0 x1.26 / x1.17 at 2 and
                                      # 3 streams; ~3-6 min of warm-up each); the scheduler picks DFlash or plain per

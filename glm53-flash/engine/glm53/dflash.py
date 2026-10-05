@@ -24,7 +24,7 @@ batched decode steps). Positions are absolute; the drafter has its own RoPE (the
 
 Tensor parallel inside shard_map (axis engine.AXIS): q/k/v heads and MLP columns split over the chips (one KV head per
 chip on 8 chips; the ring is sharded with them), o and down row-parallel (psum), fc and the conv kernel projections
-column-parallel (all-gather), the codebooks, the embedding and the lm_head vocab-sharded like the target's.
+column-parallel (all-gather), the codebooks, the embedding and the lm_head ([V, D] rows) vocab-sharded like the target's.
 """
 from __future__ import annotations
 
@@ -295,10 +295,11 @@ def vocab_rows(table_local, ids, cfg: DCfg):
 def logits_local(lm_head_local, h, cfg: DCfg):
     """This chip's vocab columns of the draft logits (the target's lm_head, bf16 or int8 q8), f32, with the
     drafter's output multiplier and soft cap."""
+    from glm53.engine import dot_t                     # the lm_head is stored [V, D] (engine.lm_head_t)
     if Q8.is_q8(lm_head_local):
-        z = jnp.dot(h, lm_head_local["q"].astype(h.dtype), preferred_element_type=jnp.float32) * lm_head_local["s"]
+        z = dot_t(h, lm_head_local["q"].astype(h.dtype)) * lm_head_local["s"].reshape(-1)
     else:
-        z = jnp.dot(h, lm_head_local, preferred_element_type=jnp.float32)
+        z = dot_t(h, lm_head_local)
     z = z * cfg.out_mult
     if cfg.softcap:
         z = jnp.tanh(z / cfg.softcap) * cfg.softcap
@@ -375,11 +376,11 @@ def draft(params, ring, feats, pos0, n_new, anchor, embed, lm_head, cfg: DCfg, T
 class Drafter:
     """The drafter's params on a mesh (axis engine.AXIS) and its jitted programs. `embed_spec` / `lm_head_spec` =
     the target's (engine `specs["embed"]`, `specs["lm_head"]`: vocab-sharded, possibly q8 dicts); the programs take
-    the target's arrays as arguments. int8=True stores the big matrices (layers, fc) as q8 (glm53.quant8); the
+    the target's arrays as arguments (the lm_head [V, D], `engine.lm_head_t`). int8=True stores the big matrices (layers, fc) as q8 (glm53.quant8); the
     codebooks stay in their dtype. Ring buffers are donated to `ingest` / `draft` (never reuse a ring passed in).
     temp_scale: a sampled draft draws its path at temp_scale x the given temperature (q is that distribution)."""
 
-    def __init__(self, cfg: DCfg, params, mesh, embed_spec=P(AXIS, None), lm_head_spec=P(None, AXIS), int8=False,
+    def __init__(self, cfg: DCfg, params, mesh, embed_spec=P(AXIS, None), lm_head_spec=P(AXIS, None), int8=False,
                  temp_scale=1.0):
         assert cfg.kv_heads % mesh.size == 0 and cfg.vocab % mesh.size == 0, (cfg.kv_heads, cfg.vocab, mesh.size)
         self.cfg, self.mesh = cfg, mesh

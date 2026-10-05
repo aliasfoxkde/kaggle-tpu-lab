@@ -191,10 +191,10 @@ def hc_post(post, comb, y, residual):
 
 
 # ----------------------------------------------------------------------------- KDA
-def causal_conv1d(x, w, state=None, length=None):
+def causal_conv1d(x, w, state=None, length=None, out_dtype=None):
     """Depthwise causal conv over time. x [B,T,C], w [C,K], state [B,K-1,C] or None (zeros).
     `length` (traced int, <= T): only the first `length` tokens are real; the new state is taken from them.
-    Returns (y [B,T,C], new_state [B,K-1,C])."""
+    Returns (y [B,T,C] in x's dtype (or out_dtype), new_state [B,K-1,C])."""
     B, T, C = x.shape
     K = w.shape[-1]
     if state is None:
@@ -207,7 +207,7 @@ def causal_conv1d(x, w, state=None, length=None):
         new_state = xp[:, -(K - 1):]
     else:
         new_state = lax.dynamic_slice_in_dim(xp, length, K - 1, axis=1)   # inputs at t in [length-K+1, length-1]
-    return y.astype(x.dtype), new_state
+    return y.astype(out_dtype or x.dtype), new_state
 
 
 def kda_gates(p, x, cfg: Cfg):
@@ -416,9 +416,50 @@ def kda_out(p, core, gate, cfg: Cfg, dtype):
     return cfg.reduce(o.astype(dtype).reshape(B, T, H * hd) @ p["o"])
 
 
+KDA_KERNEL = False         # the KDA layers' recurrent core of decode / short-verify calls (at most KDA_MAX_TOKENS tokens
+KDA_MAX_TOKENS = 8         # per row; silu, the norms, the gates, the delta-rule recurrence, the gated output norm) as
+KDA_INTERPRET = False      # glm53.pallas_kda kernels on the TPU (elsewhere only with KDA_INTERPRET); the conv taps and
+                           # the projections stay XLA. Read at trace time. hist=True (the state form) stays XLA.
+                           # OFF: v6e 2026-10-05 (j143 / j150) the kernel costs ~9 us per layer call (96 lane-to-
+                           # sublane transposes of [128, 128] per call: three per token and head) against ~10 us for
+                           # XLA's chain (the while loop + one fusion), and the conv / gate glue left outside grew:
+                           # one-stream DFlash step 13.42 -> 13.75 ms, plain B = 3 14.06 -> 14.98. Its exact-f32
+                           # contractions also moved the logits by ~2 % of the max (XLA's einsums round to bf16 there).
+
+
+def kda_kernel_active(n_tokens):
+    """Whether the KDA core kernel serves a recurrent call of n_tokens per row on this backend."""
+    return bool(KDA_KERNEL) and n_tokens <= KDA_MAX_TOKENS and (KDA_INTERPRET or jax.default_backend() == "tpu")
+
+
+def _kda_attention_kernel(p, x, cfg: Cfg, cache, hist):
+    """kda_attention's recurrent step as the glm53.pallas_kda kernel: x [B,T,D], cache {"conv": [B,K-1,3C], "state":
+    [B,H,dk,dv]} -> (y [B,T,D], new cache (+ "kin_hist" [T,B,H,4,d] and "conv_hist" [T+1,B,K-1,3C] with hist)). The
+    conv runs in f32 into the kernel (XLA's fused chain keeps f32 there too)."""
+    from glm53 import pallas_kda as PK
+    B, T, _ = x.shape
+    H, hd = cfg.kda_heads, cfg.kda_hd
+    qkv = jnp.concatenate([x @ p["q"], x @ p["k"], x @ p["v"]], -1)                                 # [B,T,3C]
+    conv_w = jnp.concatenate([p["conv_q"], p["conv_k"], p["conv_v"]], 0)
+    xc, new_conv = causal_conv1d(qkv, conv_w, cache["conv"], None, out_dtype=jnp.float32)
+    f = (x @ p["f_a"]) @ p["f_b"]
+    gate = (x @ p["g_a"]) @ p["g_b"]
+    y, new_state, kin = PK.kda_core_out(xc, f, x @ p["b"], gate, cache["state"], p["dt_bias"], p["A_log"], p["o_norm"],
+                                        hd=hd, eps=cfg.eps, gate_lb=cfg.gate_lb, hist=bool(hist), interpret=KDA_INTERPRET)
+    new_cache = {"conv": new_conv, "state": new_state}
+    if hist:
+        K = conv_w.shape[-1]
+        full = jnp.concatenate([cache["conv"].astype(qkv.dtype), qkv], axis=1)
+        new_cache["kin_hist"] = jnp.moveaxis(kin, 1, 0)
+        new_cache["conv_hist"] = jnp.stack([full[:, t:t + K - 1] for t in range(T + 1)])
+    return cfg.reduce(y.astype(x.dtype).reshape(B, T, H * hd) @ p["o"]), new_cache
+
+
 def kda_attention(p, x, cfg: Cfg, cache=None, use_recurrent=False, length=None, hist=False):
     """x [B,T,D] (already input-normed). cache: None or {"conv": [B,K-1,3C], "state": [B,H,dk,dv]} (one cache, all
     rows in lockstep). Returns (y [B,T,D], new_cache); see kda_core for `length` / `hist`."""
+    if use_recurrent and cache is not None and length is None and hist is not True and kda_kernel_active(x.shape[1]):
+        return _kda_attention_kernel(p, x, cfg, cache, hist)
     proj = kda_project(p, x, cfg)
     core, new_cache = kda_core(proj, cfg, cache, use_recurrent, length, hist)
     return kda_out(p, core, proj["gate"], cfg, x.dtype), new_cache
@@ -428,6 +469,12 @@ def kda_attention_rows(p, x, cfg: Cfg, caches, hist=False):
     """Recurrent (decode) step of B INDEPENDENT streams: x [B,T,D], caches[b] = row b's own cache (batch dim 1).
     The projections and the output run batched, the conv/recurrence per row -> (y [B,T,D], [new cache per row]);
     hist=True (T > 1: a speculative verify of every row) adds each row's per-token histories (kda_core)."""
+    if hist is not True and kda_kernel_active(x.shape[1]):              # the kernel per row (its own cache / state)
+        ys, new = [], []
+        for b, c in enumerate(caches):
+            y, nc = _kda_attention_kernel(p, x[b:b + 1], cfg, c, hist)
+            ys.append(y); new.append(nc)
+        return jnp.concatenate(ys, 0), new
     proj = kda_project(p, x, cfg)
     cores, new = [], []
     for b, c in enumerate(caches):
@@ -833,13 +880,37 @@ def _per_query_keys(c_all, cs_all, pools, pvalid, qpos, cfg: Cfg, chip, dtype):
     slot = jnp.where(valid, slot, 0)
     c_sel = jnp.take_along_axis(c_all[:, None], slot[..., None], axis=2, mode="promise_in_bounds")
     if cfg.cache_q8:
-        # [B,Tq,W]; rows + lane select for one query (decode), element gather for a verify (`gather_scalars`)
+        # the scales [B,Tq,W]: 128-value rows + a lane select for one query (decode, `gather_scalars`); by pools for
+        # a verify (`_token_scales`: the 4 x 2080 element gathers were 50.8 us per MLA layer, 4 x 520 pool rows 9.7)
         if slot.shape[1] == 1:
             s_sel = gather_scalars(cs_all, slot)
         else:
-            s_sel = jnp.take_along_axis(cs_all[:, None], slot, axis=2, mode="promise_in_bounds")
+            s_sel = _token_scales(cs_all, pools, pvalid, qpos, cfg, chip, slot.shape[2])
         c_sel = latent_dequant(c_sel, s_sel, dtype)
     return c_sel, valid
+
+
+def _token_scales(cs_all, pools, pvalid, qpos, cfg: Cfg, chip, W):
+    """The q8 scales of `select_tokens`' slots, [B,Tq,W] in its order (the K pools' tokens pool-major, zeros up to
+    idx_topk, the tail pool's first kp-1 tokens, zeros up to W), gathered by POOLS: `_pool_scales` over the K + 1
+    pools reads the 128-value row holding each pool's kp consecutive scales and selects them by lane — 4x fewer
+    gather rows than the tokens' scales one by one (v6e 2026-10-05, j148: 9.7 vs 50.8 us per MLA layer of a T = 4
+    verify). Invalid or foreign pools read local pool 0 (their slots are masked by `valid`)."""
+    B, Tq, K = pools.shape
+    n, kp = cfg.seq_shard, cfg.idx_kpool
+    tail = jnp.broadcast_to((qpos // kp)[None, :, None], (B, Tq, 1))                   # the query's incomplete pool
+    gpool = jnp.concatenate([pools, tail], -1)                                           # [B,Tq,K+1] global pool ids
+    ok = jnp.concatenate([pvalid, jnp.ones((B, Tq, 1), bool)], -1)
+    if n > 1:
+        ok = ok & (gpool % n == chip)
+        gpool = gpool // n
+    sc = _pool_scales(cs_all, jnp.where(ok, gpool, 0), kp)                               # [B,Tq,K+1,kp]
+    parts = [sc[:, :, :K].reshape(B, Tq, K * kp)]
+    if K * kp < cfg.idx_topk:
+        parts.append(jnp.zeros((B, Tq, cfg.idx_topk - K * kp), sc.dtype))
+    parts.append(sc[:, :, K, :kp - 1])
+    s = jnp.concatenate(parts, -1)
+    return jnp.pad(s, ((0, 0), (0, 0), (0, W - s.shape[-1])))
 
 
 POOL_GATHER_WINDOWS = True    # `_per_query_pool_keys` gathers (kp, kvr) windows (lax.gather) instead of rows of a

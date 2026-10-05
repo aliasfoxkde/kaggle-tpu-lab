@@ -259,3 +259,20 @@ def test_prefill_embedding_override():
     l1, _, _ = eng.prefill(mixed[:, 20:], c1, p1)
     l2, _, _ = eng.prefill(ids[:, 20:], c2, p2, embeds=(idx - 20, table[alt[0, idx]]))
     np.testing.assert_allclose(np.asarray(l2), np.asarray(l1), rtol=1e-4, atol=1e-4)
+
+
+def test_lm_head_t_forms():
+    """`engine.lm_head_t` stores the lm_head [V, D] with [V, 1] scales from every form it is given: the checkpoint's
+    [D, V] array, the base store's pre-quantized {q [D, V], s [1, V]} (the TPU kernel's path: a build failed on the
+    unconverted scales, 2026-10-05), and an already converted dict (idempotent)."""
+    from glm53.engine import lm_head_t
+    from glm53 import quant8 as Q8
+    D, V = 16, 64
+    w = np.random.default_rng(0).standard_normal((D, V)).astype(np.float32)
+    assert lm_head_t(w).shape == (V, D)
+    t = lm_head_t(Q8.quantize_array_host(w, 1))
+    ref = Q8.quantize_array_host(np.ascontiguousarray(w.T), 0)
+    assert t["q"].shape == (V, D) and t["s"].shape == (V, 1)
+    np.testing.assert_array_equal(t["q"], ref["q"]); np.testing.assert_allclose(t["s"], ref["s"])
+    t2 = lm_head_t(t)
+    assert t2["q"].shape == (V, D) and t2["s"].shape == (V, 1)

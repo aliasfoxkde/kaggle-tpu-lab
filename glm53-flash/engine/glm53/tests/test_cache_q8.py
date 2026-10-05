@@ -111,3 +111,43 @@ def test_q8_resident_pieces_snapshots_match_one_shot():
     _, logits, sets, pos_next = eng.decode_rows(toks, [c1, c2], [pos1, pos2])
     np.testing.assert_allclose(np.asarray(logits)[0], a[1][0], rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(np.asarray(logits)[1], ref2[1][0], rtol=1e-4, atol=1e-4)
+
+
+def _elem_scales(cs_all, pools, pvalid, qpos, cfg, chip, W):
+    """The reference: every slot's scale gathered one by one (the path before 2026-10-05)."""
+    tok = M.select_tokens(pools, pvalid, qpos, cfg)
+    valid = (tok >= 0) & (tok <= qpos[None, :, None])
+    if cfg.seq_shard > 1:
+        owner, slot = M._pos_to_slot(jnp.maximum(tok, 0), cfg.idx_kpool, cfg.seq_shard)
+        valid = valid & (owner == chip)
+    else:
+        slot = tok
+    slot = jnp.where(valid, slot, 0)
+    return jnp.take_along_axis(cs_all[:, None], slot, axis=2, mode="promise_in_bounds"), valid
+
+
+@pytest.mark.parametrize("n,S", [(1, 512), (8, 4096), (1, 300)])
+def test_token_scales_by_pools_equal_element_gather(n, S):
+    """`_token_scales` (the scales of a verify's selected tokens from pool rows) equals the element gather on every
+    VALID slot: replicated and sharded caches, a capacity that is not a multiple of 128 (the fallback)."""
+    import dataclasses
+    rng = np.random.default_rng(3)
+    kp, topk = 4, 64
+    from glm53.tests.test_seq_shard import build
+    _, _, jcfg = build(16)
+    cfg = dataclasses.replace(jcfg, seq_shard=n, idx_kpool=kp, idx_topk=topk, cache_q8=True, cache_cap=S)
+    S_local = S // n
+    P_local = -(-S_local // kp)
+    cs_all = jnp.asarray(rng.uniform(0.5, 2.0, (1, S_local)), jnp.float32)
+    K = min(topk // kp, P_local)
+    for chip in range(n):
+        Tq = 4
+        qpos = jnp.asarray(np.sort(rng.integers(kp * n * 2, S - 1, Tq)), jnp.int32)
+        pools = jnp.asarray(rng.integers(0, (S // kp) // 1, (1, Tq, K)), jnp.int32)
+        pools = jnp.minimum(pools, (qpos // kp)[None, :, None] - 1)                    # visible pools only
+        pvalid = jnp.asarray(rng.random((1, Tq, K)) > 0.2)
+        ref, valid = _elem_scales(cs_all, pools, pvalid, qpos, cfg, chip, None)
+        got = M._token_scales(cs_all, pools, pvalid, qpos, cfg, chip, ref.shape[-1])
+        assert got.shape == ref.shape
+        np.testing.assert_array_equal(np.where(np.asarray(valid), np.asarray(got), 0.0),
+                                      np.where(np.asarray(valid), np.asarray(ref), 0.0), err_msg=f"n {n} chip {chip}")
