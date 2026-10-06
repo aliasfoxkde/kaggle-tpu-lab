@@ -24,7 +24,7 @@ eos = {tok.convert_tokens_to_ids("<|endoftext|>")}
 ns = dict(eng=eng, tok=tok, ids=ids, eos=eos, cfg=eng.cfg, VISION=None, VISION_FWD=None, SERVE_FOREVER=False,
           CFG_PRESET=dict(skip_runtime=True, tunnel=False, port=8765, streams=2, sets=2, sched_piece=32, api_key="k", base_min=10 ** 9,
                           snap_min=1, snap_rows=8, snap_warm_tokens=64, max_new_default=24, max_queue=1, bucket_min=64, vision=False,
-                          min_free_gb=0))
+                          min_free_gb=0, dflash=""))      # (dflash="": the default would fetch the 2.3 GB drafter)
 exec(compile(open(os.path.join(HERE, "..", "kernel", "serve_glm53.py")).read(), "serve_glm53", "exec"), ns)
 STATE, SCHED = ns["STATE"], ns["SCHED"]
 assert eng.PREFILL_BUCKETS[0] == 64, eng.PREFILL_BUCKETS

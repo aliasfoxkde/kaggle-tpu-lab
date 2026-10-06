@@ -39,6 +39,7 @@ import numpy as np
 from jax import lax
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from glm53 import aot
 from glm53 import model as M
 from glm53 import quant8 as Q8
 from glm53.engine import AXIS, R, shard_map
@@ -416,7 +417,7 @@ class Drafter:
                 return ingest(Q8.dequant_tree(params, self.cfg.dtype), ring, feats, pos0, length, self.lcfg)
             rs = RING_SPECS
             sm = shard_map(prog, mesh=self.mesh, in_specs=(self.specs, rs, R, R, R), out_specs=rs, check_vma=False)
-            self._progs[key] = jax.jit(sm, donate_argnums=(1,))
+            self._progs[key] = aot.jit(key, sm, donate_argnums=(1,))
         return self._progs[key]
 
     def _prog_draft(self, B, N, T, sample, feat_index=None, rows=False):
@@ -441,7 +442,7 @@ class Drafter:
             out_specs = {"path": R, "cand": R, "scores": R, "rings" if rows else "ring": rs, "seq": R,
                          **({"q": R} if sample else {})}
             sm = shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
-            self._progs[key] = jax.jit(sm, donate_argnums=(1,))
+            self._progs[key] = aot.jit(key, sm, donate_argnums=(1,))
         return self._progs[key]
 
     def ingest(self, ring, feats, pos0, length):

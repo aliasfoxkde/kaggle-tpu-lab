@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from glm53 import aot
 from glm53 import iqquant as Q
 from glm53 import model as M
 from glm53 import planes as PL
@@ -373,7 +374,7 @@ class ResidentLayerEngine(Engine):
                     x = jnp.where(mask[..., None], vec.astype(x.dtype), x)
                 return jnp.broadcast_to(x[:, :, None, :], (B, T, self.cfg.hc, x.shape[-1]))
             in_specs = (self.specs["embed"], R) + ((R, R) if override else ())
-            self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=R, check_vma=False))
+            self._progs[key] = aot.jit(key, shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=R, check_vma=False))
         return self._progs[key]
 
     def _prog_head(self, B, T, sample=False):
@@ -392,7 +393,7 @@ class ResidentLayerEngine(Engine):
                 k1, k2 = jax.random.split(k)
                 return device_sample(zl, temp, top_p, k1), logits, k2
             in_specs = (R, self.specs["lm_head"], R, R) + ((R, R, R) if sample else ())
-            self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=in_specs,
+            self._progs[key] = aot.jit(key, shard_map(prog, mesh=self.mesh, in_specs=in_specs,
                                                  out_specs=(R, R, R) if sample else R, check_vma=False))
         return self._progs[key]
 
@@ -468,7 +469,7 @@ class ResidentLayerEngine(Engine):
                         css if has_cache else None) + ((hss, R) if pend else ())
             out_specs = (R, css) + ((hss,) if hist else ()) + ((R,) if capture else ())
             sm = shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
-            self._progs[key] = jax.jit(sm, donate_argnums=((4,) if has_cache else ()) + ((5,) if pend else ()))
+            self._progs[key] = aot.jit(key, sm, donate_argnums=((4,) if has_cache else ()) + ((5,) if pend else ()))
         return self._progs[key]
 
     def _embed_streams(self, table, tokens):
@@ -487,7 +488,7 @@ class ResidentLayerEngine(Engine):
     def _prog_stream_mean(self, B, T):
         key = ("stream_mean", B, T)
         if key not in self._progs:
-            self._progs[key] = jax.jit(shard_map(self._stream_mean, mesh=self.mesh, in_specs=(R,), out_specs=R,
+            self._progs[key] = aot.jit(key, shard_map(self._stream_mean, mesh=self.mesh, in_specs=(R,), out_specs=R,
                                                  check_vma=False))
         return self._progs[key]
 
@@ -497,7 +498,7 @@ class ResidentLayerEngine(Engine):
         if key not in self._progs:
             def prog(norm, streams):
                 return M.rmsnorm(streams.mean(2).astype(self.lcfg.dtype), norm, self.cfg.eps)
-            self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=(R, R), out_specs=R, check_vma=False))
+            self._progs[key] = aot.jit(key, shard_map(prog, mesh=self.mesh, in_specs=(R, R), out_specs=R, check_vma=False))
         return self._progs[key]
 
     def _prog_head_all(self, B, T, sample=False):
@@ -516,7 +517,7 @@ class ResidentLayerEngine(Engine):
                 ids = device_sample(zl.reshape(B * T, -1), temp, top_p, k1)
                 return ids.reshape(B, T), logits, h, k2
             in_specs = (R, self.specs["lm_head"], R) + ((R, R, R) if sample else ())
-            self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=in_specs,
+            self._progs[key] = aot.jit(key, shard_map(prog, mesh=self.mesh, in_specs=in_specs,
                                                  out_specs=(R, R, R, R) if sample else (R, R), check_vma=False))
         return self._progs[key]
 
@@ -544,7 +545,7 @@ class ResidentLayerEngine(Engine):
                             per[g[j]] = {**(per[g[j]] or {}), k: h[k][s_]}
                 return M.rollback_states(per, n, dts, cur)
             sm = shard_map(prog, mesh=self.mesh, in_specs=(hgs, R, oss), out_specs=oss, check_vma=False)
-            self._progs[key] = jax.jit(sm, donate_argnums=(2,))
+            self._progs[key] = aot.jit(key, sm, donate_argnums=(2,))
         return self._progs[key]
 
     def _hist_cur(self, caches, kin=False):
@@ -656,7 +657,7 @@ class ResidentLayerEngine(Engine):
                 pk = (k, a.shape, str(a.dtype))
                 if pk not in self._progs[key]:
                     sp = spec[k]
-                    self._progs[key][pk] = jax.jit(shard_map(lambda x, rk=rk: x[:, :rk], mesh=self.mesh, in_specs=(sp,),
+                    self._progs[key][pk] = aot.jit((key, pk), shard_map(lambda x, rk=rk: x[:, :rk], mesh=self.mesh, in_specs=(sp,),
                                                              out_specs=sp, check_vma=False))
                 snap[k] = self._progs[key][pk](a)
             out.append(snap)
@@ -682,7 +683,7 @@ class ResidentLayerEngine(Engine):
                 pk = (k, a.shape, str(a.dtype))
                 if pk not in self._progs[key]:
                     sp = spec[k]
-                    self._progs[key][pk] = jax.jit(shard_map(lambda x, p: lax.dynamic_update_slice_in_dim(x, p, 0, axis=1),
+                    self._progs[key][pk] = aot.jit((key, pk), shard_map(lambda x, p: lax.dynamic_update_slice_in_dim(x, p, 0, axis=1),
                                                              mesh=self.mesh, in_specs=(sp, sp), out_specs=sp, check_vma=False),
                                                    donate_argnums=(0,))
                 new[k] = self._progs[key][pk](a, sc[k])
@@ -788,7 +789,7 @@ class ResidentLayerEngine(Engine):
             def prog(embed, tokens, pos):
                 x = self._embed(embed, tokens[:, None]).astype(self.lcfg.dtype)
                 return jnp.broadcast_to(x[:, :, None, :], (B, 1, self.cfg.hc, x.shape[-1])), pos + 1
-            self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=(self.specs["embed"], R, R),
+            self._progs[key] = aot.jit(key, shard_map(prog, mesh=self.mesh, in_specs=(self.specs["embed"], R, R),
                                                  out_specs=(R, R), check_vma=False))
         return self._progs[key]
 
@@ -821,7 +822,7 @@ class ResidentLayerEngine(Engine):
             in_specs = ([self.specs["layers"][i] for i in layers], R, R, css)
             out_specs = (R, css) + ((R,) if capture else ())
             sm = shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
-            self._progs[key] = jax.jit(sm, donate_argnums=(3,))
+            self._progs[key] = aot.jit(key, sm, donate_argnums=(3,))
         return self._progs[key]
 
     def _prog_head_ring(self, B, sample, fidx):
@@ -853,7 +854,7 @@ class ResidentLayerEngine(Engine):
             rs = [dict(DF.RING_SPECS)] * B
             in_specs = (R, self.specs["lm_head"], R, dr.specs, [R] * len(fidx), rs, R) + ((R, R, R) if sample else ())
             out_specs = (R, R, R, rs) if sample else (R, rs)
-            self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs,
+            self._progs[key] = aot.jit(key, shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs,
                                                  check_vma=False), donate_argnums=(5,))
         return self._progs[key]
 
@@ -910,7 +911,7 @@ class ResidentLayerEngine(Engine):
             in_specs = ([self.specs["layers"][i] for i in layers], (self.specs["embed"], R) if embed else R, R, css) + \
                 ((hss, R) if pend else ())
             sm = shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=(R, css, hss, R), check_vma=False)
-            self._progs[key] = jax.jit(sm, donate_argnums=(3,) + ((4,) if pend else ()))
+            self._progs[key] = aot.jit(key, sm, donate_argnums=(3,) + ((4,) if pend else ()))
         return self._progs[key]
 
     def _pend_identity_rows(self, sets, T):
@@ -937,7 +938,7 @@ class ResidentLayerEngine(Engine):
             def prog(curs):                                                     # curs[b][layer] -> per group {k: [n,T,B,...]}
                 return [{k: jnp.stack([jnp.concatenate([one(curs[b][g[j]], k) for b in range(B)], axis=1) for j in js])
                          for k, js in lay.items()} for g, lay in zip(groups, lays)]
-            self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=([cur_specs] * B,), out_specs=hgs,
+            self._progs[key] = aot.jit(key, shard_map(prog, mesh=self.mesh, in_specs=([cur_specs] * B,), out_specs=hgs,
                                                  check_vma=False))
         return self._progs[key]([self._hist_cur(c, kin=True) for c in sets]), self.device_positions([T] * B), T
 
@@ -982,7 +983,7 @@ class ResidentLayerEngine(Engine):
                     out.append(M.rollback_states(per, n[b], dts, cur[b]))
                 return out
             sm = shard_map(prog, mesh=self.mesh, in_specs=(hgs, R, [oss] * B), out_specs=[oss] * B, check_vma=False)
-            self._progs[key] = jax.jit(sm, donate_argnums=(2,))
+            self._progs[key] = aot.jit(key, sm, donate_argnums=(2,))
         return self._progs[key]
 
     def _verify_rows(self, tokens, sets, pos, pend=None):
@@ -1171,7 +1172,7 @@ class ResidentLayerEngine(Engine):
                 return self._logits(lm_head, last), h, nc
             in_specs = (self.mtp_spec, self.specs["embed"], self.specs["lm_head"], R, R, R, R, cs)
             sm = shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=(R, R, cs), check_vma=False)
-            self._progs[key] = jax.jit(sm, donate_argnums=(7,))
+            self._progs[key] = aot.jit(key, sm, donate_argnums=(7,))
         return self._progs[key]
 
     def _verify_layers(self, tokens, caches, pos0, capture=False, pend=None):
@@ -1324,7 +1325,7 @@ class ResidentLayerEngine(Engine):
                         "pos_b": jnp.broadcast_to(pos, (B,)), "n_new_b": a + 1, "key": k2}
             outs = {k: R for k in ("emitted", "a", "bonus", "n_keep", "pos_next", "pos_b", "n_new_b", "key")}
             in_specs = (R, self.specs["lm_head"], R, R, R, R, R, R, R, R)
-            self._progs[key] = jax.jit(shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=outs,
+            self._progs[key] = aot.jit(key, shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=outs,
                                                  check_vma=False))
         return self._progs[key]
 

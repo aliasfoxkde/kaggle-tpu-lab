@@ -20,51 +20,58 @@ TPU and gives you a public endpoint that speaks both the OpenAI and the Anthropi
 Claude Code, Codex CLI, opencode, or plain `curl`.
 
 As far as we know this is the first inference engine to run GLM-5.3-Flash on a TPU, and it runs on the free one.
-We wrote it in JAX for this model: the routed experts sit in HBM as 3-bit codebook weights and custom TPU kernels read
-them straight into the matrix multiply. Measured on this setup: about **64 tok/s** for one stream, **~90 tok/s** aggregate over three streams, **~1,600 tok/s** prefill, the
-model's full **262,144-token context**, prefix caching that makes agent sessions resume in about a second, and
-image inputs.
+We wrote it in JAX for this model: the experts sit in HBM as 3-bit weights that custom TPU kernels read straight
+into the matrix multiply, and a small draft model proposes blocks of tokens that the big model verifies in one step.
+Measured here: about **165 tok/s** for one stream, about **170 tok/s** aggregate over three, the model's full
+**262,144-token context**, prefix caching that resumes an agent session in about a second, and image inputs.
 
-## Before you run — three clicks in the right sidebar
-1. **Accelerator → TPU VM v5e-8** (Session options)
-2. **Internet → ON** (Session options; needed for the tunnel)
-3. **Add Input** → search and attach these three datasets:
-   - `rahim3/glm53-flash-iq3xxs-1` and `rahim3/glm53-flash-iq3xxs-2` — the routed experts (Unsloth's UD-IQ3_XXS GGUF)
-   - `rahim3/glm53-flash-serve` — the rest of the weights, the vision tower, the tokenizer and the compiled programs
+## Before you run: three clicks in the right sidebar
+1. **Accelerator → TPU VM v5e-8**
+2. **Internet → ON** (the tunnel needs it)
+3. **Add Input** → attach these three datasets:
+   - `rahim3/glm53-flash-iq3xxs-1` and `rahim3/glm53-flash-iq3xxs-2`: the experts (Unsloth's UD-IQ3_XXS GGUF)
+   - `rahim3/glm53-flash-serve-v3`: the rest of the weights, the vision tower, the tokenizer and the programs
 
-Then run the cells top to bottom. The last cell keeps running on purpose: that is your server. The endpoint URL
-and API key appear in a `READY` banner in its output, about 16 minutes after you start.
-
-(Without the serve dataset the script can still build from `rahim3/glm53-flash-fp8-1` … `-4`, the FP8 checkpoint;
-that takes about 22 minutes.)
+Then run all cells. The last cell is the server and keeps running on purpose; the endpoint URL and the API key
+appear in its `READY` banner after about 6–13 minutes (the weights are most of that). The draft model
+(`incoai/GLM-5.3-Flash-DFlash2`, CC BY-NC-ND 4.0, research use) comes from Hugging Face when the server starts;
+set `dflash` to `""` in the config cell to run without it, at about 79 tok/s.
 
 If the last cell stops in its first minute, its message says why: no TPU in this session (Kaggle does that
 sometimes; stop and start the session again), Internet off, or a dataset not attached.
+
+The code, the engine and a guide for the same recipe on a rented TPU VM are in the GitHub repo:
+https://github.com/ARahim3/kaggle-tpu-lab. Keep an eye on it for more models in the future!
 """,
 }
 
-CONFIG = {"glm53-flash": {"streams": 4, "max_len": 262144, "reasoning_effort_default": "low", "vision": True, "keepalive_min": 90}}
+CONFIG = {"glm53-flash": {"streams": 3, "max_len": 262144, "reasoning_effort_default": "low", "vision": True, "keepalive_min": 90}}
 
 CONFIG_NOTES = {"glm53-flash": """### Configuration
 The defaults above are what we serve. Things you might change:
-- `streams`: how many requests decode together. Three fit in HBM at the full 262k context; the fourth waits for a
-  free slot. Each extra stream slows the others (one stream ~65 tok/s, two ~40 each, three ~30 each).
+- `streams`: how many requests decode together. Three fit in HBM at the full 262k context; a fourth request waits
+  for a free slot. One stream runs at about 165 tok/s, three together at about 170 tok/s aggregate.
+- `dflash`: where the draft model comes from: `hf:<repo>@<revision>` (the default, fetched from Hugging Face), an
+  attached dataset or directory holding its `config.json` and `model.safetensors`, or `""` for no speculative
+  decoding.
 - `reasoning_effort_default`: `"low"`, `"medium"` or `"high"`; clients can still set it per request.
-- `vision`: `false` skips the vision tower (saves a minute and a little HBM; image inputs then error out).
-- `keepalive_min`: the server shuts itself down after this long. Raise it (up to about 480) when you want a
-  long-lived endpoint; the default keeps a test run cheap on your TPU quota.
+- `vision`: `false` skips the vision tower (a minute and a little HBM saved; image inputs then error out).
+- `keepalive_min`: the server shuts itself down after this long. Raise it (up to about 480) for a long-lived
+  endpoint; the default keeps a test run cheap on your TPU quota.
 - `api_key`: set your own; otherwise one is generated and printed in the banner.
 - `ntfy_topic`: optional; the script posts its progress to `ntfy.sh/<topic>` so you can follow it from your phone.
 """,
 }
 
 LAUNCH_NOTES = {"glm53-flash": """### Launch (leave this cell running: it is the server)
-What you will see, step by step:
-1. **Runtime** — a pinned TPU runtime and a few packages (~1 min)
-2. **Weights** — the 3-bit experts and the int8 non-expert weights go straight onto the eight chips (~4 min)
-3. **Vision** — the vision tower, sharded over the chips (~20 s)
-4. **Warm-up** — the prefill and batched-decode programs are loaded from the compile cache and traced (~9 min; ~14 cold)
-5. **Tunnel** — a public URL
+What you will see:
+1. **Runtime**: a pinned TPU runtime and a few packages (about a minute)
+2. **Weights**: the 3-bit experts and the int8 non-expert weights go straight onto the eight chips (3–10 minutes,
+   depending on how fast the dataset mount reads)
+3. **Vision**: the vision tower (seconds), then the draft model from Hugging Face (about a minute)
+4. **Warm-up**: every program is loaded in its exported and compiled form from the serve dataset (under a minute);
+   without the matching dataset every program is traced and compiled (about 28 minutes)
+5. **Tunnel**: a public URL
 6. **READY banner** with `ENDPOINT`, `API KEY` and `MODEL`, then a short self-test
 
 Use the endpoint from anywhere:

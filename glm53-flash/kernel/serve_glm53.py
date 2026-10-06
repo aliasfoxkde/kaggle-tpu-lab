@@ -12,14 +12,15 @@ Steps (each one is announced in the log):
                   (int8) straight onto the eight chips (~6 min); the non-expert weights come from the serve dataset's
                   base store when it is attached, else from the FP8 checkpoint datasets
   3/6  vision   — the vision tower, sharded over the chips
-  4/6  warm-up  — the prefill buckets, the batched decode programs and the snapshot programs (~9 min with the serve
-                  dataset's compile cache, ~14 min cold: the rest is JAX tracing, which no cache skips)
+  4/6  warm-up  — the prefill buckets, the batched decode and speculative-decoding programs, the snapshot programs:
+                  loaded from the serve dataset's exported programs and compile cache; without them every program is
+                  traced, exported and compiled (~28 min)
   5/6  tunnel   — a public cloudflared URL (three attempts; a URL that never resolves is replaced once)
   6/6  ready    — READY banner + self-test, then keep serving until keepalive_min elapses
 
-A cold run leaves `jax_cache/` (everything it compiled) and `base/` (the non-expert weights, vision tower and
-tokenizer, ~11 GB) in /kaggle/working, so its output can be turned into the serve dataset ("New dataset" from the
-kernel output) that later runs attach instead of the FP8 datasets.
+A cold run leaves `jax_cache/` (everything it compiled), `exported/` (every program it traced) and, when it read the
+FP8 checkpoint, `base/` (the non-expert weights, vision tower and tokenizer, ~11 GB) in /kaggle/working, so its output
+can be turned into the serve dataset ("New dataset" from the kernel output) that later runs attach.
 """
 import base64, collections, glob, hashlib, io, json, os, queue, re, secrets, shutil, subprocess, sys, tarfile, threading, time, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,8 +32,16 @@ DEFAULTS = {
     "expert_datasets": ["rahim3/glm53-flash-iq3xxs-1", "rahim3/glm53-flash-iq3xxs-2"],   # Unsloth UD-IQ3_XXS GGUF, mirrored
     "base_datasets": ["rahim3/glm53-flash-fp8-1", "rahim3/glm53-flash-fp8-2",            # HF FP8 checkpoint, mirrored:
                       "rahim3/glm53-flash-fp8-3", "rahim3/glm53-flash-fp8-4"],           # non-expert weights, vision, tokenizer
-    "serve_dataset": "rahim3/glm53-flash-serve",   # base/ (non-expert weights, vision, tokenizer) + jax_cache/ (compiled
-                                     # programs); attached: the FP8 datasets are not needed and the warm-up is ~9 min instead of ~14
+    "serve_dataset": "rahim3/glm53-flash-serve-v3",   # base/ (non-expert weights, vision, tokenizer) + exported/ (the
+                                     # programs' exports) + jax_cache/ (their compiled executables); attached: the FP8
+                                     # datasets are not needed and the warm-up neither traces nor compiles
+    "serve_fallback": ["rahim3/glm53-flash-serve-v2", "rahim3/glm53-flash-serve"],   # used when `serve_dataset` is not
+                                     # attached: an older serve dataset's base/ still fits; its compiled programs are
+                                     # another build's (every program is traced and compiled, ~28 min)
+    "aot": True,                     # AOT export of the programs (glm53.aot): a program that has to be traced is exported
+                                     # to /kaggle/working/exported and a run that finds its file there, or in the serve
+                                     # dataset's exported/, skips JAX's tracing and lowering (the compile cache only
+                                     # skips XLA's compile); v6e 2026-10-06: warm-up 10.4 min with the cache -> 0.3
     "dump_base": True,               # a cold run writes base/ into its output (so the serve dataset can be made from it)
     "libtpu": "0.0.42.*",            # the image's runtime is 140x slower on gathers and cannot run Pallas kernels
     "max_len": 262144,               # context capacity (tokens); a multiple of 32
@@ -69,19 +78,22 @@ DEFAULTS = {
     "keepalive_min": 480,            # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
     "api_key": "",                   # generated if empty
     "ntfy_topic": "",                # optional: publish progress to ntfy.sh/<topic> (launch.py watches it)
-    "dflash": "",                    # DFlash 2 speculative decoding for a stream running alone: the drafter's directory or
-                                     # dataset (config.json + model.safetensors of incoai/GLM-5.3-Flash-DFlash2: CC BY-NC-ND
-                                     # 4.0, research only -> attach it yourself); "" = off
+    "dflash": "hf:incoai/GLM-5.3-Flash-DFlash2@bf582e4eacc1810f76656d1811693ff6c6737d2a",
+                                     # DFlash 2 speculative decoding (one stream alone, and batched for 2-3 streams): the
+                                     # drafter as `hf:<repo>[@revision]` (fetched from Hugging Face at start: public, 2.3 GB,
+                                     # ~1 min; incoai's drafter is CC BY-NC-ND 4.0, research use only), or its directory /
+                                     # attached dataset (config.json + model.safetensors); "" = plain decoding (one stream
+                                     # ~79 tok/s instead of ~166 on the v5e-8)
     "dflash_int8": True,             # the drafter's big matrices as int8 (159 instead of 295 MB per chip, same acceptance)
-    "dflash_cost": {"4": 13.3},      # ms per DFlash step by block size (v6e-8, 2026-10-05 night) = the block sizes compiled:
+    "dflash_cost": {"4": 16.4},      # ms per DFlash step by block size (Kaggle v5e-8, 2026-10-05: 2.6 tokens per step) = the block sizes compiled:
                                      # {"4": ..., "8": ...} also drafts 8 (2026-10-03: math-like text x1.97 instead of
                                      # x1.64, no gain overall at temperature 1.0; its programs only add warm-up)
     "dflash_prior": {"4": 2.8, "8": 3.3},    # tokens per step a new stream assumes until it has measured its own
-    "dflash_rows": {"2": [21.4, 11.6], "3": [28.9, 13.7]},   # DFlash for B streams at once: {"B": [ms of a B-stream
+    "dflash_rows": {"2": [26.0, 14.9], "3": [35.5, 17.0]},   # DFlash for B streams at once: {"B": [ms of a B-stream
                                      # DFlash step (block = the smallest of dflash_cost), ms of a plain batched step of
-                                     # B]} = the B compiled (v6e-8, 2026-10-05; served at temperature 1.0 x1.26 / x1.17 at 2 and
-                                     # 3 streams; ~3-6 min of warm-up each); the scheduler picks DFlash or plain per
-                                     # step from these and the streams' tokens per step; {} = plain batched steps
+                                     # B]} = the B compiled (Kaggle v5e-8, 2026-10-05; served 154 / 168 tok/s aggregate at
+                                     # 2 / 3 streams vs plain 114 / 147; ~8 min of cold warm-up each); the scheduler picks
+                                     # DFlash or plain per step from these and the streams' tokens per step; {} = plain
     "dflash_draft_temp": 0.7,        # drafts are drawn at this x the request's temperature; the verify accepts them by
                                      # rejection sampling (output distributed exactly as plain sampling)
     "served_model_name": "glm-5.3-flash",
@@ -101,6 +113,8 @@ ENGINE_B64 = ""  # __ENGINE__  (launch.py embeds the glm53 package here; the not
 PORT = int(CFG["port"])
 WORK = Path("/kaggle/working") if Path("/kaggle/working").is_dir() else Path("/tmp")
 CACHE_DIR = WORK / "jax_cache"
+EXPORT_DIR = WORK / "exported"
+SERVE_NAMES = [n for n in [CFG["serve_dataset"], *CFG["serve_fallback"]] if n]
 CLOUDFLARED = Path("/tmp/cloudflared")
 T0 = time.time()
 LOG_LINES = []
@@ -170,7 +184,7 @@ def preflight():
     """Look before the slow steps (~20 s): the datasets attached, Internet on (pip, cloudflared) and a real TPU present.
     Kaggle sometimes starts a "TPU" session with no TPU (a CPU-only container, most often on new or not-yet-verified
     accounts): jax then sees one CPU device and the build dies minutes later with a sharding error."""
-    need = list(CFG["expert_datasets"]) + ([] if CFG["serve_dataset"] and mounts_of([CFG["serve_dataset"]]) else
+    need = list(CFG["expert_datasets"]) + ([] if mounts_of(SERVE_NAMES) else
                                            ([CFG["serve_dataset"]] if CFG["serve_dataset"] and not mounts_of(CFG["base_datasets"]) else list(CFG["base_datasets"])))
     missing = [n for n in need if not mounts_of([n])]
     if missing:
@@ -209,7 +223,7 @@ if not CFG["skip_runtime"]:
     banner(1, "Runtime", "pre-flight, pinned libtpu + pip packages, cloudflared, the engine")
     preflight()
     sh([sys.executable, "-m", "pip", "install", "-q", "safetensors", "huggingface_hub", "transformers>=5.16", "pillow",
-        "torch", "--index-url", "https://download.pytorch.org/whl/cpu", "--extra-index-url", "https://pypi.org/simple"], "pip packages")
+        "flatbuffers", "torch", "--index-url", "https://download.pytorch.org/whl/cpu", "--extra-index-url", "https://pypi.org/simple"], "pip packages")
     if CFG["libtpu"]:
         sh([sys.executable, "-m", "pip", "install", "-q", f"libtpu=={CFG['libtpu']}"], f"libtpu=={CFG['libtpu']}")
     if ENGINE_B64 and not ENGINE_B64.startswith("__"):
@@ -229,7 +243,10 @@ import numpy as np                      # noqa: E402  (after the runtime pins: l
 import jax, jax.numpy as jnp            # noqa: E402
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P   # noqa: E402
 
-SERVE_MOUNT = (mounts_of([CFG["serve_dataset"]]) or [None])[0] if CFG["serve_dataset"] else None
+SERVE_MOUNT = (mounts_of(SERVE_NAMES) or [None])[0]
+if SERVE_MOUNT and CFG["serve_dataset"] and not mounts_of([CFG["serve_dataset"]]):
+    log(f"   {CFG['serve_dataset']} is not attached: using {SERVE_MOUNT} (its weights fit; its compiled programs are "
+        "another build's, so every program compiles)")
 BASE_DIR = os.path.join(SERVE_MOUNT, "base") if SERVE_MOUNT and os.path.isdir(os.path.join(SERVE_MOUNT, "base")) else None
 if "eng" not in globals():              # (a test harness may pre-set eng/tok/ids/eos/cfg and skip the build)
     cache_src = os.path.join(SERVE_MOUNT, "jax_cache") if SERVE_MOUNT and os.path.isdir(os.path.join(SERVE_MOUNT, "jax_cache")) else None
@@ -244,7 +261,40 @@ if "eng" not in globals():              # (a test harness may pre-set eng/tok/id
         _cc.reset_cache()
     except Exception as e:  # noqa: BLE001
         log(f"   (compile cache reset skipped: {e!r})")
+    try:                                 # which cache entries this build loads or writes (the serve dataset's next
+        if not hasattr(_cc, "_glm_use"):     # jax_cache/ is exactly those: jax_cache_used.txt in the output)
+            _cc._glm_use = {"hit": [], "miss": [], "put": [], "read_s": 0.0}
+
+            def _rec(fn, kind, use):         # (`use` is bound here: the warm-up below reuses the name _cc)
+                def wrapped(cache_key, *a, **k):
+                    t = time.time()
+                    r = fn(cache_key, *a, **k)
+                    try:
+                        if kind == "put":
+                            use["put"].append(cache_key)
+                        else:
+                            use["hit" if r[0] is not None else "miss"].append(cache_key)
+                            use["read_s"] += time.time() - t
+                    except Exception:  # noqa: BLE001  (the record must never cost a cache read)
+                        pass
+                    return r
+                return wrapped
+            _cc.get_executable_and_time = _rec(_cc.get_executable_and_time, "get", _cc._glm_use)
+            _cc.put_executable_and_time = _rec(_cc.put_executable_and_time, "put", _cc._glm_use)
+        CACHE_USE = _cc._glm_use
+        for _k in ("hit", "miss", "put"):
+            CACHE_USE[_k].clear()
+        CACHE_USE["read_s"] = 0.0
+    except Exception as e:  # noqa: BLE001
+        log(f"   (compile cache use is not recorded: {e!r})")
     log(f"   jax {jax.__version__}, {jax.device_count()} devices, compile cache at {CACHE_DIR}")
+if CFG["aot"]:
+    from glm53 import aot as AOT
+    _exp_src = os.path.join(SERVE_MOUNT, "exported") if SERVE_MOUNT and os.path.isdir(os.path.join(SERVE_MOUNT, "exported")) else None
+    AOT.configure(EXPORT_DIR, [_exp_src], context=lambda: AOT.engine_context(eng), log=log)
+    _n_exp = sum(len(glob.glob(os.path.join(d, "*" + AOT.EXT))) for d in AOT.STORE.read_dirs)
+    log(f"   exported programs: {_n_exp} files in {', '.join(AOT.STORE.read_dirs)}"
+        + ("" if _n_exp else " (none yet: every program is traced, then exported for the next run)"))
 
 # ----------------------------------------------------------------------------- 2. weights -> the chips
 if "eng" not in globals():
@@ -357,9 +407,22 @@ del _vp
 
 # ----------------------------------------------------------------------------- 3b. DFlash 2 drafter (optional)
 _d = CFG["dflash"]
-DFLASH_DIR = (_d if os.path.isdir(_d) else (mounts_of([_d]) or [None])[0]) if _d else None
-if _d and not DFLASH_DIR:
-    log(f"   DFlash: {_d} not found -> plain decoding")
+if _d.startswith("hf:"):                 # fetched from Hugging Face at start (a public repo: no token)
+    _repo, _, _rev = _d[3:].partition("@")
+    DFLASH_DIR = f"/tmp/models/{_repo.split('/')[-1]}"
+    try:
+        from huggingface_hub import snapshot_download
+        t = time.time()
+        snapshot_download(_repo, revision=_rev or None, local_dir=DFLASH_DIR,
+                          allow_patterns=["config.json", "model.safetensors"])
+        log(f"   DFlash drafter {_repo}: fetched in {time.time() - t:.0f}s")
+    except Exception as e:  # noqa: BLE001
+        log(f"   DFlash: fetching {_repo} failed ({e!r}) -> plain decoding")
+        DFLASH_DIR = None
+else:
+    DFLASH_DIR = (_d if os.path.isdir(_d) else (mounts_of([_d]) or [None])[0]) if _d else None
+    if _d and not DFLASH_DIR:
+        log(f"   DFlash: {_d} not found -> plain decoding")
 if DFLASH_DIR and getattr(eng, "dflash", None) is None:
     from glm53 import dflash as DF
     t = time.time()
@@ -1186,17 +1249,17 @@ for B in range(1, MAX_STREAMS + 1):
     log(f"   batched decode B={B}: {time.time() - t:.0f}s, {grew()}")
     publish("compiling", what=f"decode B={B}", secs=int(time.time() - t))
 if getattr(eng, "dflash", None) is not None:          # draft (every block-size pair), verify + capture, head, settle
-    for T0 in sorted(DFLASH_COST):
+    for _T in sorted(DFLASH_COST):
         t = time.time()
         _lg, _cc, _p = eng.prefill(ids)
-        _st = eng.dflash_start(np.array([0]), _cc, _p, T=T0)
+        _st = eng.dflash_start(np.array([0]), _cc, _p, T=_T)
         for _nt in sorted(DFLASH_COST):
             _e, _st = eng.dflash_step(_st, DeviceSampler(1.0, 0.95, seed=0), tuple(sorted(STOP_IDS)), next_T=_nt)
         _st = eng.dflash_settle(_st)                  # the stream's end: the verify run ahead undone (its program)
         del _lg, _cc, _st
         eng.dflash_end()                              # (the last step's arrays, kept for a deferred release)
-        log(f"   DFlash block {T0}: {time.time() - t:.0f}s, {grew()}")
-        publish("compiling", what=f"dflash T={T0}", secs=int(time.time() - t))
+        log(f"   DFlash block {_T}: {time.time() - t:.0f}s, {grew()}")
+        publish("compiling", what=f"dflash T={_T}", secs=int(time.time() - t))
     for B in sorted(DFLASH_ROWS):                     # B streams at once: batched verify, draft, head, rollback
         t = time.time()
         _sets, _tok, _pp = [], [], []
@@ -1223,6 +1286,15 @@ log(f"   warm-up done in {(time.time() - t_warm) / 60:.1f} min; HBM chip0 {use:.
 if CACHE_DIR.exists():
     n_files = sum(1 for _ in CACHE_DIR.iterdir()); size = sum(f.stat().st_size for f in CACHE_DIR.iterdir()) / 1e9
     log(f"   compile cache: {n_files} entries, {size:.2f} GB in {CACHE_DIR}")
+if globals().get("CACHE_USE") is not None:
+    _used = sorted(set(CACHE_USE["hit"]) | set(CACHE_USE["put"]))
+    (WORK / "jax_cache_used.txt").write_text("\n".join(_used) + "\n")
+    log(f"   compile cache use: {len(set(CACHE_USE['hit']))} programs loaded from it ({CACHE_USE['read_s']:.0f}s), "
+        f"{len(set(CACHE_USE['put']))} compiled and stored, {len(set(CACHE_USE['miss']) - set(CACHE_USE['put']))} compiled only "
+        f"(small); the {len(_used)} entries of this build are listed in {WORK / 'jax_cache_used.txt'}")
+if CFG["aot"]:
+    _fs = list(EXPORT_DIR.glob("*" + AOT.EXT))
+    log(f"   {AOT.summary()}; {len(_fs)} files, {sum(f.stat().st_size for f in _fs) / 1e9:.2f} GB in {EXPORT_DIR}")
 publish("warmed", minutes=round((time.time() - t_warm) / 60, 1), hbm_gb=round(use, 2))
 
 SCHED.start()

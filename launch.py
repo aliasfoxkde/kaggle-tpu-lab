@@ -401,9 +401,9 @@ def main():
     s.add_argument("--user", help="Kaggle username (auto-detected if possible)")
     s.add_argument("--slug", default=None, help="kernel name (default: the model's)")
     s.add_argument("--max-len", type=int, default=262144, help="glm53-flash: context capacity (a multiple of 32)")
-    s.add_argument("--streams", type=int, default=4, help="glm53-flash: requests decoded together")
-    s.add_argument("--serve-dataset", default="rahim3/glm53-flash-serve",
-                   help="glm53-flash: dataset with base/ + jax_cache/ (replaces the FP8 mounts, shorter warm-up); '' = FP8 mounts, cold")
+    s.add_argument("--streams", type=int, default=3, help="glm53-flash: requests decoded together (3 fit at 262k; speculative decoding is batched up to 3)")
+    s.add_argument("--serve-dataset", default="rahim3/glm53-flash-serve-v3",
+                   help="glm53-flash: dataset with base/ + exported/ + jax_cache/ (replaces the FP8 mounts, no tracing or compiling); '' = FP8 mounts, cold")
     s.add_argument("--max-model-len", type=int, default=262144,
                    help="context length (default: native 262k; use 131072 with "
                         "--max-num-seqs 16 for max multi-stream throughput)")
