@@ -426,6 +426,9 @@ def server_args(cfg):
             "--api-key", cfg["api_key"],
             "--served-model-name", cfg["served_model_name"],
             "--reasoning-parser", "qwen3"]
+    # Kaggle mounts dataset weights through FUSE.GCSFUSE, which vLLM does not
+    # auto-detect for prefetch; prefetch avoids slow demand reads during loading.
+    args += ["--safetensors-load-strategy", "prefetch"]
     if cfg.get("async_scheduling") is not None:
         args.append("--async-scheduling" if cfg["async_scheduling"] else "--no-async-scheduling")
     if cfg["text_only"]:
