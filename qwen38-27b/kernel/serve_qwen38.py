@@ -120,14 +120,33 @@ def banner(step, title, note=""):
     log("=" * 70)
 
 
+_SENSITIVE_PROGRESS_KEYS = frozenset({"api_key", "authorization", "access_token", "token", "secret", "credential"})
+
+
+def sanitize_progress(value):
+    """Redact credential-shaped progress fields before they reach logs or ntfy."""
+    if isinstance(value, dict):
+        safe = {}
+        for key, item in value.items():
+            normalized = str(key).casefold().replace("-", "_")
+            sensitive = (normalized in _SENSITIVE_PROGRESS_KEYS
+                         or normalized.endswith(("_api_key", "_token", "_secret", "_credential")))
+            safe[key] = "[REDACTED]" if sensitive else sanitize_progress(item)
+        return safe
+    if isinstance(value, (list, tuple)):
+        return [sanitize_progress(item) for item in value]
+    return value
+
+
 def publish(phase, **extra):
-    """Progress event: always logged; also pushed to ntfy if a topic is set."""
-    log(f"PHASE {phase}", json.dumps(extra) if extra else "")
+    """Progress event: redact credentials before logging or publishing to ntfy."""
+    safe_extra = sanitize_progress(extra)
+    log(f"PHASE {phase}", json.dumps(safe_extra) if safe_extra else "")
     if not CFG["ntfy_topic"]:
         return
     try:
         body = {"topic": CFG["ntfy_topic"], "title": f"kaggle-tpu-lab {phase}",
-                "message": json.dumps({"phase": phase, **extra})}
+                "message": json.dumps({"phase": phase, **safe_extra})}
         req = urllib.request.Request("https://ntfy.sh", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10)
