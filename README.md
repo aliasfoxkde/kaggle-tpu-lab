@@ -62,6 +62,11 @@ from it, plus whatever the recipe needs (a patch, an engine). The launcher and t
 notebook share the same config block, so a setting changed in one place means the same
 thing in the other.
 
+## Research notes
+
+- [DeepSeek V4.1 Flash and Qwen3.8-Flash-Next on Kaggle](docs/research/deepseek-v4.1-flash-kaggle.md) — hardware fit,
+  runtime support, and a staged proof-of-concept recommendation; no cloud run is claimed.
+
 ## License
 
 The code here is MIT. Model weights keep their own licenses; each folder says which.
