@@ -15,6 +15,7 @@ import argparse
 import base64
 import io
 import json
+import os
 import re
 import secrets
 import shutil
@@ -30,6 +31,19 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 KERNEL_SRC = HERE / "qwen38-27b" / "kernel" / "serve_qwen38.py"
 STATE_FILE = Path.home() / ".kaggle-tpu-lab.json"
+
+
+def save_state(state):
+    """Atomically persist launcher credentials with user-only permissions."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.chmod(tmp, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f)
+        f.write("\n")
+    os.replace(tmp, STATE_FILE)
+    os.chmod(STATE_FILE, 0o600)
 
 WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
 ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
@@ -191,13 +205,12 @@ def cmd_serve(args):
                 say(f"WARNING: {line.strip()} — the kernel will still run, "
                     "but may need to download weights / compile cold.")
 
-    STATE_FILE.write_text(json.dumps(
-        {"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key}))
+    save_state({"kernel": f"{user}/{slug}", "topic": topic, "api_key": api_key})
     say("Pushed. Kaggle takes a few minutes to provision the TPU and attach the "
         f"datasets; the endpoint is usually live ~{model['minutes']} min after the kernel starts.")
     say("Watching progress (Ctrl-C is safe — the server keeps running; "
         "`python launch.py status` re-attaches, `... stop` kills it).")
-    watch(f"{user}/{slug}", topic)
+    watch(f"{user}/{slug}", topic, api_key)
 
 
 def read_events(topic, since):
@@ -222,7 +235,7 @@ def read_events(topic, since):
     return events
 
 
-def render_event(ev):
+def render_event(ev, api_key=None):
     phase = ev.get("phase", "?")
     if phase == "compiling":
         if "what" in ev:
@@ -251,7 +264,7 @@ def render_event(ev):
         print("\n" + "=" * 66)
         print("  YOUR ENDPOINT IS LIVE")
         print(f"  base URL : {ev['endpoint']}")
-        print(f"  API key  : {ev['api_key']}")
+        print(f"  API key  : {api_key or '<see local launcher state>'}")
         print(f"  model    : {ev['model']}   (context: {ev.get('max_model_len', '?')})")
         print("=" * 66)
         base = ev["endpoint"] if ev["endpoint"].endswith("/v1") else ev["endpoint"] + "/v1"
@@ -296,7 +309,7 @@ See the model folder's README for hooking this into Claude Code, Codex CLI, open
         say(text if text else f"{phase} {json.dumps({k: v for k, v in ev.items() if k != 'phase'})}")
 
 
-def watch(kernel, topic):
+def watch(kernel, topic, api_key=None):
     since = int(time.time()) - 600
     last_status = None
     seen_boot = False
@@ -305,7 +318,7 @@ def watch(kernel, topic):
             for ts, ev in read_events(topic, since):
                 since = max(since, ts)
                 seen_boot = True
-                render_event(ev)
+                render_event(ev, api_key)
                 if ev.get("phase") in ("failed", "auto-shutdown", "stopped"):
                     return
             since = max(since, int(time.time()) - 1) if seen_boot else since
@@ -356,8 +369,7 @@ def cmd_build_env(args):
         out = (r.stdout or "") + (r.stderr or "")
         if "successfully pushed" not in out:
             sys.exit(f"Push failed:\n{out.strip()}")
-    STATE_FILE.write_text(json.dumps({"kernel": f"{user}/{args.slug}", "topic": topic,
-                                      "api_key": ""}))
+    save_state({"kernel": f"{user}/{args.slug}", "topic": topic, "api_key": ""})
     say(f"Pushed {user}/{args.slug}. It serves each config once (~1.5 h total) and "
         "leaves xla_cache.tar / cloudflared / manifest.json in its output.")
     watch(f"{user}/{args.slug}", topic)
@@ -376,11 +388,11 @@ def cmd_status(args):
     say(((r.stdout or "") + (r.stderr or "")).strip())
     events = read_events(st["topic"], int(time.time()) - 24 * 3600)
     for _, ev in events[-8:]:
-        render_event(ev)
+        render_event(ev, st.get("api_key"))
     if any(ev.get("phase") == "ready" for _, ev in events):
         say(f"API key: {st['api_key']}")
     if args.follow:
-        watch(st["kernel"], st["topic"])
+        watch(st["kernel"], st["topic"], st.get("api_key"))
 
 
 def cmd_stop(args):
