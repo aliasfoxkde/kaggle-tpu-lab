@@ -3,8 +3,10 @@
 Kaggle's free TPU session is one host with eight TPU v5e chips, a `v5litepod-8`. Google Cloud rents the same machine,
 and its faster sibling the `v6e-8`, by the hour: no queue, no nine-hour cap, a VM you can SSH into. This folder is how
 we run the GLM-5.3-Flash recipe there, which we do daily for development: the same kernel script, the same public
-datasets, Kaggle's paths recreated on the VM. It answers [issue #11](https://github.com/ARahim3/kaggle-tpu-lab/issues/11);
-Terraform for the same steps is welcome as a pull request.
+datasets, Kaggle's paths recreated on the VM. It answers [issue #11](https://github.com/ARahim3/kaggle-tpu-lab/issues/11).
+An optional [Terraform module](terraform/README.md) creates an eight-chip Spot TPU VM; use the runbook below to
+install the runtime and start serving. It uses direct provisioning, so use the queued-resource `gcloud` commands below
+if the selected zone has no immediate capacity.
 
 **You need**: a Google Cloud project with billing, the `gcloud` CLI, TPU quota in one zone (below), and a Kaggle API
 token (the datasets are public, the Kaggle CLI still wants a token to download them).
