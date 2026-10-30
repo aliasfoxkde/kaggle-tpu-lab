@@ -67,6 +67,15 @@ thing in the other.
 - [DeepSeek V4.1 Flash and Qwen3.8-Flash-Next on Kaggle](docs/research/deepseek-v4.1-flash-kaggle.md) — hardware fit,
   runtime support, and a staged proof-of-concept recommendation; no cloud run is claimed.
 
+## Community tool (third party)
+
+Upstream [issue #12](https://github.com/ARahim3/kaggle-tpu-lab/issues/12) proposes the independently maintained
+[Kaggle TPU Lab Mobile app](https://github.com/afterexam/kaggle-tpu-lab-mobile) for monitoring and chat. It is not part
+of this project, and we have not audited its APK or verified release provenance. Its source stores Kaggle account tokens
+in Capacitor Preferences and `localStorage`; its Android manifest enables app backup, so backup exposure depends on the
+device's backup configuration. Race mode automatically cancels competing queued kernels after one starts. Review the
+source and release before installing, and remove or revoke saved credentials if you stop using the app.
+
 ## License
 
 The code here is MIT. Model weights keep their own licenses; each folder says which.
