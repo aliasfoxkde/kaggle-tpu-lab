@@ -22,7 +22,7 @@ A cold run leaves `jax_cache/` (everything it compiled), `exported/` (every prog
 FP8 checkpoint, `base/` (the non-expert weights, vision tower and tokenizer, ~11 GB) in /kaggle/working, so its output
 can be turned into the serve dataset ("New dataset" from the kernel output) that later runs attach.
 """
-import base64, collections, glob, hashlib, io, json, os, queue, re, secrets, shutil, subprocess, sys, tarfile, threading, time, urllib.request, uuid
+import base64, collections, glob, hashlib, hmac, io, json, os, queue, re, secrets, shutil, subprocess, sys, tarfile, threading, time, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -100,6 +100,7 @@ DEFAULTS = {
     "tunnel": True,                  # False: no cloudflared (local testing)
     "skip_runtime": False,           # True: no pip installs (local testing)
     "port": 8000,
+    "bind": "0.0.0.0",
 }
 CFG = {**DEFAULTS, **(CFG or {}), **globals().get("CFG_PRESET", {})}
 _cfg_file = Path("serve_config.json")            # notebook flow: overrides next to this script
@@ -1045,12 +1046,15 @@ class H(BaseHTTPRequestHandler):
         if not API_KEY:
             return True
         h = self.headers.get("Authorization", ""); k = self.headers.get("x-api-key", "")
-        return h == f"Bearer {API_KEY}" or k == API_KEY
+        expected = API_KEY.encode()
+        return hmac.compare_digest(h.encode(), f"Bearer {API_KEY}".encode()) or hmac.compare_digest(k.encode(), expected)
 
     def _sse(self, obj, event=None):
         self._raw((f"event: {event}\n" if event else "") + f"data: {json.dumps(obj)}\n\n")
 
     def do_GET(self):
+        if not self._auth():
+            return self._json(401, {"error": {"type": "authentication_error", "message": "bad api key"}})
         if self.path.startswith("/health"):
             return self._json(200, {"status": "ok", "model": MODEL, "layers": cfg.n_layers, "max_len": eng.max_len, "max_streams": MAX_STREAMS,
                                     "max_sets": MAX_SETS, "max_queue": MAX_QUEUE, "piece": SCHED.piece, "buckets": list(eng.PREFILL_BUCKETS),
@@ -1298,7 +1302,7 @@ if CFG["aot"]:
 publish("warmed", minutes=round((time.time() - t_warm) / 60, 1), hbm_gb=round(use, 2))
 
 SCHED.start()
-srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
+srv = ThreadingHTTPServer((CFG["bind"], PORT), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 log(f"   HTTP server on :{PORT}")
 
@@ -1333,13 +1337,14 @@ def start_tunnel(attempts=3, wait_s=90):
     return None
 
 
-def tunnel_probe(u, wait_s=180):
+def tunnel_probe(u, api_key, wait_s=180):
     """Background: confirm the public URL answers (a fresh hostname can take a minute to resolve); if it never does,
     open a new tunnel once and announce the new URL."""
     t0 = time.time()
     while time.time() - t0 < wait_s:
         try:
-            urllib.request.urlopen(f"{u}/health", timeout=10).read()
+            req = urllib.request.Request(f"{u}/health", headers={"Authorization": f"Bearer {api_key}"})
+            urllib.request.urlopen(req, timeout=10).read()
             log(f"   tunnel reachable from outside: {u} ({time.time() - t0:.0f} s after it opened)")
             return
         except Exception:  # noqa: BLE001
@@ -1360,7 +1365,7 @@ if CFG["tunnel"]:
     url = start_tunnel()
     if url:
         publish("tunnel-url", endpoint=url)
-        threading.Thread(target=tunnel_probe, args=(url,), daemon=True).start()
+        threading.Thread(target=tunnel_probe, args=(url, API_KEY), daemon=True).start()
     else:
         publish("tunnel-failed", note="server still reachable inside the kernel on :8000")
 STATE["url"] = url or f"http://127.0.0.1:{PORT}"
@@ -1407,7 +1412,8 @@ log(f"#    ANTHROPIC_SMALL_FAST_MODEL={MODEL} CLAUDE_CODE_MAX_CONTEXT_TOKENS={CF
 log("#  OpenAI-compatible clients: base URL " + endpoint + "/v1, model " + MODEL)
 log(f"#  Serving for up to {CFG['keepalive_min']} min, then this cell exits on its own.")
 log("#" * 70)
-publish("ready", endpoint=endpoint, api_key=API_KEY, model=MODEL, max_model_len=CFG["max_len"],
+# Keep the bearer key in the local launcher state; ntfy is only a progress relay.
+publish("ready", endpoint=endpoint, model=MODEL, max_model_len=CFG["max_len"],
         keepalive_min=CFG["keepalive_min"], startup_secs=int(time.time() - T0))
 
 if globals().get("SERVE_FOREVER", True):

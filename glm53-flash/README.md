@@ -43,7 +43,9 @@ python launch.py serve --model glm53-flash
 ```
 
 The launcher pushes the kernel, follows its progress and prints the endpoint and key when the
-server is up. `python launch.py status` re-attaches, `python launch.py stop` ends the session.
+server is up. The bearer key is kept in a user-only local state file and is not sent through
+the ntfy progress relay. `/health` and `/v1/models` require the same API key as inference
+requests. `python launch.py status` re-attaches, `python launch.py stop` ends the session.
 
 ## Quick start C — on a Google Cloud TPU VM
 

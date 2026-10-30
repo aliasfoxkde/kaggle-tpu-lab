@@ -198,7 +198,13 @@ ths = [threading.Thread(target=fire, args=(i,)) for i in range(4)]
 [t.start() for t in ths]; time.sleep(1.0); SCHED.resume(); [t.join() for t in ths]
 log("codes ->", codes, "| rejected", STATE.get("rejected"))
 assert sorted(codes) == [200, 200, 200, 429], codes
-h = json.loads(urllib.request.urlopen(URL + "/health").read())
+for path in ("/health", "/v1/models"):
+    try:
+        urllib.request.urlopen(URL + path, timeout=10)
+        raise AssertionError(f"unauthenticated {path} unexpectedly succeeded")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 401, (path, exc.code)
+h = json.loads(urllib.request.urlopen(urllib.request.Request(URL + "/health", headers=HDR)).read())
 log("health", {k: v for k, v in h.items() if k in ("active", "pending", "live_contexts", "max_streams", "max_sets", "max_queue", "piece", "buckets", "requests", "steps", "step_tokens", "snap_parks", "snap_hits", "rejected")})
 log("HARNESS OK")
 os._exit(0)
