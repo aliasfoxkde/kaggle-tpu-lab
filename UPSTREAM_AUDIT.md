@@ -22,7 +22,7 @@ PRs remain intact.
 | Issue #20 backend split | The same log shows the old `tpu-inference` package falling back to vLLM's PyTorch model implementation for this architecture. This patch addresses the directly observed GCSFuse load stall. Migrating the full recipe to `vllm-torchtpu` is a separate runtime change and was not claimed or bundled without a Kaggle TPU validation run. |
 | Issue #11 | Added `gcp/terraform/` for an opt-in eight-chip v5e-8/v6e-8 Spot TPU VM and documented credentials, cost, cleanup, and the direct-provisioning limit. It does not run `terraform apply` or upload Kaggle credentials. Use the existing queued-resource `gcloud` flow when capacity is scarce. |
 | Issue #12 | The Android companion link remains a maintainer-curated decision. It handles endpoint credentials, so review its credential storage and release practices before advertising it to users. |
-| Issue #15 | Added a cited feasibility assessment for DeepSeek V4.1 Flash and Qwen3.8-Flash-Next. It recommends a separate Qwen Q2_0/T4x2 POC first; no new model recipe is claimed until it passes runtime testing. |
+| Issue #15 | Added a cited feasibility assessment for DeepSeek V4.1 Flash and Qwen3.8-Flash-Next. A Qwen Q2_0/T4x2 POC is conditional on available Kaggle GPU quota and scratch capacity; it requires partial CPU offload and disk-backed PLE reads, and remains unvalidated. No new model recipe is claimed until it passes runtime testing. |
 | Issue #19 | The playlist guest-mode report does not map to a playlist component in this repository. |
 
 ## Open pull request review
