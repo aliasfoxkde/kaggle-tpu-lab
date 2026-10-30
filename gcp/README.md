@@ -76,7 +76,9 @@ curl localhost:8000/v1/chat/completions -H "Authorization: Bearer <API_KEY>" -H 
 ```
 
 The OpenAI API is at `/v1`, the Anthropic API at `/v1/messages`; the model README has the client settings for Claude
-Code and other agents. The server keeps running until you stop it (`tmux kill-session -t glm`) or the VM goes away.
+Code and other agents. `/health` and `/v1/models` also require the API key. The local server binds to loopback;
+`run.sh` creates its configuration file with mode `0600`. It keeps running until you stop it (`tmux kill-session -t glm`)
+or the VM goes away.
 
 ## Good to know
 
