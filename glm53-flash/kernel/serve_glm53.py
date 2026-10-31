@@ -22,7 +22,7 @@ A cold run leaves `jax_cache/` (everything it compiled), `exported/` (every prog
 FP8 checkpoint, `base/` (the non-expert weights, vision tower and tokenizer, ~11 GB) in /kaggle/working, so its output
 can be turned into the serve dataset ("New dataset" from the kernel output) that later runs attach.
 """
-import base64, collections, glob, hashlib, hmac, io, json, os, queue, re, secrets, shutil, subprocess, sys, tarfile, threading, time, urllib.request, uuid
+import base64, collections, glob, hashlib, hmac, io, ipaddress, json, os, queue, re, secrets, shutil, socket, subprocess, sys, tarfile, threading, time, urllib.parse, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -526,6 +526,14 @@ def _image_bytes(block):
     if url.startswith("data:"):
         return base64.b64decode(url.split(",", 1)[1])
     if url.startswith("http://") or url.startswith("https://"):
+        host = urllib.parse.urlsplit(url).hostname or ""
+        # SSRF guard: the kernel runs on a host with access to internal metadata
+        # and cluster services; only fetch public addresses.
+        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
+        if not host or any(ipaddress.ip_address(a).is_private or ipaddress.ip_address(a).is_loopback
+                           or ipaddress.ip_address(a).is_link_local or ipaddress.ip_address(a).is_reserved
+                           for a in addrs):
+            raise ValueError("refusing to fetch image from a non-public address")
         return urllib.request.urlopen(url, timeout=30).read()
     raise ValueError("unsupported image source")
 
