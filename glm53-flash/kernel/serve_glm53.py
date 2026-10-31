@@ -76,6 +76,13 @@ DEFAULTS = {
     "base_min": 512,                 # a system section at least this long is pinned for new sessions
     "snap_warm_tokens": 32768,       # warm the snapshot programs for contexts up to this many tokens
     "keepalive_min": 480,            # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
+    "idle_min": 15,                  # shut down after this many minutes with no active or queued
+                                     # request (0 = serve the full keepalive window regardless)
+    "burst_gateway": "",             # optional burst control-plane gateway URL;
+    "burst_instance": "",            # when set with a tunnel URL, announce {instance, url,
+    "burst_gateway_token": "",       # credential_ref, model} to POST /admin/endpoints so the
+    "burst_credential_ref": "session/glm53",  # controller can adopt this session
+    "burst_model": "glm5.3-flash",
     "api_key": "",                   # generated if empty
     "ntfy_topic": "",                # optional: publish progress to ntfy.sh/<topic> (launch.py watches it)
     "dflash": "hf:incoai/GLM-5.3-Flash-DFlash2@bf582e4eacc1810f76656d1811693ff6c6737d2a",
@@ -1462,12 +1469,44 @@ log(f"#    ANTHROPIC_SMALL_FAST_MODEL={MODEL} CLAUDE_CODE_MAX_CONTEXT_TOKENS={CF
 log("#  OpenAI-compatible clients: base URL " + endpoint + "/v1, model " + MODEL)
 log(f"#  Serving for up to {CFG['keepalive_min']} min, then this cell exits on its own.")
 log("#" * 70)
+
+
+def report_to_gateway(reason):
+    """Burst adoption seam: tell the control-plane gateway this session is live.
+    Non-fatal; the token is the bearer and never logged."""
+    if not (CFG["burst_gateway"] and endpoint and CFG["burst_instance"]):
+        return False
+    body = {
+        "instance": CFG["burst_instance"],
+        "url": endpoint,
+        "credential_ref": CFG["burst_credential_ref"] or None,
+        "model": CFG["burst_model"] or None,
+    }
+    req = urllib.request.Request(
+        f"{CFG['burst_gateway'].rstrip('/')}/admin/endpoints",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {CFG['burst_gateway_token']}",
+                 "User-Agent": "burst-kernel/0.1"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        log(f"   gateway told ({reason})")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(f"   (gateway report failed: {e})")
+        return False
+
+
 # Keep the bearer key in the local launcher state; ntfy is only a progress relay.
 publish("ready", endpoint=endpoint, model=MODEL, max_model_len=CFG["max_len"],
         keepalive_min=CFG["keepalive_min"], startup_secs=int(time.time() - T0))
+report_to_gateway("ready")
 
 if globals().get("SERVE_FOREVER", True):
     t_serve = time.time()
+    idle_deadline = CFG["idle_min"] * 60
+    last_reqs = STATE["requests"]
+    last_busy = time.time()
     while time.time() - t_serve < CFG["keepalive_min"] * 60:
         time.sleep(120)
         if SCHED.thread is not None and not SCHED.thread.is_alive():
@@ -1476,8 +1515,23 @@ if globals().get("SERVE_FOREVER", True):
             publish("stopped", reason="scheduler-exit")
             sys.exit(1)
         up = int((time.time() - t_serve) / 60)
+        # active/pending misses a request that arrives and finishes between two polls; a
+        # change in the completed-request counter marks the session busy anyway.
+        busy = bool(SCHED.active or SCHED.pending) or STATE["requests"] != last_reqs
+        last_reqs = STATE["requests"]
+        if busy:
+            last_busy = time.time()
+        idle_now = int((time.time() - last_busy) / 60)
         if up % 10 < 2:
-            publish("heartbeat", up_min=up, endpoint=endpoint, requests=STATE["requests"], tokens=STATE["tokens"])
-    publish("auto-shutdown", served_min=CFG["keepalive_min"])
+            publish("heartbeat", up_min=up, endpoint=endpoint, requests=STATE["requests"], tokens=STATE["tokens"],
+                    busy=busy, idle_min=idle_now)
+            report_to_gateway("heartbeat")
+        if idle_deadline and (time.time() - last_busy) >= idle_deadline:
+            served_min = int((time.time() - t_serve) / 60)
+            publish("idle-shutdown", idle_min=idle_now, served_min=served_min)
+            log(f"#  idle for {idle_now} min (idle_min={CFG['idle_min']}) — exiting "
+                f"to free the slot after {served_min} min of serving")
+            break
+    publish("auto-shutdown", served_min=int((time.time() - t_serve) / 60))
     SCHED.stop(); srv.shutdown()
     sys.exit(0)

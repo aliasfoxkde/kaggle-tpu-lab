@@ -14,7 +14,8 @@ Steps (each one is announced in the log):
   5/6  tunnel   — open a public cloudflared URL (printed before the server is
                   live so you can prepare your client)
   6/6  ready    — READY banner + self-test, then keep serving until
-                  keepalive_min elapses
+                  keepalive_min elapses or idle_min passes with no request
+                  (harvest_cache also tars the XLA cache into the output)
 
 With both datasets attached the endpoint is live in ~22 minutes (~12 with
 text_only, ~6 with fast_start). Without the env dataset the compile is cold (+15 min).
@@ -66,6 +67,18 @@ DEFAULTS = {
                                    # dataset's cache); the script then warms the common
                                    # request shapes itself; rare shapes stall once (~1 min)
     "keepalive_min": 480,          # auto-shutdown guard (Kaggle TPU caps at 9h anyway)
+    "idle_min": 15,                # shut down after this many minutes with no
+                                   # in-flight requests (0 = serve the full
+                                   # keepalive window regardless of traffic)
+    "harvest_cache": False,        # tar the completed XLA cache into
+                                   # /kaggle/working on the exit path, so it can
+                                   # be published as a private env-dataset update
+                                   # for this exact config
+    "burst_gateway": "",           # optional burst control-plane gateway URL;
+    "burst_instance": "",          # when set with a tunnel URL, announce
+    "burst_gateway_token": "",     # {instance, url, credential_ref, model} to
+    "burst_credential_ref": "session/qwen38",  # POST /admin/endpoints so the
+    "burst_model": "qwen38-27b",   # controller can adopt this session
     "api_key": "",                 # generated if empty
     "ntfy_topic": "",              # optional: publish progress to ntfy.sh/<topic>
     "served_model_name": "qwen3.8-27b",
@@ -152,6 +165,85 @@ def publish(phase, **extra):
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         log(f"(ntfy publish failed: {e})")
+
+
+def report_to_gateway(reason):
+    """Announce {instance, url, credential_ref, model} to the burst gateway
+    (POST /admin/endpoints adoption seam). Non-fatal: a reporting failure
+    never stops serving. The gateway token is the bearer and never logged;
+    the URL goes through sanitize_progress so a redaction slip upstream
+    cannot leak it either."""
+    if not (CFG["burst_gateway"] and url and CFG["burst_instance"]):
+        return False
+    body = sanitize_progress({
+        "instance": CFG["burst_instance"],
+        "url": f"{url}/v1",
+        "credential_ref": CFG["burst_credential_ref"] or None,
+        "model": CFG["burst_model"] or None,
+    })
+    req = urllib.request.Request(
+        f"{CFG['burst_gateway'].rstrip('/')}/admin/endpoints",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {CFG['burst_gateway_token']}",
+                 "User-Agent": "burst-kernel/0.1"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        log(f"   gateway told ({reason})")
+        return True
+    except Exception as e:
+        log(f"   (gateway report failed: {e})")
+        return False
+
+
+def server_busy():
+    """True while any request is running or queued (vLLM Prometheus gauges).
+    Returns True on blindness — a metrics failure can never idle-kill a
+    session that may be serving."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/metrics", timeout=10) as r:
+            text = r.read().decode("utf-8", "replace")
+    except Exception:
+        return True
+    for gauge in ("vllm:num_requests_running", "vllm:num_requests_waiting"):
+        for line in text.splitlines():
+            if line.startswith(gauge):
+                try:
+                    if float(line.rsplit(None, 1)[1]) > 0:
+                        return True
+                except (IndexError, ValueError):
+                    pass
+                break
+    return False
+
+
+def final_harvest():
+    """Tar the completed XLA cache into the session output, synchronously on
+    the exit path: /kaggle/working only becomes session output on a clean
+    interpreter exit, and a daemon thread dies at sys.exit."""
+    if not CFG["harvest_cache"]:
+        return
+    banner(7, "XLA cache harvest", f"{XLA_CACHE} -> {WORK}/xla_cache.tar")
+    t0 = time.time()
+    tmp = Path("/tmp/xla_cache.tar")
+    if tmp.exists():
+        tmp.unlink()
+    sh(["tar", "-cf", str(tmp), "-C", "/tmp", "xla_cache"], "tar")
+    shutil.move(str(tmp), str(WORK / "xla_cache.tar"))
+    size = (WORK / "xla_cache.tar").stat().st_size / 1e9
+    log(f"   harvested {size:.2f} GB in {time.time() - t0:.0f}s")
+    publish("cache-harvested", size_gb=round(size, 2))
+
+
+def shutdown(server):
+    """Terminate vLLM, let it finish writing, harvest, exit clean."""
+    server.terminate()
+    try:
+        server.wait(timeout=120)
+    except Exception:
+        pass
+    final_harvest()
+    sys.exit(0)
 
 
 def sh(cmd, tag, show=None, env=None):
@@ -938,6 +1030,7 @@ log("#" * 70)
 publish("ready", endpoint=(f"{url}/v1" if url else None), api_key=CFG["api_key"],
         model=CFG["served_model_name"], max_model_len=CFG["max_model_len"],
         keepalive_min=CFG["keepalive_min"], startup_secs=startup)
+report_to_gateway("ready")
 
 if CFG["fast_start"]:
     banner(6, "Warm-up", "loading the common request shapes; the endpoint is usable meanwhile")
@@ -948,14 +1041,35 @@ else:
 self_test(CFG)
 
 t_serve = time.time()
+idle_deadline = CFG["idle_min"] * 60
+last_busy = time.time()          # self-test / warm-up count as traffic
+total_polls, busy_polls = 0, 0
 while time.time() - t_serve < CFG["keepalive_min"] * 60:
     time.sleep(120)
     if server.poll() is not None:
         server_died(server, "stopped", reason="server-exit")
+    total_polls += 1
+    busy = server_busy()
+    if busy:
+        busy_polls += 1
+        last_busy = time.time()
     up = int((time.time() - t_serve) / 60)
+    idle_now = int((time.time() - last_busy) / 60)
     if up % 10 < 2:
-        publish("heartbeat", up_min=up, endpoint=(f"{url}/v1" if url else None))
-        log(f"   still serving ({up} min) — {url + '/v1' if url else ''}")
-publish("auto-shutdown", served_min=CFG["keepalive_min"])
-server.terminate()
-sys.exit(0)
+        busy_frac = round(busy_polls / max(total_polls, 1), 2)
+        publish("heartbeat", up_min=up, endpoint=(f"{url}/v1" if url else None),
+                busy=busy, idle_min=idle_now, busy_frac=busy_frac)
+        log(f"   still serving ({up} min, idle {idle_now}, "
+            f"busy {busy_frac * 100:.0f}% of polls) — {url + '/v1' if url else ''}")
+        report_to_gateway("heartbeat")
+    if idle_deadline and (time.time() - last_busy) >= idle_deadline:
+        served_min = int((time.time() - t_serve) / 60)
+        publish("idle-shutdown", idle_min=idle_now, served_min=served_min,
+                busy_frac=round(busy_polls / max(total_polls, 1), 2))
+        log(f"#  idle for {idle_now} min (idle_min={CFG['idle_min']}) — exiting "
+            f"to free the slot after {served_min} min of serving")
+        shutdown(server)
+served_min = int((time.time() - t_serve) / 60)
+publish("auto-shutdown", served_min=served_min,
+        busy_frac=round(busy_polls / max(total_polls, 1), 2))
+shutdown(server)
