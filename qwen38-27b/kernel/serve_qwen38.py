@@ -99,6 +99,10 @@ if CFG["fast_start"]:
     os.environ["SKIP_JAX_PRECOMPILE"] = "1"
 # The venv ships its own libtpu; don't let the image's TPU_LIBRARY_PATH override it.
 os.environ.pop("TPU_LIBRARY_PATH", None)
+# Kaggle image updates changed the permissions on /root/.cache/uv, and when uv
+# cannot use its default cache it re-downloads ~1 GB of wheels every run.
+# Keep the cache somewhere we own (reported on upstream PR #21, 2026-10-31).
+os.environ["UV_CACHE_DIR"] = "/tmp/uv-cache"
 
 _raw = open(RAW_LOG, "a", buffering=1)
 
