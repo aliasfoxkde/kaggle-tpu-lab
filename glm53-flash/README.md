@@ -156,7 +156,9 @@ tools/harness_serve.py              the whole kernel on a tiny CPU model (40 s),
   (the three speculative-decoding program sets take 6–8 minutes each), and the run leaves `exported/`
   and `jax_cache/` in `/kaggle/working`, which is how the serve dataset is made.
 - **Sessions.** Kaggle stops a TPU session after nine hours; the kernel shuts itself down after
-  `keepalive_min` minutes so a forgotten run does not burn your quota. Each run gets a new
+  `keepalive_min` minutes so a forgotten run does not burn your quota, and earlier than that
+  after `idle_min` minutes with no request running or queued (15 by default, `0` disables it).
+  Each run gets a new
   tunnel URL. A fresh Cloudflare hostname can take a minute to resolve.
 - **Stop sequences** apply to the text output, not to the reasoning.
 - **Long tool calls and the tunnel.** Cloudflare closes a response that stays silent for about
@@ -192,8 +194,8 @@ minute with a plain message:
   running but only reachable inside the kernel; start the session again. A fresh URL can take a
   minute to resolve, and the kernel replaces one that never does, so watch the log for a
   `NEW ENDPOINT` line before giving up.
-- **The server stopped on its own**: it exits after `keepalive_min` minutes (8 hours by default, 90 minutes in the notebook's config)
-  and Kaggle ends TPU sessions after nine hours.
+- **The server stopped on its own**: it exits after `keepalive_min` minutes (8 hours by default, 90 minutes in the notebook's config),
+  or after `idle_min` minutes with no request running or queued (15 by default), and Kaggle ends TPU sessions after nine hours.
 - **Anything else**: the log prints the step it was in and the error; paste that into an issue.
 
 ## Credits
