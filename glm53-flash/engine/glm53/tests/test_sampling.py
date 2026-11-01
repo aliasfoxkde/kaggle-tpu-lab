@@ -5,10 +5,11 @@ import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
-from jax.sharding import Mesh, PartitionSpec as P  # noqa: E402
+import jax.numpy as jnp
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
-from glm53.engine import AXIS, R, shard_map, device_sample, DeviceSampler  # noqa: E402
+from glm53.engine import AXIS, DeviceSampler, R, device_sample, shard_map
 
 
 def run(z, temperature, top_p, seed, n_cand=2048, impl="approx"):

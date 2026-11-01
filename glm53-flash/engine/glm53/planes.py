@@ -31,9 +31,9 @@ The XLA dequant returns each expert as [C*W, R] with input index c*W + w ("pm or
 to match: x_pm[c*W + w] = x[input(w, c)], and the per-word activation matrix used by the Pallas kernel is
 X[w, c] = x[input(w, c)] (same data as x_pm reshaped [C, W] and transposed).
 """
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from glm53 import iqquant as Q
 

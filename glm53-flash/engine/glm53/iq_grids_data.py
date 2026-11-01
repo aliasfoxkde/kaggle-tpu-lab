@@ -1,5 +1,7 @@
 """Auto-generated: llama.cpp IQ codebook grids (from gguf-py), npz base64 — so the package needs no data files."""
-import base64, io
+import base64
+import io
+
 import numpy as np
 
 _B64 = (

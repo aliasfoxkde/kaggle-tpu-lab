@@ -1,0 +1,17 @@
+# CI-only dependencies for kaggle-tpu-lab (GitForge + GitHub Actions).
+# Pinned to the versions in the local CPU harness venv (/var/tmp/ktl-venv)
+# that the test suite is verified against. The TPU runtime stack
+# (vllm-tpu, jax[tpu], torchax) is NOT installable on CPU CI runners and is
+# intentionally excluded; tests run against the CPU harness.
+# torch: use the CPU wheel (--index-url https://download.pytorch.org/whl/cpu);
+# the PyPI default is the CUDA build plus ~3 GB of NVIDIA libs.
+numpy==2.5.4
+jax[cpu]==0.12.0.1
+torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
+transformers==5.22.1
+safetensors
+pytest==9.2.0
+pytest-cov
+coverage==7.17.0
+ruff==0.17.3
+mypy==2.4.1

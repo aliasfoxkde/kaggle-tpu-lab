@@ -7,9 +7,9 @@ import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
+import jax.numpy as jnp
 
-from glm53 import model as M  # noqa: E402
+from glm53 import model as M
 
 jax.config.update("jax_default_matmul_precision", "highest")
 

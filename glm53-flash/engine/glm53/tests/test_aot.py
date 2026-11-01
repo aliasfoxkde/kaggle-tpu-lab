@@ -8,13 +8,13 @@ import pytest
 
 jax = pytest.importorskip("jax")
 pytest.importorskip("flatbuffers")              # the serialization of an export needs it
-import jax.numpy as jnp  # noqa: E402
+import jax.numpy as jnp
 
-from glm53 import aot  # noqa: E402
-from glm53 import model as M  # noqa: E402
-from glm53.engine import DeviceSampler  # noqa: E402
-from glm53.tests.test_dflash_engine import random_drafter  # noqa: E402
-from glm53.tests.test_spec_decode import build  # noqa: E402
+from glm53 import aot
+from glm53 import model as M
+from glm53.engine import DeviceSampler
+from glm53.tests.test_dflash_engine import random_drafter
+from glm53.tests.test_spec_decode import build
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
@@ -75,7 +75,7 @@ def same(a, b):
         np.testing.assert_allclose(a[k], b[k], rtol=1e-5, atol=1e-5 * np.abs(b[k]).max())
 
 
-@pytest.fixture()
+@pytest.fixture
 def store(tmp_path):
     saved = dict(vars(aot.STORE))
     yield tmp_path / "exported"
@@ -127,7 +127,6 @@ def test_names_do_not_depend_on_import_order(store):
         aot.configure(store, log=lambda *a: None)
         assert all(m in sys.modules for m in ("glm53.pallas_mhc", "glm53.pallas_kda"))
         before = aot._stable(aot._flags())
-        import glm53.pallas_mhc  # noqa: F401
         assert aot._stable(aot._flags()) == before
     finally:
         sys.modules.update(saved)

@@ -25,16 +25,17 @@ dimensions"), so a one-op 1024-entry lookup is not available.
 Codebook tables: `code_table(qtype)` (see there).
 """
 import functools
-import numpy as np
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from glm53 import iqquant as Q
-from glm53 import planes as PL
 from glm53 import model as M
+from glm53 import planes as PL
 
 LANES = 128
 SUB = 8
@@ -508,10 +509,10 @@ def _decode_store(decode, rows, tb, w_ref, s_ref, wi, si, nb):
         for scale, items in decode(b, rows, tb):
             s_ref[si] = scale
             si += 1
-            for c, val in items:
+            for _, val in items:
                 w_ref[wi] = val
                 wi += 1
-            plan.append((b, [c for c, _ in items]))
+            plan.append((b, [ci for ci, _ in items]))
     return wi, si, plan
 
 
@@ -533,7 +534,7 @@ def _n_values(qtype, nb):
     counts = []
 
     def f():
-        z = lambda k, r0, n: jnp.zeros((n, LANES), jnp.uint32)                             # noqa: E731
+        z = lambda k, r0, n: jnp.zeros((n, LANES), jnp.uint32)
         tbl = _table_arrays(qtype)
         tb = [jnp.zeros((SUB, LANES), tbl.dtype)] * (1 if qtype == "IQ4_XS" else tbl.shape[0])
         out = []
@@ -559,7 +560,7 @@ def _grouped_geometry(planes, qtype, nblk, eids, cnt, slots, classes, loop):
     assert cnt.shape == (G,) and slots.shape[0] % G == 0, (eids.shape, cnt.shape, slots.shape)
     tm = slots.shape[0] // G
     classes = tuple(classes) or ((1,) if loop else tuple(range(1, tm)))
-    classes = tuple(sorted(set(c for c in classes if c < tm))) + (() if loop else (tm,))
+    classes = tuple(sorted({c for c in classes if c < tm})) + (() if loop else (tm,))
     first = planes[keys[0]]
     return (keys, rows_p, PL.WORDS_PER_BLOCK[qtype] * nblk, PL.PLANES_PER_WORD[qtype], first.ndim == 3,
             first.shape[-1], G, tm, classes, {k: (rows_p[k] if rows_p[k] % SUB == 0 else SUB) for k in keys})
@@ -869,8 +870,8 @@ def moe_sweep_gateup(planes_g, planes_u, qtype, nblk, ids, n_active, xk, limit, 
                 for b0 in range(0, W // SUB, nbg):
                     k0 = b0 * C * SUB
                     xs = x_ref[:, k0:k0 + K]                                              # (TB, K) bf16
-                    tg = _probe_tiles(probe, lambda: _tiles(decode, rg, tb, b0, nbg, dtype), K, dtype)
-                    tu = _probe_tiles(probe, lambda: _tiles(decode, ru, tb, b0, nbg, dtype), K, dtype)
+                    tg = _probe_tiles(probe, lambda rg=rg, b0=b0: _tiles(decode, rg, tb, b0, nbg, dtype), K, dtype)
+                    tu = _probe_tiles(probe, lambda ru=ru, b0=b0: _tiles(decode, ru, tb, b0, nbg, dtype), K, dtype)
                     if probe == "deq":
                         ag = ag + jnp.sum(tg, axis=0, keepdims=True).astype(jnp.float32)
                         au = au + jnp.sum(tu, axis=0, keepdims=True).astype(jnp.float32)
@@ -952,7 +953,7 @@ def moe_sweep_down(planes, qtype, nblk, ids, n_active, hk, *, interpret=False, l
                 acc = o_ref[:, lanes]
                 for b0 in range(0, W // SUB, nbg):
                     k0 = b0 * C * SUB
-                    td = _probe_tiles(probe, lambda: _tiles(decode, rows, tb, b0, nbg, dtype), K, dtype)
+                    td = _probe_tiles(probe, lambda b0=b0: _tiles(decode, rows, tb, b0, nbg, dtype), K, dtype)
                     if probe == "deq":
                         acc = acc + jnp.sum(td, axis=0, keepdims=True).astype(jnp.float32)
                         continue

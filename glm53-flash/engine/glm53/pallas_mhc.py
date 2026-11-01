@@ -88,7 +88,7 @@ def _kernel(*refs, hc, D, iters, eps, hc_eps, with_post, prec, with_pre=True, op
         pin = pin_ref[...]
         cin = cin_ref[...]
         once = "once" in opts
-        rnd = (lambda v: v) if once else (lambda v: v.astype(dt).astype(f32))   # noqa: E731
+        rnd = (lambda v: v) if once else (lambda v: v.astype(dt).astype(f32))
         pc = [rnd(_col(pin, k)) for k in range(hc)]
         cc = [rnd(_col(cin, j)) for j in range(hc * hc)]
         olds = [s_ref[:, h * D:(h + 1) * D].astype(f32) for h in range(hc)]
@@ -156,11 +156,11 @@ def _kernel(*refs, hc, D, iters, eps, hc_eps, with_post, prec, with_pre=True, op
         return out
 
     if "recip" in opts:
-        div = lambda a, b: a * b                                                      # noqa: E731
-        inv = lambda v: 1.0 / v                                                       # noqa: E731
+        div = lambda a, b: a * b
+        inv = lambda v: 1.0 / v
     else:
-        div = lambda a, b: a / b                                                      # noqa: E731
-        inv = lambda v: v                                                             # noqa: E731
+        div = lambda a, b: a / b
+        inv = lambda v: v
     cs = [inv(csum(c, j) + hc_eps) for j in range(hc)]
     c = [div(c[i * hc + j], cs[j]) for i in range(hc) for j in range(hc)]
     for _ in range(iters - 1):

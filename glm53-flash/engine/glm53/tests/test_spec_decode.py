@@ -3,22 +3,22 @@ Pallas, Q2_K / Q3_K expert planes for the MTP layer): greedy spec decoding must 
 token for token — with random MTP weights (drafts mostly rejected: the rollback path) and with oracle drafts
 (all accepted: the acceptance path), for k = 1 and k = 2; the MTP cache survives a snapshot round trip."""
 import copy
+
 import numpy as np
 import pytest
 import torch
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
-from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel  # noqa: E402
+import jax.numpy as jnp
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel
 
-from glm53 import iqquant as Q  # noqa: E402
-from glm53 import model as M  # noqa: E402
-from glm53 import planes as PL  # noqa: E402
-from glm53.hf_convert import from_hf_module  # noqa: E402
-from glm53.engine import DeviceSampler  # noqa: E402
-from glm53.resident import ResidentFetch, ResidentLayerEngine, pack_chip_planes  # noqa: E402
-from glm53.tests.test_resident_cpu import random_tables  # noqa: E402
-from glm53.tests.test_tiny_vs_hf import tiny_config  # noqa: E402
+from glm53 import iqquant as Q
+from glm53 import model as M
+from glm53.engine import DeviceSampler
+from glm53.hf_convert import from_hf_module
+from glm53.resident import ResidentFetch, ResidentLayerEngine, pack_chip_planes
+from glm53.tests.test_resident_cpu import random_tables
+from glm53.tests.test_tiny_vs_hf import tiny_config
 
 jax.config.update("jax_default_matmul_precision", "highest")
 N_DEV = 8
@@ -70,7 +70,7 @@ def build(seq_shard, mtp=True):
     if not mtp:
         return eng, cfg, rng
     # the MTP layer: the attention of an MLA+indexer layer, a router, random K-quant experts, random projections
-    mla = [i for i in range(jcfg.n_layers) if jcfg.layer_types[i] != "linear_attention" and jcfg.mlp_types[i] == "sparse"][0]
+    mla = next(i for i in range(jcfg.n_layers) if jcfg.layer_types[i] != "linear_attention" and jcfg.mlp_types[i] == "sparse")
     src = params["layers"][mla]
     tables, kq = kq_tables(rng, E, D, mi)
     mtp = {"ln1": np.ones(D, np.float32), "ln2": np.ones(D, np.float32), "attn": copy.deepcopy(src["attn"]),

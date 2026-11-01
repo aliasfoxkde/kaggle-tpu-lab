@@ -10,9 +10,10 @@ patches of a merge block consecutive), so consecutive groups of 4 form one outpu
 merge blocks in row-major order, i.e. the order of the `<|image|>` tokens in the prompt.
 """
 import math
-import numpy as np
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 PATCH, MERGE, TEMPORAL = 14, 2, 2
 FACTOR = PATCH * MERGE                                                  # 28 pixels per token side
@@ -27,7 +28,7 @@ def smart_resize(height, width, min_tokens=16, max_tokens=8000, factor=FACTOR):
     of 28, holding between min_tokens and max_tokens 28x28 tokens."""
     ppt = TEMPORAL * factor ** 2
     min_px, max_px = min_tokens * ppt, max_tokens * ppt
-    align = lambda v: math.ceil(v / factor) * factor  # noqa: E731
+    align = lambda v: math.ceil(v / factor) * factor
     frames = TEMPORAL
     ah, aw = align(height), align(width)
     if frames * ah * aw < min_px:
@@ -101,8 +102,8 @@ def segment_ids(grids):
 def from_state_dict(get, depth, hidden, dtype=np.float32):
     """`get(name)` -> np array for the HF names without the `model.visual.` prefix -> our params (matrices
     transposed to [in, out]; the two convs flattened to matrices)."""
-    t = lambda n: np.ascontiguousarray(np.asarray(get(n), dtype).T)  # noqa: E731
-    v = lambda n: np.asarray(get(n), dtype)  # noqa: E731
+    t = lambda n: np.ascontiguousarray(np.asarray(get(n), dtype).T)
+    v = lambda n: np.asarray(get(n), dtype)
     blocks = []
     for i in range(depth):
         b = f"blocks.{i}."
@@ -215,6 +216,7 @@ def shard_specs(p):
     MLP and merger intermediate columns over AXIS (down rows), the downsample columns and m_proj rows over AXIS;
     small vectors replicated. ~140 MB per chip in bf16 for the real tower."""
     from jax.sharding import PartitionSpec as P
+
     from glm53.engine import AXIS
     R = P()
     blk = {"n1": R, "n2": R, "qkv": P(None, None, AXIS, None), "qkv_b": P(None, AXIS, None),
@@ -256,16 +258,15 @@ def make_forward_sharded(p_sharded, mesh, dtype=jnp.bfloat16, q_chunk=1024):
     (attention scores chunked over q_chunk queries), its MLP/merger columns; two psums per block. The 24 blocks run
     as a `lax.scan` over the stacked parameters (one block body per executable: TPU executables live in HBM, and
     five unrolled buckets held ~0.4 GB)."""
-    from glm53.engine import AXIS, shard_map
     from jax import lax
     from jax.sharding import PartitionSpec as P
+
+    from glm53.engine import AXIS, shard_map
     R = P()
     n_heads = p_sharded["n_heads"]
     specs = shard_specs(p_sharded)
     del specs["n_heads"]
     pp = {k: v for k, v in p_sharded.items() if k != "n_heads"}
-    n_dev = mesh.devices.size
-    Hl = n_heads // n_dev
     cache = {}
 
     def build(N):

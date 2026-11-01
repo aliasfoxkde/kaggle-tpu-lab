@@ -1,0 +1,119 @@
+[project]
+name = "kaggle-tpu-lab"
+version = "0.1.0"
+description = "Kaggle TPU inference lab"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 88
+exclude = [".git", "__pycache__", "build", "dist", ".scratch"]
+
+[tool.ruff.lint]
+# Strict-ish set scoped to what the codebase can actually satisfy today.
+# Per-rule ignores carry rationale; remove an ignore only after the code
+# changes, never silently.
+select = [
+    "E", "F", "W",      # pycodestyle / pyflakes basics
+    "I",                # import sorting
+    "B",                # bugbear
+    "C4", "SIM", "RET", # modernization / simplification
+    "PT",               # pytest style
+    "RUF",              # ruff-specific
+]
+ignore = [
+    # E501: the engine is dense numeric/JAX code; line-wrapping shard-map
+    # blocks hurts readability more than 88 columns helps. Format is enforced
+    # by `ruff format` instead.
+    "E501",
+    # N803/N806/N812/N802: math identifiers (N, D, X, W, b) are domain
+    # conventions in the kernel/engine code; renaming would fight the papers.
+    "N803", "N806", "N812", "N802",
+    # SLF001: tests intentionally poke private engine internals.
+    "SLF001",
+    # ARG001/ARG005: JAX jit/shard_map signatures force unused params/args.
+    "ARG001", "ARG005",
+    # PTH: os.path is used consistently; switching to pathlib is churn.
+    "PTH",
+    # E701/E702: compact multi-statement lines (init + loop invariants) are a
+    # deliberate density convention in the kernel code; reformatting ~160
+    # sites risks churn without behavior benefit.
+    "E701", "E702",
+    # E731/E741: short lambdas in JAX programs and math names (l, I) match
+    # the surrounding numerics style.
+    "E731", "E741",
+    # RUF005: `[a] + b` list concatenation is idiomatic here; `[*a, *b]`
+    # rewrite of ~68 sites is churn.
+    "RUF005",
+    # B905: zip() strictness is guaranteed by construction in the engine
+    # (shapes derived from the same config); adding strict=True everywhere
+    # adds noise. Revisit if a real zip-length bug ever appears.
+    "B905",
+    # RUF059: `for _, x in ...` unpacking kept for tuple-shape clarity.
+    "RUF059",
+    # PT018: composite asserts in tests read as one logical property.
+    "PT018",
+    # SIM115: module-lifetime files (logs, shard readers) intentionally
+    # outlive the function that opens them.
+    "SIM115",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: composite asserts and parametrize-style deviations are fine there;
+# E402 is required by the `pytest.importorskip("jax")` gate pattern.
+"glm53-flash/engine/glm53/tests/*" = ["PT018", "PT006", "RET504", "E402"]
+# Engine/kernel modules that must install runtime pins or extract an embedded
+# package before importing jax/numpy; the imports after the setup block are
+# the point, not an oversight.
+"glm53-flash/engine/glm53/iqquant.py" = ["E402"]
+"glm53-flash/engine/glm53/resident.py" = ["E402"]
+"glm53-flash/kernel/serve_glm53.py" = ["E402"]
+# harness_serve.py exec()s the serve kernel inside its own namespace, so
+# numpy/engine imports must follow the sys.path/XLA setup; it is a standalone
+# smoke script, not a pytest module, so PT rules do not apply.
+"glm53-flash/tools/harness_serve.py" = ["E402", "PT017"]
+# bench_endpoint.py defines small HTTP helper functions whose names ruff's
+# PT028 heuristic mistakes for tests (default-arg dimensions w/h); these are
+# plain functions, not test cases. RET503: the CLI main() intentionally
+# returns early on --image/--skip-long.
+"glm53-flash/tools/bench_endpoint.py" = ["PT028", "RET503"]
+# serve scripts embed a user-facing self-test block at module scope; the
+# pytest-style helpers there are helpers, not collected tests.
+"qwen38-27b/kernel/serve_qwen38.py" = ["PT028"]
+# Notebooks are prose + code mixes; typographic characters in narrative
+# strings are deliberate.
+"glm53-flash/notebook/*" = ["RUF001"]
+"modal/notebook/*" = ["RUF001"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_configs = true
+# Baseline: relaxed-but-checked. The JAX engine (51 files, ~3k strict errors)
+# depends on untyped third-party stubs (jax/pytype stubs, flatbuffers), so a
+# blanket `strict = true` buries real errors under annotation noise. These
+# flags keep type checking (untyped defs ARE checked) while tolerating the
+# missing annotations.
+ignore_missing_imports = true
+allow_untyped_defs = true
+allow_untyped_calls = true
+allow_incomplete_defs = true
+allow_untyped_globals = true
+no_strict_optional = true
+check_untyped_defs = true
+
+# Known JAX-fundamentals false positives (Thread.join/start return values,
+# ndarray-only attribute protocols) — fixed opportunistically, not blocked on.
+disable_error_code = ["func-returns-value", "no-any-return", "type-arg"]
+
+# Note: strict per-module overrides were evaluated and dropped — mypy
+# resolves path-based checks (tools/ has no __init__.py) to top-level module
+# names, making overrides fragile, and the strict errors there are purely
+# missing annotations. Re-introduce once the tooling is annotated.
+
+[tool.pytest.ini_options]
+addopts = "-q --cov=glm53-flash --cov-report=term-missing"
+testpaths = ["glm53-flash/engine/glm53/tests", "glm53-flash/kernel", "qwen38-27b/kernel"]

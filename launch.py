@@ -18,7 +18,6 @@ import json
 import os
 import re
 import secrets
-import shutil
 import subprocess
 import sys
 import tarfile
@@ -38,12 +37,12 @@ def save_state(state):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.chmod(tmp, 0o600)
+    tmp.chmod(0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(state, f)
         f.write("\n")
-    os.replace(tmp, STATE_FILE)
-    os.chmod(STATE_FILE, 0o600)
+    tmp.replace(STATE_FILE)
+    STATE_FILE.chmod(0o600)
 
 WEIGHTS_DATASET = "rahim3/qwen3-8-27b-bf16"
 ENV_DATASET = "rahim3/qwen38-tpu-env-v5e8"   # XLA compile cache + cloudflared + manifest
@@ -88,8 +87,7 @@ PHASE_TEXT = {
 
 def kaggle(*args, capture=True):
     cmd = [sys.executable, "-m", "kaggle", *args]
-    r = subprocess.run(cmd, capture_output=capture, text=True)
-    return r
+    return subprocess.run(cmd, check=False, capture_output=capture, text=True)
 
 
 def say(msg):
@@ -187,18 +185,18 @@ def cmd_serve(args):
         }
         if args.serve_dataset:
             cfg["serve_dataset"] = args.serve_dataset
-            datasets = GLM_DATASETS[:2] + [args.serve_dataset]           # experts + the serve dataset; no FP8 mounts
+            datasets = [*GLM_DATASETS[:2], args.serve_dataset]           # experts + the serve dataset; no FP8 mounts
         else:
             datasets = GLM_DATASETS
 
     src = model["kernel"].read_text()
     src, n = re.subn(r"^CFG = None  # __LAUNCHER_CONFIG__.*$",
-                     f"CFG = {cfg!r}", src, count=1, flags=re.M)
+                     f"CFG = {cfg!r}", src, count=1, flags=re.MULTILINE)
     if n != 1:
         sys.exit(f"{model['kernel']} is missing the __LAUNCHER_CONFIG__ line")
     if model.get("engine"):
         src, n = re.subn(r'^ENGINE_B64 = ""  # __ENGINE__.*$', f'ENGINE_B64 = "{engine_b64(model["engine"])}"',
-                         src, count=1, flags=re.M)
+                         src, count=1, flags=re.MULTILINE)
         if n != 1:
             sys.exit(f"{model['kernel']} is missing the __ENGINE__ line")
 
@@ -330,7 +328,7 @@ See the model folder's README for hooking this into Claude Code, Codex CLI, open
             "kernel page on kaggle.com.")
     else:
         text = PHASE_TEXT.get(phase)
-        say(text if text else f"{phase} {json.dumps({k: v for k, v in ev.items() if k != 'phase'})}")
+        say(text or f"{phase} {json.dumps({k: v for k, v in ev.items() if k != 'phase'})}")
 
 
 def watch(kernel, topic, api_key=None):
@@ -368,15 +366,17 @@ def watch(kernel, topic, api_key=None):
 
 def cmd_build_env(args):
     """Maintainer flow. When the kernel finishes:
-        kaggle kernels output <user>/<slug> -p bundle_out
-        then create/version the dataset from bundle_out/bundle (see README)."""
+
+    kaggle kernels output <user>/<slug> -p bundle_out
+    then create/version the dataset from bundle_out/bundle (see README).
+    """
     check_auth()
     user = kaggle_username(args.user)
     topic = "ktl-" + uuid.uuid4().hex[:20]
     cfg = {"build_bundle": True, "ntfy_topic": topic, "weights_dataset": args.weights_dataset}
     src = KERNEL_SRC.read_text()
     src, n = re.subn(r"^CFG = None  # __LAUNCHER_CONFIG__.*$",
-                     f"CFG = {cfg!r}", src, count=1, flags=re.M)
+                     f"CFG = {cfg!r}", src, count=1, flags=re.MULTILINE)
     if n != 1:
         sys.exit("qwen38-27b/kernel/serve_qwen38.py is missing the __LAUNCHER_CONFIG__ line")
     with tempfile.TemporaryDirectory() as td:
@@ -423,7 +423,7 @@ def cmd_stop(args):
     st = load_state()
     say(f"Deleting kernel {st['kernel']} (terminates the TPU session)...")
     p = subprocess.run([sys.executable, "-m", "kaggle", "kernels", "delete",
-                        st["kernel"]], input="yes\n", capture_output=True, text=True)
+                        st["kernel"]], check=False, input="yes\n", capture_output=True, text=True)
     say((p.stdout + p.stderr).strip() or "done")
 
 

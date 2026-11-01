@@ -7,10 +7,17 @@ max_streams + max_queue requests are in flight).
 
   python3 tools/check_features.py URL --key KEY [--queue]
 """
-import argparse, json, os, sys, threading, time, urllib.error, urllib.request
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bench_endpoint import post, health  # noqa: E402
+from bench_endpoint import health, post
 
 TOOLS_A = [{"name": "read_file", "description": "Read a text file from disk.",
             "input_schema": {"type": "object", "properties": {"path": {"type": "string", "description": "file path"}},

@@ -1,5 +1,9 @@
-import json, os, numpy as np
-from gguf import GGUFWriter, GGMLQuantizationType as T
+import json
+
+import numpy as np
+from gguf import GGMLQuantizationType as T
+from gguf import GGUFWriter
+
 from glm53 import gguf_reader, iqquant
 
 

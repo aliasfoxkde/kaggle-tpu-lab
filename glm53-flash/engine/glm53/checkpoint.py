@@ -9,7 +9,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from functools import lru_cache
+import typing
+from functools import cache
 
 import numpy as np
 
@@ -17,7 +18,7 @@ PREFIX = "model.language_model."
 BLOCK = 128
 
 
-@lru_cache(maxsize=None)
+@cache
 def weight_map(model_dir: str) -> dict[str, str]:
     """model_dir may be one directory or several joined by ':' (e.g. the 4 Kaggle dataset mounts); the index is
     taken from the first dir that has it and each shard is resolved to whichever dir contains it."""
@@ -64,7 +65,7 @@ class ShardReader:
             fd = os.open(resolve_shard(self.model_dir, fname), os.O_RDONLY)
             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
             os.close(fd)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     def has(self, name: str) -> bool:
@@ -261,8 +262,8 @@ class RawShardReader(ShardReader):
     shard counts toward the process RSS (and the Kaggle cgroup), which is what pushed the 2026-09-06 full build over
     the memory guard and forced int4 for half the layers. Here only our own arrays occupy memory."""
 
-    _DT = {"F32": np.float32, "F16": np.float16, "BF16": "bf16", "F8_E4M3": "fp8", "I8": np.int8, "U8": np.uint8,
-           "I32": np.int32, "I64": np.int64}
+    _DT: typing.ClassVar[dict] = {"F32": np.float32, "F16": np.float16, "BF16": "bf16", "F8_E4M3": "fp8",
+                                  "I8": np.int8, "U8": np.uint8, "I32": np.int32, "I64": np.int64}
 
     def _header(self, fname):
         if fname not in self._open:
@@ -286,7 +287,7 @@ class RawShardReader(ShardReader):
             while off < len(buf):
                 k = os.preadv(fd, [view[off:]], base + b0 + off)
                 if k <= 0:
-                    raise IOError(f"short read on {name}")
+                    raise OSError(f"short read on {name}")
                 off += k
         finally:
             os.close(fd)
@@ -323,7 +324,7 @@ class RawShardReader(ShardReader):
             fd = os.open(resolve_shard(self.model_dir, fname), os.O_RDONLY)
             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
             os.close(fd)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
 

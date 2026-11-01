@@ -13,13 +13,13 @@ proposes blocks of tokens that the big model verifies in one step. What you get:
 
 | What | Measured (TPU v5e-8) |
 |---|---|
-| Decode, one stream | **about 165 tok/s** with speculative decoding (code 170, prose 155, math 195; 75 without the draft model), at any context length up to 262k |
-| Decode, two / three streams | **about 155 / 170 tok/s aggregate** with speculative decoding (115 / 150 without) |
+| Decode, one stream | **about 165 tok/s** with speculative decoding (code 170, prose 155, math 195; 79 without the draft model), at any context length up to 262k |
+| Decode, two / three streams | **about 155 / 170 tok/s aggregate** with speculative decoding (114 / 147 without) |
 | Prefill | **1,700–1,950 tok/s**; a 27k-token prompt in 14 s, 260k in 2.5 min |
 | Context | the model's native **262,144 tokens** (needle test passes at 27k, 64k, 131k and 260k) |
 | Agent sessions | a 27k-token conversation resumes in about a second after an interleaved call |
 | Images | supported in both APIs (screenshots from a coding agent, for example) |
-| Time to live endpoint | **5 min 36 s** measured with the serve dataset (runtime, weights and draft model 4.6 min, warm-up 52 s); the weights take up to about 10 min when Kaggle's dataset mount is cold, so expect 6–13 min. ~40 min when every program is traced and compiled (warm-up 27 min) |
+| Time to live endpoint | **5 min 36 s** measured with the serve dataset (runtime, weights and draft model 4.6 min, warm-up 52 s); the weights take up to about 10 min when Kaggle's dataset mount is cold, so expect 6–13 min. ~40 min when every program is traced and compiled (warm-up 28 min) |
 
 The output is that of a 3-bit-expert quantization, not the bf16 model. Agent tasks, long-context
 retrieval and tool calling behave as expected in our use; a formal comparison against the full
@@ -141,6 +141,22 @@ tools/check_features.py             stop sequences, tool_choice, thinking budget
 tools/harness_serve.py              the whole kernel on a tiny CPU model (40 s), for changes to the serving code
 ```
 
+The engine's ~100 pytest tests run on CPU only (8 virtual JAX devices; `jax` is the
+only real dependency):
+
+```bash
+pip install jax pytest
+cd engine && python -m pytest glm53/tests
+```
+
+Against a live endpoint (URL from the READY banner, key printed next to it):
+
+```bash
+python tools/bench_endpoint.py <url> --key <key>        # latency, tok/s, prefix-cache hits
+python tools/bench_concurrent.py <url> --key <key> --streams 3
+python tools/check_features.py <url> --key <key>        # API feature conformance
+python tools/harness_serve.py                           # offline: whole kernel on a tiny CPU model
+
 ## Good to know
 
 - **Three concurrent streams** is the HBM limit at the full context; a fourth request waits for a
@@ -152,7 +168,7 @@ tools/harness_serve.py              the whole kernel on a tiny CPU model (40 s),
   comes from Hugging Face in about a minute. The warm-up takes under a minute: the serve dataset holds
   every program twice, as an exported program (`exported/`, the lowered form JAX would otherwise
   rebuild by tracing the Python) and as a compiled executable (`jax_cache/`), so nothing is traced or
-  compiled. Without the matching dataset every program is traced, exported and compiled, ~27 minutes
+  compiled. Without the matching dataset every program is traced, exported and compiled, ~28 minutes
   (the three speculative-decoding program sets take 6–8 minutes each), and the run leaves `exported/`
   and `jax_cache/` in `/kaggle/working`, which is how the serve dataset is made.
 - **Sessions.** Kaggle stops a TPU session after nine hours; the kernel shuts itself down after
@@ -188,7 +204,7 @@ minute with a plain message:
 - **"datasets not attached"**: Add Input in the right sidebar and attach the names it lists (the
   two expert datasets and the serve dataset).
 - **The draft model could not be fetched** (Hugging Face unreachable): the log says so and the server
-  starts without speculative decoding (one stream ~75 tok/s). Set `dflash` to an attached dataset that
+  starts without speculative decoding (one stream ~79 tok/s). Set `dflash` to an attached dataset that
   holds the drafter's `config.json` and `model.safetensors` to avoid the download.
 - **The tunnel gives no URL**: the kernel tries three times. If it still fails, the server is
   running but only reachable inside the kernel; start the session again. A fresh URL can take a

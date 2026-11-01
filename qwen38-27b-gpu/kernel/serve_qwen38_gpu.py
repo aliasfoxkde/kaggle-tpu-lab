@@ -29,6 +29,7 @@ Steps (each announced in the log):
                   on the exit path, harvest the torch.compile cache
 """
 import collections
+import contextlib
 import glob
 import json
 import os
@@ -685,10 +686,8 @@ def harvest():
 
 def shutdown(server):
     server.terminate()
-    try:
+    with contextlib.suppress(Exception):
         server.wait(timeout=120)
-    except Exception:
-        pass
     harvest()
     sys.exit(0)
 

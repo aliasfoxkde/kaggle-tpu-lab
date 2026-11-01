@@ -37,12 +37,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from glm53 import aot
 from glm53 import model as M
 from glm53 import quant8 as Q8
 from glm53.engine import AXIS, R, shard_map
+
+_VOCAB_SPEC = P(AXIS, None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,7 +80,7 @@ class DCfg:
         return y if self.tp_axis is None else lax.all_gather(y, self.tp_axis, axis=-1, tiled=True)
 
     @classmethod
-    def from_hf(cls, c: dict, dtype=jnp.float32) -> "DCfg":
+    def from_hf(cls, c: dict, dtype=jnp.float32) -> DCfg:
         """`c` = the drafter's config.json (a Qwen3 config with a `dflash_config` dict)."""
         dc = c.get("dflash_config", {})
 
@@ -296,7 +299,7 @@ def vocab_rows(table_local, ids, cfg: DCfg):
 def logits_local(lm_head_local, h, cfg: DCfg):
     """This chip's vocab columns of the draft logits (the target's lm_head, bf16 or int8 q8), f32, with the
     drafter's output multiplier and soft cap."""
-    from glm53.engine import dot_t                     # the lm_head is stored [V, D] (engine.lm_head_t)
+    from glm53.engine import dot_t  # the lm_head is stored [V, D] (engine.lm_head_t)
     if Q8.is_q8(lm_head_local):
         z = dot_t(h, lm_head_local["q"].astype(h.dtype)) * lm_head_local["s"].reshape(-1)
     else:
@@ -381,7 +384,7 @@ class Drafter:
     codebooks stay in their dtype. Ring buffers are donated to `ingest` / `draft` (never reuse a ring passed in).
     temp_scale: a sampled draft draws its path at temp_scale x the given temperature (q is that distribution)."""
 
-    def __init__(self, cfg: DCfg, params, mesh, embed_spec=P(AXIS, None), lm_head_spec=P(AXIS, None), int8=False,
+    def __init__(self, cfg: DCfg, params, mesh, embed_spec=_VOCAB_SPEC, lm_head_spec=_VOCAB_SPEC, int8=False,
                  temp_scale=1.0):
         assert cfg.kv_heads % mesh.size == 0 and cfg.vocab % mesh.size == 0, (cfg.kv_heads, cfg.vocab, mesh.size)
         self.cfg, self.mesh = cfg, mesh

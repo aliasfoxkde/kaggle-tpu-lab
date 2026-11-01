@@ -6,14 +6,14 @@ Layouts (bytes): IQ2_S 82 = d2|qs32|signs32|qh8|scales8 · IQ3_S 110 = d2|qs64|q
 IQ4_XS 136 = d2|sh2|sl4|qs128 · IQ2_XS 74 = d2|qs64(u16)|scales8 · IQ3_XXS 98 = d2|qs64|scales32(u32).
 The grid lookup is `jnp.take(grid, idx)`; `LOOKUP` can be swapped for a faster TPU implementation.
 """
-import os
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 QK_K = 256
 BLOCK_BYTES = {"IQ2_S": 82, "IQ3_S": 110, "IQ4_XS": 136, "IQ2_XS": 74, "IQ3_XXS": 98, "Q2_K": 84, "Q3_K": 110}
 from glm53 import iq_grids_data as _gd
+
 _g = _gd.load()
 GRIDS = {k: np.asarray(_g[k]) for k in ("IQ2_S", "IQ3_S", "IQ2_XS", "IQ3_XXS")}   # int8 [entries, 8 or 4]
 KSIGNS = np.asarray(_g["ksigns"])                                                  # uint8 [128]
@@ -77,7 +77,7 @@ class _TreeLUT:
         code = jnp.zeros(idx.shape, jnp.uint32)
         for b in range(self.nbits):
             nodes = [jnp.uint32(int(x)) for x in self.words[b]]
-            for k, bit in enumerate(bits):                                 # select tree over word index bits
+            for _, bit in enumerate(bits):                                 # select tree over word index bits
                 nodes = [jnp.where(bit, nodes[2 * j + 1], nodes[2 * j]) for j in range(len(nodes) // 2)]
             word = nodes[0] if len(nodes) == 1 else jnp.broadcast_to(jnp.uint32(int(self.words[b][0])), idx.shape)
             code = code | (((word >> sh) & 1) << b)

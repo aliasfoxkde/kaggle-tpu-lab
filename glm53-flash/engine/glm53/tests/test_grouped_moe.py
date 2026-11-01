@@ -9,11 +9,11 @@ import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
+import jax.numpy as jnp
 
-from glm53 import pallas_moe as K  # noqa: E402
-from glm53.resident import ResidentFetch  # noqa: E402
-from glm53.tests.test_resident_cpu import N_DEV, random_tables  # noqa: E402
+from glm53 import pallas_moe as K
+from glm53.resident import ResidentFetch
+from glm53.tests.test_resident_cpu import N_DEV, random_tables
 
 
 def routing(rng, T, E, k, shared):

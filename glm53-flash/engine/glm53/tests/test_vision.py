@@ -5,11 +5,11 @@ import pytest
 import torch
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
-from transformers.models.glm5_next.configuration_glm5_next import Glm5NextVisionConfig  # noqa: E402
-from transformers.models.glm5_next.modeling_glm5_next import Glm5NextVisionModel  # noqa: E402
+import jax.numpy as jnp
+from transformers.models.glm5_next.configuration_glm5_next import Glm5NextVisionConfig
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextVisionModel
 
-from glm53 import vision as V  # noqa: E402
+from glm53 import vision as V
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
@@ -20,7 +20,7 @@ def tiny(num_heads=4):
                                projection_intermediate_size=128)
     m = Glm5NextVisionModel(cfg).float().eval()
     with torch.no_grad():                                   # non-trivial norms / biases
-        for n, p in m.named_parameters():
+        for _, p in m.named_parameters():
             if p.ndim == 1:
                 p.add_(torch.randn_like(p) * 0.2)
     return m, V.from_hf_module(m)
@@ -64,8 +64,10 @@ def test_preprocess_layout():
 
 def test_smart_resize_matches_hf():
     try:
-        from transformers.models.glm5_next.image_processing_glm5_next import smart_resize
-    except Exception:  # noqa: BLE001
+        from transformers.models.glm5_next.image_processing_glm5_next import (
+            smart_resize,
+        )
+    except Exception:
         pytest.skip("HF image processor needs torchvision")
     for h, w in [(200, 300), (1080, 1920), (20, 20), (4000, 3000), (28, 5000)]:
         assert V.smart_resize(h, w) == smart_resize(2, h, w), (h, w)
@@ -75,6 +77,7 @@ def test_smart_resize_matches_hf():
 def test_sharded_forward_matches(monkeypatch):
     """The 8-way TP forward (heads / MLP columns sharded, q-chunked attention) == the plain forward, f32."""
     from jax.sharding import Mesh
+
     from glm53.engine import AXIS
     m, p = tiny(num_heads=8)                                   # heads must divide by the 8 devices (real: 16)
     mesh = Mesh(np.array(jax.devices()), (AXIS,))

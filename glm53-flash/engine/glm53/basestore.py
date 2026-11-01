@@ -10,8 +10,8 @@ import json
 import os
 import shutil
 
-import numpy as np
 import jax
+import numpy as np
 
 EXPERT_KEYS = ("gate_q", "up_q", "down_q")                     # resident expert tables (glm53.resident), never stored
 HF_FILES = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",

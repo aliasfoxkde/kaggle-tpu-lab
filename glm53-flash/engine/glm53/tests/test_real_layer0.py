@@ -11,10 +11,10 @@ import pytest
 import torch
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
+import jax.numpy as jnp
 
-from glm53 import checkpoint as C  # noqa: E402
-from glm53 import model as M  # noqa: E402
+from glm53 import checkpoint as C
+from glm53 import model as M
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
@@ -35,7 +35,9 @@ pytestmark = pytest.mark.skipif(MODEL_DIR is None, reason="real shard 2 not down
 
 
 def hf_layer0(text_cfg, r: C.ShardReader):
-    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
+    from transformers.models.glm5_next.modeling_glm5_next import (
+        Glm5NextTextDecoderLayer,
+    )
     layer = Glm5NextTextDecoderLayer(text_cfg, 0).float().eval()
     pfx = C.PREFIX + "layers.0."
     sd = {}

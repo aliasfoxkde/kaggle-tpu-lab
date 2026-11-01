@@ -4,9 +4,8 @@ Frees ~1.1 GB of HBM per chip on v5e-8 (18 GB bf16 -> 9 GB). Routers stay fp32; 
 
 A quantized leaf is the dict {"q": int8 [in, out], "s": scale} with the scale laid out so it shards like the weight:
 weights sharded on axis 0 get per-row scales [in, 1]; everything else per-column scales [1, out]."""
-import numpy as np
-import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import PartitionSpec as P
 
 MIN_SIZE = 1 << 20

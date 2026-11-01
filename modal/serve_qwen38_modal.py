@@ -51,16 +51,15 @@ image = (
             "TRITON_CACHE_DIR": "/jitcache/triton",
             "TORCHINDUCTOR_CACHE_DIR": "/jitcache/torchinductor",
             "BURST_WEIGHTS_DIR": MODEL_DIR,
-        }
+        },
     )
 )
 
 with image.imports():
-    import subprocess
-    import time
+    pass
 
 volume = modal.Volume.from_name(
-    os.environ.get("BURST_WEIGHTS_VOLUME", "burst-qwen38-27b-gptq-int4")
+    os.environ.get("BURST_WEIGHTS_VOLUME", "burst-qwen38-27b-gptq-int4"),
 )
 jit_cache = modal.Volume.from_name("burst-qwen38-jit-cache", create_if_missing=True)
 

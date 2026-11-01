@@ -1,7 +1,7 @@
 """RawShardReader (pread, no mmap) vs safetensors safe_open on a synthetic shard with fp8/bf16/f32 tensors."""
-import json, os
+import json
+
 import numpy as np
-import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -17,7 +17,7 @@ def test_raw_reader_matches_safetensors(tmp_path):
                "model.language_model.layers.0.self_attn.q_proj.weight": torch.randn(64, 128).to(torch.bfloat16),
                "model.language_model.layers.0.self_attn.A_log": torch.randn(8)}
     save_file(tensors, str(tmp_path / "model-00001-of-00001.safetensors"))
-    json.dump({"weight_map": {k: "model-00001-of-00001.safetensors" for k in tensors}},
+    json.dump({"weight_map": dict.fromkeys(tensors, "model-00001-of-00001.safetensors")},
               open(tmp_path / "model.safetensors.index.json", "w"))
     C.weight_map.cache_clear()
     ref = C.ShardReader(str(tmp_path))

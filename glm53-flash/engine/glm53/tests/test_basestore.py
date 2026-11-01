@@ -6,15 +6,15 @@ import pytest
 import torch
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
-from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel  # noqa: E402
+import jax.numpy as jnp
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel
 
-from glm53 import basestore as BS  # noqa: E402
-from glm53 import model as M  # noqa: E402
-from glm53.hf_convert import from_hf_module  # noqa: E402
-from glm53.resident import ResidentFetch, ResidentLayerEngine  # noqa: E402
-from glm53.tests.test_resident_cpu import random_tables  # noqa: E402
-from glm53.tests.test_tiny_vs_hf import tiny_config  # noqa: E402
+from glm53 import basestore as BS
+from glm53 import model as M
+from glm53.hf_convert import from_hf_module
+from glm53.resident import ResidentFetch, ResidentLayerEngine
+from glm53.tests.test_resident_cpu import random_tables
+from glm53.tests.test_tiny_vs_hf import tiny_config
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
@@ -55,13 +55,13 @@ def test_engine_rebuilt_from_store(tmp_path):
         else:
             packed["layers"].append(L)
     fetch = ResidentFetch(qtypes, D, mi // 8, out_dtype=jnp.float32, gather_max_rows=64, chunk=4, interpret=True)
-    kw = dict(max_len=128, layers_per_program=3, prefill_piece=32, seq_shard=True)
+    kw = {"max_len": 128, "layers_per_program": 3, "prefill_piece": 32, "seq_shard": True}
     eng1 = ResidentLayerEngine(jcfg, packed, fetch, int8_nonexpert="all", **kw)
     # dump the engine's own parameters (device arrays, int8 nodes included; expert tables skipped)
     BS.dump(str(tmp_path), eng1.params, vision=None, hf_dir=None, meta={"test": True}, log=lambda *a: None)
     store = BS.load(str(tmp_path))
     assert store["manifest"]["n_layers"] == jcfg.n_layers and store["manifest"]["test"] is True
-    for i, L in enumerate(store["layers"]):
+    for _, L in enumerate(store["layers"]):
         assert not any(k in L["mlp"] for k in BS.EXPERT_KEYS)
     params2 = {**store["top"], "layers": [{**L, "mlp": {**L["mlp"], **tables_of.get(i, {})}} for i, L in enumerate(store["layers"])]}
     eng2 = ResidentLayerEngine(jcfg, params2, fetch, int8_nonexpert=False, **kw)

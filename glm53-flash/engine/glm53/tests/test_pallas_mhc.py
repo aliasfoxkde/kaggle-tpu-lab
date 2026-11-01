@@ -5,10 +5,10 @@ import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
+import jax.numpy as jnp
 
-from glm53 import model as M  # noqa: E402
-from glm53 import pallas_mhc as PM  # noqa: E402
+from glm53 import model as M
+from glm53 import pallas_mhc as PM
 
 
 @dataclasses.dataclass(frozen=True)
@@ -108,6 +108,7 @@ def test_model_forward_switch(prec, monkeypatch):
     "f32" to f32 rounding; "bf16" rounds the two small contractions' operands to bf16)."""
     torch = pytest.importorskip("torch")
     from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel
+
     from glm53.hf_convert import from_hf_module
     from glm53.tests.test_tiny_vs_hf import tiny_config
     torch.manual_seed(0)

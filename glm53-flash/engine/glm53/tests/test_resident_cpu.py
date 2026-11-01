@@ -5,15 +5,15 @@ import pytest
 import torch
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
-from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel  # noqa: E402
+import jax.numpy as jnp
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel
 
-from glm53 import iqquant as Q  # noqa: E402
-from glm53 import model as M  # noqa: E402
-from glm53.engine import Engine  # noqa: E402
-from glm53.hf_convert import from_hf_module  # noqa: E402
-from glm53.resident import ResidentFetch, hbm_bytes, pack_chip_planes  # noqa: E402
-from glm53.tests.test_tiny_vs_hf import tiny_config  # noqa: E402
+from glm53 import iqquant as Q
+from glm53 import model as M
+from glm53.engine import Engine
+from glm53.hf_convert import from_hf_module
+from glm53.resident import ResidentFetch, hbm_bytes, pack_chip_planes
+from glm53.tests.test_tiny_vs_hf import tiny_config
 
 jax.config.update("jax_default_matmul_precision", "highest")
 N_DEV = 8
@@ -141,8 +141,8 @@ def test_layer_engine_matches_single_program():
 
 def test_int8_nonexpert_close():
     """int8 per-channel non-expert weights: logits close to bf16/fp32 weights and same argmax."""
-    from glm53.resident import ResidentLayerEngine
     from glm53 import quant8 as Q8
+    from glm53.resident import ResidentLayerEngine
     torch.manual_seed(0)
     cfg = tiny_config(index_topk=16)
     cfg.hidden_size = 256; cfg.moe_intermediate_size = 2048; cfg.intermediate_size = 4096   # dense MLP big enough to quantize
@@ -265,8 +265,8 @@ def test_lm_head_t_forms():
     """`engine.lm_head_t` stores the lm_head [V, D] with [V, 1] scales from every form it is given: the checkpoint's
     [D, V] array, the base store's pre-quantized {q [D, V], s [1, V]} (the TPU kernel's path: a build failed on the
     unconverted scales, 2026-10-05), and an already converted dict (idempotent)."""
-    from glm53.engine import lm_head_t
     from glm53 import quant8 as Q8
+    from glm53.engine import lm_head_t
     D, V = 16, 64
     w = np.random.default_rng(0).standard_normal((D, V)).astype(np.float32)
     assert lm_head_t(w).shape == (V, D)

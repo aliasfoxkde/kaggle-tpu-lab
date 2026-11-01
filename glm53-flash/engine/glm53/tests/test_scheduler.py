@@ -3,16 +3,15 @@ times run batched, a follow-up turn extends a finished context kept on the chips
 LRU context into the host snapshot store and a later turn resumes it, cancellation stops a stream — every request's
 tokens equal its own single-stream greedy generation."""
 import threading
-import time
 
 import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
+import jax.numpy as jnp
 
-from glm53.scheduler import Request, Scheduler, SnapStore  # noqa: E402
-from glm53.tests.test_batched_rows import build_engine  # noqa: E402
+from glm53.scheduler import Request, Scheduler, SnapStore
+from glm53.tests.test_batched_rows import build_engine
 
 STOP = 7                                                  # a token id that ends a generation
 
@@ -65,7 +64,7 @@ def test_batched_requests_and_context_reuse():
         # only 2 cache sets fit: admitting r4 parked the LRU live context (r2's or r3's) into the host store
         assert state.get("snap_parks", 0) >= 1
         # a turn extending a PARKED context resumes it from the store
-        parked = list(sched.snaps.entries.values())[0]
+        parked = next(iter(sched.snaps.entries.values()))
         for r, p in ((r2, p2), (r3, p3)):
             if list(parked["ids"]) == p + r.out[:-1]:
                 p5 = p + r.out

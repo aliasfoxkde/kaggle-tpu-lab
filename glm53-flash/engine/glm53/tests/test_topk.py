@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
-from jax import lax  # noqa: E402
+import jax.numpy as jnp
+from jax import lax
 
-from glm53 import model as M  # noqa: E402
+from glm53 import model as M
 
 
 @pytest.mark.parametrize("shape,k", [((1, 4, 8192), 128), ((1, 1, 8192), 512), ((1, 3, 19360), 16),
@@ -42,7 +42,9 @@ def test_indexer_select_buckets(Tq):
     """The bucketed indexer selection (`Cfg.select_buckets`: the local top-k over the first 512 / 2048 / all local
     pools, chosen from the block's positions) returns exactly the unbucketed selection on the sharded layout (8 CPU
     devices), at positions in every bucket, with random and tied scores."""
-    from jax.sharding import Mesh, PartitionSpec as P
+    from jax.sharding import Mesh
+    from jax.sharding import PartitionSpec as P
+
     from glm53.engine import AXIS, shard_map
     assert jax.device_count() == 8, jax.devices()
     n, kp, P_local = 8, 4, 4096

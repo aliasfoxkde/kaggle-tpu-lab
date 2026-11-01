@@ -22,7 +22,28 @@ A cold run leaves `jax_cache/` (everything it compiled), `exported/` (every prog
 FP8 checkpoint, `base/` (the non-expert weights, vision tower and tokenizer, ~11 GB) in /kaggle/working, so its output
 can be turned into the serve dataset ("New dataset" from the kernel output) that later runs attach.
 """
-import base64, collections, glob, hashlib, hmac, io, ipaddress, json, os, queue, re, secrets, shutil, socket, subprocess, sys, tarfile, threading, time, urllib.parse, urllib.request, uuid
+import base64
+import collections
+import glob
+import hashlib
+import hmac
+import io
+import ipaddress
+import json
+import os
+import queue
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -154,7 +175,7 @@ def publish(phase, **extra):
         body = {"topic": CFG["ntfy_topic"], "title": f"kaggle-tpu-lab {phase}", "message": json.dumps({"phase": phase, **extra})}
         req = urllib.request.Request("https://ntfy.sh", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log(f"(ntfy publish failed: {e})")
 
 
@@ -216,7 +237,7 @@ def preflight():
         fail("datasets", f"datasets not attached: {missing}. In the right sidebar, Add Input -> search each name -> attach, then run again.")
     try:
         urllib.request.urlopen("https://pypi.org/simple/pip/", timeout=20).read(1)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         fail("no-internet", f"no Internet from this session ({str(e)[:120]}): Session options -> Internet ON (a phone-verified "
                             "Kaggle account is needed for that), then run again. The pip packages and the tunnel need it.")
     code = ("import jax\n"
@@ -228,14 +249,14 @@ def preflight():
     try:
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=180)
         m = re.search(r"TPU_CHECK (\d+) (\S+)(.*)", (r.stdout or "") + (r.stderr or ""))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log(f"   (TPU check skipped: {e})"); return
     if m is None:
         log("   (TPU check inconclusive: the image's jax did not answer; continuing)"); return
     n, platform, rest = int(m.group(1)), m.group(2), m.group(3).strip()
     if n == 8 and platform == "tpu":
         log(f"   pre-flight OK: datasets attached, Internet on, 8 TPU chips ({rest})"); return
-    if n == 0 and not re.search(r"jellyfish|TPU initialization failed|initialize backend 'tpu'|No TPU|vfio", rest, re.I):
+    if n == 0 and not re.search(r"jellyfish|TPU initialization failed|initialize backend 'tpu'|No TPU|vfio", rest, re.IGNORECASE):
         log(f"   (TPU check inconclusive, continuing: {rest[:160]})"); return
     fail("no-tpu", f"this session has no working TPU: jax sees {n} {platform} device(s) {rest}. Kaggle sometimes starts a TPU "
                    "session without one (most often on new or not-yet-verified accounts); nothing in this notebook can fix "
@@ -266,9 +287,11 @@ if CFG["tunnel"] and not CLOUDFLARED.exists():
     CLOUDFLARED.chmod(0o755)
     log("   cloudflared downloaded")
 
-import numpy as np                      # noqa: E402  (after the runtime pins: libtpu must be installed before jax loads)
-import jax, jax.numpy as jnp            # noqa: E402
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P   # noqa: E402
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 SERVE_MOUNT = (mounts_of(SERVE_NAMES) or [None])[0]
 if SERVE_MOUNT and CFG["serve_dataset"] and not mounts_of([CFG["serve_dataset"]]):
@@ -286,7 +309,7 @@ if "eng" not in globals():              # (a test harness may pre-set eng/tok/id
     try:                                 # a process that already initialised the cache elsewhere keeps writing there
         from jax._src import compilation_cache as _cc
         _cc.reset_cache()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log(f"   (compile cache reset skipped: {e!r})")
     try:                                 # which cache entries this build loads or writes (the serve dataset's next
         if not hasattr(_cc, "_glm_use"):     # jax_cache/ is exactly those: jax_cache_used.txt in the output)
@@ -302,7 +325,7 @@ if "eng" not in globals():              # (a test harness may pre-set eng/tok/id
                         else:
                             use["hit" if r[0] is not None else "miss"].append(cache_key)
                             use["read_s"] += time.time() - t
-                    except Exception:  # noqa: BLE001  (the record must never cost a cache read)
+                    except Exception:
                         pass
                     return r
                 return wrapped
@@ -312,7 +335,7 @@ if "eng" not in globals():              # (a test harness may pre-set eng/tok/id
         for _k in ("hit", "miss", "put"):
             CACHE_USE[_k].clear()
         CACHE_USE["read_s"] = 0.0
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log(f"   (compile cache use is not recorded: {e!r})")
     log(f"   jax {jax.__version__}, {jax.device_count()} devices, compile cache at {CACHE_DIR}")
 if CFG["aot"]:
@@ -328,10 +351,15 @@ if "eng" not in globals():
     banner(2, "Weights", "3-bit codebook experts + int8 non-expert weights onto the eight chips, ~9 min")
     from glm53 import basestore as BS
     from glm53 import checkpoint as C
+    from glm53 import gguf_reader as G
     from glm53 import model as M
     from glm53.engine import AXIS
-    from glm53 import gguf_reader as G
-    from glm53.resident import ResidentFetch, ResidentLayerEngine, pack_layer_from_gguf, hbm_bytes
+    from glm53.resident import (
+        ResidentFetch,
+        ResidentLayerEngine,
+        hbm_bytes,
+        pack_layer_from_gguf,
+    )
     from transformers import AutoConfig, AutoTokenizer
     gguf_mounts = mounts_of(CFG["expert_datasets"])
     fp8_mounts = [] if BASE_DIR else mounts_of(CFG["base_datasets"])
@@ -443,7 +471,7 @@ if _d.startswith("hf:"):                 # fetched from Hugging Face at start (a
         snapshot_download(_repo, revision=_rev or None, local_dir=DFLASH_DIR,
                           allow_patterns=["config.json", "model.safetensors"])
         log(f"   DFlash drafter {_repo}: fetched in {time.time() - t:.0f}s")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log(f"   DFlash: fetching {_repo} failed ({e!r}) -> plain decoding")
         DFLASH_DIR = None
 else:
@@ -462,10 +490,9 @@ DFLASH_COST = {int(k): float(v) for k, v in CFG["dflash_cost"].items()}
 DFLASH_ROWS = {int(k): tuple(float(x) for x in v) for k, v in CFG["dflash_rows"].items() if 1 < int(k) <= CFG["streams"]}
 
 # ----------------------------------------------------------------------------- 4. the server
-from glm53.resident import ResidentLayerEngine as _RLE   # noqa: E402
-from glm53.engine import DeviceSampler                    # noqa: E402
-from glm53.scheduler import DFlashPolicy, Request, Scheduler, SnapStore   # noqa: E402
-from glm53 import vision as VIS                           # noqa: E402
+from glm53 import vision as VIS
+from glm53.engine import DeviceSampler
+from glm53.scheduler import DFlashPolicy, Request, Scheduler, SnapStore
 
 API_KEY = CFG["api_key"]
 MAX_NEW_DEFAULT = CFG["max_new_default"]
@@ -608,7 +635,7 @@ def _match_len(live_ids, pos, prompt, quiet=False):
     """Longest reuse of the live context (ids[:pos]) for `prompt`: (k, fed) where prompt[k:] must still be prefilled and
     `fed` = the ids the engine will have seen after that, or (0, None). Handles a dropped thinking block (the template
     renders `<think></think>` where the live context holds the reasoning) and re-tokenisation drift near the boundary."""
-    THINK, END = T["<|assistant|>"], T["</think>"]
+    END = T["</think>"]
     i = j = 0
     while True:
         n = min(pos - i, len(prompt) - j)
@@ -761,7 +788,7 @@ def parse_tool_call(body, tools):
         else:
             try:
                 val = json.loads(raw)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 val = raw
         args[key] = val
         i = d + 1
@@ -990,7 +1017,7 @@ def openai_messages(req):
             if isinstance(fn.get("arguments"), str):
                 try:
                     fn["arguments"] = json.loads(fn["arguments"])
-                except Exception:  # noqa: BLE001
+                except Exception:
                     fn["arguments"] = {"_raw": fn["arguments"]}
         msgs.append(m)
     return msgs, req.get("tools") or None
@@ -1074,7 +1101,7 @@ class H(BaseHTTPRequestHandler):
         try:
             self.wfile.write(b if isinstance(b, bytes) else b.encode()); self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            raise ClientGone() from None
+            raise ClientGone from None
 
     def _auth(self):
         if not API_KEY:
@@ -1112,7 +1139,7 @@ class H(BaseHTTPRequestHandler):
                                     "hbm_free_in_use_gb": SCHED.in_use_free_gb(), **STATE})
         if self.path.startswith("/v1/models"):
             return self._json(200, {"object": "list", "data": [{"id": MODEL, "object": "model"}]})
-        self._json(404, {"error": "not found"})
+        return self._json(404, {"error": "not found"})
 
     def do_POST(self):
         if not self._auth():
@@ -1120,7 +1147,7 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         try:
             req = json.loads(self.rfile.read(n) or b"{}")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             return self._json(400, {"error": str(e)})
         try:
             if self.path.startswith("/v1/messages/count_tokens"):
@@ -1132,7 +1159,7 @@ class H(BaseHTTPRequestHandler):
                 return self.openai_chat(req)
             if self.path.startswith("/v1/completions"):
                 return self.openai_text(req)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             if isinstance(e, ClientGone):
                 return log(f"client disconnected: {getattr(self, 'rid', '?')} after {getattr(e, 'n', '?')} tokens (stream cancelled)")
             if isinstance(e, QueueFull):
@@ -1140,16 +1167,17 @@ class H(BaseHTTPRequestHandler):
                 if getattr(self, "_stream_format", None):
                     return self._stream_error(429, "rate_limit_error", str(e))
                 return self._json(429, {"error": {"type": "rate_limit_error", "message": str(e)}}, [("Retry-After", "5")])
-            import traceback; log("request failed:", traceback.format_exc()[-1500:])
+            import traceback
+            log("request failed:", traceback.format_exc()[-1500:])
             code, kind = (503, "overloaded_error") if isinstance(e, TimeoutError) else \
                          (400, "invalid_request_error") if isinstance(e, ValueError) else (500, "api_error")
             try:
                 if getattr(self, "_stream_format", None):
                     return self._stream_error(code, kind, str(e))
                 return self._json(code, {"error": {"type": kind, "message": str(e)}})
-            except Exception:  # noqa: BLE001
-                return
-        self._json(404, {"error": "not found"})
+            except Exception:
+                return None
+        return self._json(404, {"error": "not found"})
 
     # ---- OpenAI
     def openai_chat(self, req):
@@ -1160,7 +1188,7 @@ class H(BaseHTTPRequestHandler):
         temperature = float(req.get("temperature", DEFAULT_TEMP)); top_p = float(req.get("top_p", DEFAULT_TOP_P))
         rid = self.rid = "chatcmpl-" + uuid.uuid4().hex[:12]
         STATE["requests"] += 1
-        kw = dict(tools=tools, stops=stops_of(req), prefix=forced_prefix(choice), think_budget=think_budget_of(req))
+        kw = {"tools": tools, "stops": stops_of(req), "prefix": forced_prefix(choice), "think_budget": think_budget_of(req)}
         finish = lambda r: "tool_calls" if r["calls"] else ("length" if r["stop"] == "length" else "stop")
         if req.get("stream"):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream")
@@ -1222,7 +1250,7 @@ class H(BaseHTTPRequestHandler):
         temperature = float(req.get("temperature", DEFAULT_TEMP)); top_p = float(req.get("top_p", DEFAULT_TOP_P))
         rid = self.rid = "msg_" + uuid.uuid4().hex[:16]
         STATE["requests"] += 1
-        kw = dict(tools=tools, stops=stops_of(req), prefix=forced_prefix(choice), think_budget=think_budget_of(req))
+        kw = {"tools": tools, "stops": stops_of(req), "prefix": forced_prefix(choice), "think_budget": think_budget_of(req)}
         stop_of = lambda r: "tool_use" if r["calls"] else {"length": "max_tokens", "stop_sequence": "stop_sequence"}.get(r["stop"], "end_turn")
         if req.get("stream"):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream")
@@ -1376,7 +1404,8 @@ def start_tunnel(attempts=3, wait_s=90):
         tun = subprocess.Popen([str(CLOUDFLARED), "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate"],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         q = queue.Queue()
-        threading.Thread(target=lambda: [q.put(l) for l in iter(tun.stdout.readline, "")], daemon=True).start()
+        threading.Thread(target=lambda q=q, tun=tun: [q.put(l) for l in iter(tun.stdout.readline, "")],
+                         daemon=True).start()
         t0 = time.time()
         while time.time() - t0 < wait_s:
             try:
@@ -1404,7 +1433,7 @@ def tunnel_probe(u, api_key, wait_s=180):
             urllib.request.urlopen(req, timeout=10).read()
             log(f"   tunnel reachable from outside: {u} ({time.time() - t0:.0f} s after it opened)")
             return
-        except Exception:  # noqa: BLE001
+        except Exception:
             time.sleep(10)
     log(f"   tunnel URL {u} did not answer in {wait_s} s: opening a new one")
     if TUN[0] is not None:
@@ -1452,8 +1481,9 @@ try:
     ths = [threading.Thread(target=_one, args=(0, "Count from one to ten in words.")), threading.Thread(target=_one, args=(1, "Name three primary colors."))]
     t0 = time.time(); [t.start() for t in ths]; [t.join() for t in ths]
     log("   self-test concurrent:", [o["choices"][0]["message"]["content"][:50] for o in outs], f"{time.time() - t0:.1f}s")
-except Exception as e:  # noqa: BLE001
-    import traceback; log("   self-test failed:", traceback.format_exc()[-800:])
+except Exception:
+    import traceback
+    log("   self-test failed:", traceback.format_exc()[-800:])
 
 endpoint = STATE["url"]
 log("")
@@ -1492,7 +1522,7 @@ def report_to_gateway(reason):
         urllib.request.urlopen(req, timeout=10)
         log(f"   gateway told ({reason})")
         return True
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log(f"   (gateway report failed: {e})")
         return False
 

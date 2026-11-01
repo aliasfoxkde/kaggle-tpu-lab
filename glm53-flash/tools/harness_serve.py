@@ -3,14 +3,23 @@ kaggle-tpu-lab/glm53-flash/tools/harness_serve.py`, ~40 s; needs the GLM tokeniz
 JOB_TUNNEL=False. Exercises the self-test in the job, then Anthropic streaming x2 concurrently, count_tokens, a
 mid-stream disconnect, a follow-up turn (prefix reuse of a live context), stop sequences (unit + the completions
 endpoint's cancel path), tool_choice (none / any / named), keep-alive pings while a tool call is buffered (both APIs),
-the thinking budget (a forced </think>), and the bounded queue (429)."""
-import os, sys, glob, json, threading, time, urllib.request, urllib.error
+the thinking budget (a forced </think>), and the bounded queue (429).
+"""
+import glob
+import json
+import os
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "engine"))
-import numpy as np, jax
-from transformers import AutoTokenizer
+import numpy as np
 from glm53.tests.test_batched_rows import build_engine
+from transformers import AutoTokenizer
 
 rng = np.random.default_rng(0)
 eng, V = build_engine(True, rng, max_len=512)
@@ -21,10 +30,10 @@ def log(*a):
     print(f"[{time.time() - t0:7.1f}s]", *a, flush=True)
 ids = np.asarray(tok("Write a haiku about the sea.", add_special_tokens=False).input_ids, np.int32)[None]
 eos = {tok.convert_tokens_to_ids("<|endoftext|>")}
-ns = dict(eng=eng, tok=tok, ids=ids, eos=eos, cfg=eng.cfg, VISION=None, VISION_FWD=None, SERVE_FOREVER=False,
-          CFG_PRESET=dict(skip_runtime=True, tunnel=False, port=8765, streams=2, sets=2, sched_piece=32, api_key="k", base_min=10 ** 9,
-                          snap_min=1, snap_rows=8, snap_warm_tokens=64, max_new_default=24, max_queue=1, bucket_min=64, vision=False,
-                          min_free_gb=0, dflash=""))      # (dflash="": the default would fetch the 2.3 GB drafter)
+ns = {"eng": eng, "tok": tok, "ids": ids, "eos": eos, "cfg": eng.cfg, "VISION": None, "VISION_FWD": None, "SERVE_FOREVER": False,
+          "CFG_PRESET": {"skip_runtime": True, "tunnel": False, "port": 8765, "streams": 2, "sets": 2, "sched_piece": 32, "api_key": "k", "base_min": 10 ** 9,
+                          "snap_min": 1, "snap_rows": 8, "snap_warm_tokens": 64, "max_new_default": 24, "max_queue": 1, "bucket_min": 64, "vision": False,
+                          "min_free_gb": 0, "dflash": ""}}      # (dflash="": the default would fetch the 2.3 GB drafter)
 exec(compile(open(os.path.join(HERE, "..", "kernel", "serve_glm53.py")).read(), "serve_glm53", "exec"), ns)
 STATE, SCHED = ns["STATE"], ns["SCHED"]
 assert eng.PREFILL_BUCKETS[0] == 64, eng.PREFILL_BUCKETS
@@ -93,8 +102,7 @@ script = tok("some reasoning", add_special_tokens=False).input_ids + [T["</think
 real_generate = ns["generate"]
 def fake_generate(prompt, max_new, temperature, top_p, on_token=None, imgs=None, rid=None, on_idle=None, budget=None):
     n = 0
-    for t in script:
-        n += 1
+    for n, t in enumerate(script, 1):
         if on_token(t):
             return script[:n], 0.1, 0.2, 0, "stop_sequence"
     return script, 0.1, 0.2, 0, "stop"
@@ -154,7 +162,7 @@ try:
     log("anthropic: pings", pings, "| events", types)
     assert pings >= 2 and types[-1] == "message_stop" and all(e["type"] == "ping" for e in evs if "ping" in e.get("type", "")), lines
     assert any(e["type"] == "content_block_start" and e["content_block"]["type"] == "tool_use" and e["content_block"]["name"] == "read_file" for e in evs), evs
-    assert [e for e in evs if e["type"] == "message_delta"][0]["delta"]["stop_reason"] == "tool_use"
+    assert next(e for e in evs if e["type"] == "message_delta")["delta"]["stop_reason"] == "tool_use"
     with post("/v1/chat/completions", {"stream": True, "max_tokens": 64, "messages": [{"role": "user", "content": "Read /etc/hostname."}],
                                        "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]}) as r:
         lines = [line.decode().rstrip() for line in r]

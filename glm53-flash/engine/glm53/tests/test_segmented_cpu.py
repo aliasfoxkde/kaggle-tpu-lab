@@ -4,14 +4,13 @@ import pytest
 import torch
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
+import jax.numpy as jnp
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel
 
-from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel  # noqa: E402
-
-from glm53 import model as M  # noqa: E402
-from glm53.engine import HostExperts, SegmentedEngine  # noqa: E402
-from glm53.hf_convert import from_hf_module  # noqa: E402
-from glm53.tests.test_tiny_vs_hf import tiny_config  # noqa: E402
+from glm53 import model as M
+from glm53.engine import HostExperts, SegmentedEngine
+from glm53.hf_convert import from_hf_module
+from glm53.tests.test_tiny_vs_hf import tiny_config
 
 jax.config.update("jax_default_matmul_precision", "highest")
 

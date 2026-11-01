@@ -14,9 +14,9 @@ blob = base64.b64encode(gzip.compress(diff, 9)).decode()
 
 script_path = repo / "kernel" / "serve_qwen38.py"
 src = script_path.read_text()
-new, n = re.subn(r'^MTP_PATCH_B64 = .*$',
+new, n = re.subn(r"^MTP_PATCH_B64 = .*$",
                  f'MTP_PATCH_B64 = "{blob}"  # __EMBEDDED_PATCH__',
-                 src, count=1, flags=re.M)
+                 src, count=1, flags=re.MULTILINE)
 if n != 1:
     raise SystemExit("marker line MTP_PATCH_B64 = ... not found")
 script_path.write_text(new)

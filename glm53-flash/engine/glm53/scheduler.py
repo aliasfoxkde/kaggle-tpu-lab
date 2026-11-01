@@ -19,12 +19,13 @@ when the membership or the mode changes. With temperature > 0 the drafts are acc
 the target's distribution (every token distributed as plain sampling).
 """
 import collections
+import contextlib
 import threading
 import time
 
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from glm53.engine import DeviceSampler
 
@@ -139,7 +140,7 @@ class SnapStore:
     def lookup(self, prompt):
         """-> (k, fed, entry) for the entry that covers most of `prompt`, or (0, None, None)."""
         best = (0, None, None)
-        for key, e in list(self.entries.items()):
+        for e in list(self.entries.values()):
             if e["n"] <= best[0]:
                 continue
             k, fed = self.match_len(e["ids"], e["n"], prompt, quiet=True)
@@ -194,7 +195,7 @@ class DFlashPolicy:
         return sum(s.tau["ema"][self.rows_T] for s in streams) / c[0] > margin * len(streams) / c[1]
 
     def start(self, s):
-        s.tau = {"ema": dict(self.prior), "last": {t: 0 for t in self.cost}, "n": 0}
+        s.tau = {"ema": dict(self.prior), "last": dict.fromkeys(self.cost, 0), "n": 0}
 
     def pick(self, s):
         st = s.tau
@@ -222,7 +223,7 @@ class Scheduler:
     def __init__(self, eng, stop_ids, max_streams=4, max_sets=None, feed=None, match_len=match_prefix,
                  system_end=None, first_sample=_argmax_first, snaps=None, log=print, state=None,
                  base_min=512, snap_min=256, piece=None, seed=None, min_free_gb=0.65, max_wait_s=90.0, spec=None):
-        self.eng, self.stop_ids = eng, set(int(t) for t in stop_ids)
+        self.eng, self.stop_ids = eng, {int(t) for t in stop_ids}
         self.max_streams = max(1, int(max_streams))
         self.max_sets = max(self.max_streams, int(max_sets if max_sets is not None else max_streams + 1))
         self.feed = feed or (lambda req, a, b: (np.asarray(req.prompt[a:b], np.int32), None))
@@ -290,10 +291,8 @@ class Scheduler:
         dropped set kept alive by a stray reference (seen once after a concurrent burst, 2026-09-13) cost a stream
         slot for the rest of the session — refcounts alone are not a guarantee."""
         for x in jax.tree.leaves(caches):
-            try:
+            with contextlib.suppress(Exception):
                 x.delete()
-            except Exception:  # noqa: BLE001
-                pass
 
     @property
     def n_sets(self):
@@ -318,7 +317,7 @@ class Scheduler:
                 try:
                     if len(a.sharding.device_set) == n:
                         tot += a.nbytes if a.sharding.is_fully_replicated else a.nbytes // n
-                except Exception:  # noqa: BLE001  (deleted arrays)
+                except Exception:
                     pass
             self._buf_cache = (key, tot)
         return (st["bytes_limit"] - self._buf_cache[1]) / 1e9
@@ -378,8 +377,9 @@ class Scheduler:
                     self._fail(req, None, "cancelled"); continue
                 try:
                     self._admit(req)
-                except Exception as e:  # noqa: BLE001
-                    import gc, traceback
+                except Exception as e:
+                    import gc
+                    import traceback
                     self.log("admission failed:", traceback.format_exc()[-1500:])
                     self._fail(req, RuntimeError(f"{type(e).__name__}: {str(e)[:800]}"))   # no traceback: its frames
                     del e                                                                    # would pin the half-built caches
@@ -388,8 +388,9 @@ class Scheduler:
             if self.active:
                 try:
                     self._step()
-                except Exception as e:  # noqa: BLE001
-                    import gc, traceback
+                except Exception as e:
+                    import gc
+                    import traceback
                     self.log("decode step failed:", traceback.format_exc()[-1500:])
                     err = RuntimeError(f"{type(e).__name__}: {str(e)[:800]}")
                     del e
@@ -403,10 +404,8 @@ class Scheduler:
         """Finish a request that never became a stream (capacity error, admission failure, cancelled while queued)."""
         req.error, req.stop_reason, req.t_end = error, reason, time.time()
         if req.on_done is not None:
-            try:
+            with contextlib.suppress(Exception):
                 req.on_done()
-            except Exception:  # noqa: BLE001
-                pass
         req.done.set()
 
     def _make_room(self):
@@ -497,7 +496,7 @@ class Scheduler:
         if req.on_token is not None and not req.cancelled:
             try:
                 req.on_token(tok)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self.log(f"on_token failed ({e!r}): cancelling {req.rid}")
                 req.cancelled = True
         if tok in self.stop_ids:
@@ -526,7 +525,7 @@ class Scheduler:
         if req.on_done is not None:
             try:
                 req.on_done()
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self.log(f"on_done failed ({e!r}) for {req.rid}")
         req.done.set()
 
@@ -537,7 +536,7 @@ class Scheduler:
                 self._finish(s, "cancelled")
         act = list(self.active)                                         # (streams finishing below leave self.active)
         if not act:
-            return
+            return None
         if len(act) == 1 and self._spec_ok(act[0]):
             self._rows_end()
             return self._spec_step(act[0])
@@ -586,6 +585,7 @@ class Scheduler:
             s.logits = (logits, r)                                      # sliced only when the stream finishes
         for s in act:
             self._emit(s, s.tok)
+        return None
 
     # ---- DFlash (a stream running alone)
     def _spec_ok(self, s):

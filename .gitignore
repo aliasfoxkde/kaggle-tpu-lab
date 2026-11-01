@@ -3,3 +3,11 @@ __pycache__/
 .DS_Store
 out/
 *.log
+.scratch/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/

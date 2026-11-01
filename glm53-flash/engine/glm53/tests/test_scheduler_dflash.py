@@ -7,10 +7,10 @@ import pytest
 
 jax = pytest.importorskip("jax")
 
-from glm53.scheduler import DFlashPolicy, Request, Scheduler, SnapStore  # noqa: E402
-from glm53.tests.test_dflash_engine import random_drafter  # noqa: E402
-from glm53.tests.test_scheduler import STOP, reference, wait  # noqa: E402
-from glm53.tests.test_spec_decode import build  # noqa: E402
+from glm53.scheduler import DFlashPolicy, Request, Scheduler, SnapStore
+from glm53.tests.test_dflash_engine import random_drafter
+from glm53.tests.test_scheduler import STOP, reference, wait
+from glm53.tests.test_spec_decode import build
 
 
 @pytest.fixture(scope="module")

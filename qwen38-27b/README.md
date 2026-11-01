@@ -14,7 +14,7 @@ native **262,144-token context**, and real speed:
 | Decode, 16 concurrent streams | **~900 tok/s aggregate** (with `--mtp 0` — see tuning note below) |
 | Prefill | **10,300 tok/s** — a 105k-token prompt in ~10 s |
 | Native 262k context | works — 225k-token prompt prefilled in ~28 s |
-| Time to live endpoint | **~22 min** with the env dataset attached (~12 with `--text-only`, ~6 with `--fast-start`; ~40 without the dataset) |
+| Time to live endpoint | **~22 min** with the env dataset attached (~12 with `--text-only`, ~4 with `--fast-start`; ~40 without the dataset) |
 | Output correctness with MTP | **verified lossless** — 12/12 greedy prompts exactly match non-speculative |
 
 Tuning note: speculative decoding pays off up to ~8 concurrent streams and fades beyond
@@ -101,8 +101,8 @@ python launch.py serve --max-model-len 131072 --max-num-seqs 16  # many parallel
 python launch.py serve --reasoning-effort medium                 # server-side default
 python launch.py serve --keepalive-min 120                       # auto-stop after 2 h
 python launch.py serve --idle-min 0                              # never auto-stop on idle (only on keepalive)
-python launch.py serve --text-only                               # skip the vision tower: ~10 min faster, no image inputs
-python launch.py serve --fast-start                              # live in ~6 min; common shapes warmed after, rare ones stall ~1 min once
+python launch.py serve --text-only                               # skip the vision tower: ~8 min faster, no image inputs
+python launch.py serve --fast-start                              # live in ~4 min; common shapes warmed after, rare ones stall ~1 min once
 python launch.py serve --no-async-scheduling                     # for clients that use JSON mode / structured outputs with MTP on (see "If it fails")
 ```
 
@@ -172,7 +172,7 @@ Plus two public Kaggle datasets the kernel attaches:
 ### Where the startup time goes (and went)
 
 The first version of this recipe took ~50 min from "Run" to a live URL. Measured now: ~22
-(~12 with `--text-only`, ~6 with `--fast-start`):
+(~12 with `--text-only`, ~4 with `--fast-start`):
 
 | Step | Before | Now | How |
 |---|---|---|---|

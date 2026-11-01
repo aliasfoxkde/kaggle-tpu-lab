@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
+import jax.numpy as jnp
 
-from glm53.engine import spec_accept  # noqa: E402
+from glm53.engine import spec_accept
 
 V, K = 12, 4
 

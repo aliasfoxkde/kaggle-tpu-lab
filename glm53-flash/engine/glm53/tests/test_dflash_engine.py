@@ -9,10 +9,10 @@ import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
+import jax.numpy as jnp
 
-from glm53 import dflash as D  # noqa: E402
-from glm53.tests.test_spec_decode import build, greedy  # noqa: E402
+from glm53 import dflash as D
+from glm53.tests.test_spec_decode import build, greedy
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
@@ -32,7 +32,7 @@ def random_drafter(rng, hidden, vocab, layers=(1, 2, 4)):
         return {"base": (0.5 * rng.standard_normal((2, 2, hidden))).astype(np.float32),
                 "proj": lin(hidden, 4 * hidden // cfg.conv_group)}
     qd, kvd = cfg.heads * cfg.hd, cfg.kv_heads * cfg.hd
-    layer = lambda: {"ln1": norm(hidden), "ln2": norm(hidden), "q": lin(hidden, qd), "k": lin(hidden, kvd),  # noqa: E731
+    layer = lambda: {"ln1": norm(hidden), "ln2": norm(hidden), "q": lin(hidden, qd), "k": lin(hidden, kvd),
                      "v": lin(hidden, kvd), "o": lin(qd, hidden), "q_norm": norm(cfg.hd), "k_norm": norm(cfg.hd),
                      "gate": lin(hidden, cfg.inter), "up": lin(hidden, cfg.inter), "down": lin(cfg.inter, hidden),
                      "conv_a": conv(), "conv_m": conv()}

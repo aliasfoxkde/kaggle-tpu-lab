@@ -1,7 +1,12 @@
-import json, os, numpy as np, pytest
-import jax.numpy as jnp
+import json
+import os
+
 import gguf.quants as gq
+import jax.numpy as jnp
+import numpy as np
+import pytest
 from gguf import GGMLQuantizationType as T
+
 from glm53 import iqquant
 
 HERE = os.path.dirname(__file__)

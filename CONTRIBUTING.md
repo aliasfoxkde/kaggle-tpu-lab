@@ -7,6 +7,10 @@ Thanks for wanting to help. A few notes so your time is well spent.
   both of us from a PR that cannot land.
 - **Small fixes** are welcome as direct PRs: a typo, a broken link, a wrong number with the
   measurement behind it.
+- **Run the engine tests before you send a PR:** `pip install jax pytest`, then
+  `cd glm53-flash/engine && python -m pytest glm53/tests`. They run on CPU (8 virtual
+  JAX devices), so no TPU is needed. The Qwen recipe has no local test suite; its
+  kernel script is the thing to try on Kaggle.
 - **New recipes** follow the existing shape: one folder per model with a README, the kernel,
   the generated notebook, and numbers measured on Kaggle's TPU with a note on how. Please
   propose the model in an issue first so we agree on the approach.

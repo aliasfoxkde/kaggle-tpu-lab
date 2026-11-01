@@ -22,21 +22,21 @@ text_only, ~6 with fast_start). Without the env dataset the compile is cold (+15
 """
 import base64
 import collections
-import struct
-import zlib
+import contextlib
 import glob
 import gzip
-import importlib.util
 import json
 import os
 import re
 import secrets
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.request
+import zlib
 from pathlib import Path
 
 CFG = None  # __LAUNCHER_CONFIG__  (launch.py replaces this line)
@@ -242,10 +242,8 @@ def final_harvest():
 def shutdown(server):
     """Terminate vLLM, let it finish writing, harvest, exit clean."""
     server.terminate()
-    try:
+    with contextlib.suppress(Exception):
         server.wait(timeout=120)
-    except Exception:
-        pass
     final_harvest()
     sys.exit(0)
 
@@ -376,7 +374,7 @@ def internet_check():
     try:
         urllib.request.urlopen("https://pypi.org/simple/pip/", timeout=20).read(1)
         log("   Internet check OK")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         msg = (f"no Internet from this session ({str(e)[:120]}): Session options -> Internet ON (a phone-verified "
                "Kaggle account is needed for that), then run again. The pip packages and the tunnel need it.")
         log("   " + msg)
@@ -398,7 +396,7 @@ def tpu_check():
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=180)
         out = (r.stdout or "") + (r.stderr or "")
         m = re.search(r"TPU_CHECK (\d+) (\S+)(.*)", out)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log(f"   (TPU check skipped: {e})")
         return
     if m is None:
@@ -409,7 +407,7 @@ def tpu_check():
     if n == 8 and platform == "tpu":
         log(f"   TPU check OK: 8 chips ({rest})")
         return
-    if n == 0 and not re.search(r"jellyfish|TPU initialization failed|initialize backend 'tpu'|No TPU|vfio", rest, re.I):
+    if n == 0 and not re.search(r"jellyfish|TPU initialization failed|initialize backend 'tpu'|No TPU|vfio", rest, re.IGNORECASE):
         log(f"   (TPU check inconclusive, continuing: {rest[:160]})")   # only a clear no-TPU signal stops the run
         return
     msg = (f"this session has no working TPU: jax sees {n} {platform} device(s) {rest}. Kaggle sometimes starts a "
@@ -434,7 +432,7 @@ def server_death_report(max_lines=60):
     try:
         data = RAW_LOG.read_bytes()[_LOG_START:]
         lines = [l for l in data.decode("utf-8", errors="replace").splitlines() if l.startswith("[vllm]")]
-    except Exception:  # noqa: BLE001
+    except Exception:
         return "", "", ""
     strip = re.compile(r"^\[vllm\] (?:\((?:EngineCore|APIServer|Worker)[^)]*\) )?(?:ERROR|CRITICAL) [\d-]+ [\d:]+ \[[^\]]+\] ?")
     start_pat = re.compile(r"EngineCore (?:failed|encountered|hit)|Traceback \(most recent call last\)|RESOURCE_EXHAUSTED|INVALID_ARGUMENT|NOT_FOUND")
@@ -457,7 +455,7 @@ def server_death_report(max_lines=60):
                 "not-yet-verified accounts): stop the session and start it again")
     elif "__delitem__" in joined:
         hint = ("a client sent a JSON-mode / structured-output request while MTP and async scheduling are on, which "
-                "vllm-tpu 0.28.0 cannot handle: set \"async_scheduling\": false (or \"mtp_tokens\": 0) and run again")
+                'vllm-tpu 0.28.0 cannot handle: set "async_scheduling": false (or "mtp_tokens": 0) and run again')
     elif "RESOURCE_EXHAUSTED" in joined or "out of memory" in joined.lower():
         hint = "the TPU ran out of HBM: lower max_model_len or max_num_seqs"
     return cause, joined, hint
@@ -680,7 +678,7 @@ def make_translator():
             log(f"     graph {st['graph']}/{n_graphs}: batches of {m.group(1)} tokens")
             return
         if "embed_multimodal" in line or "input_embeddings_merger" in line:
-            once("vision-enc", "     warming the image encoder (~5 min; \"text_only\": true skips it)")
+            once("vision-enc", '     warming the image encoder (~5 min; "text_only": true skips it)')
             return
         if "backbone with embeds" in line:
             once("vision", "     compiling image-input graphs (~3 min)")
@@ -1027,7 +1025,7 @@ log("#" * 70)
 log("#  Try it:")
 log(f"#    curl {url + '/v1' if url else 'http://127.0.0.1:8000/v1'}/chat/completions \\")
 log(f"#      -H 'Authorization: Bearer {CFG['api_key']}' -H 'Content-Type: application/json' \\")
-log("#      -d '{\"model\": \"" + CFG["served_model_name"] + "\", \"messages\": [{\"role\": \"user\", "
+log("#      -d '{\"model\": \"" + CFG["served_model_name"] + '", "messages": [{"role": "user", '
     "\"content\": \"Hello!\"}], \"chat_template_kwargs\": {\"reasoning_effort\": \"low\"}}'")
 log(f"#  Serving for up to {CFG['keepalive_min']} min, then this cell exits on its own.")
 log("#" * 70)

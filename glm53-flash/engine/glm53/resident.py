@@ -18,16 +18,16 @@ import dataclasses
 import queue
 import threading
 
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 
 from glm53 import aot
 from glm53 import iqquant as Q
 from glm53 import model as M
-from glm53 import planes as PL
 from glm53 import pallas_moe as K
+from glm53 import planes as PL
 
 QK = Q.QK_K
 KEYS = ("gate_q", "up_q", "down_q")
@@ -137,7 +137,7 @@ class ResidentFetch:
             return self._apply_ragged_kernel(x, idx, w, layer, gate_q, up_q, down_q, limit, self.verify_dtype,
                                              self.verify_tm, self.verify_lane_block)
         if (self.use_pallas and self.group_min_seq and self.group_min_seq <= seq_tokens < self.ragged_min_seq
-                and N > seq_tokens and N % seq_tokens == 0):         # B rows of T tokens (a batched verify)
+                and seq_tokens < N and N % seq_tokens == 0):         # B rows of T tokens (a batched verify)
             return self._apply_rows_grouped(x, idx, w, layer, gate_q, up_q, down_q, limit, seq_tokens)
         if N * k <= self.gather_max_rows:
             if self.use_pallas and self.group_min_seq and seq_tokens >= self.group_min_seq and seq_tokens == N:
@@ -288,8 +288,19 @@ class ResidentFetch:
 
 
 # ------------------------------------------------------------------------------------- per-layer-kind engine
-from glm53.engine import Engine, AXIS, R, shard_map, cache_specs, device_sample, device_probs, spec_accept, DeviceSampler   # noqa: E402
-from jax.sharding import NamedSharding, PartitionSpec as P           # noqa: E402
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
+
+from glm53.engine import (
+    AXIS,
+    DeviceSampler,
+    Engine,
+    R,
+    device_probs,
+    device_sample,
+    shard_map,
+    spec_accept,
+)
 
 
 class _Reaper(threading.Thread):
@@ -483,7 +494,7 @@ class ResidentLayerEngine(Engine):
         the same shape after a verify of any T (one draft program per block size)."""
         m = streams.astype(jnp.float32).mean(2).astype(self.lcfg.dtype)
         T, blk = m.shape[1], self.dflash.cfg.block
-        return jnp.pad(m, ((0, 0), (0, blk - T), (0, 0))) if T < blk else m
+        return jnp.pad(m, ((0, 0), (0, blk - T), (0, 0))) if blk > T else m
 
     def _prog_stream_mean(self, B, T):
         key = ("stream_mean", B, T)
@@ -602,7 +613,7 @@ class ResidentLayerEngine(Engine):
             spec = self._cache_spec(i)
             if i == cfg.n_layers and self.dflash is not None:
                 dc = self.dflash.cfg
-                shapes = {k: ((dc.n_layers, B, dc.window, dc.kv_heads, dc.hd), dc.dtype) for k in ("k", "v")}
+                shapes = dict.fromkeys(("k", "v"), ((dc.n_layers, B, dc.window, dc.kv_heads, dc.hd), dc.dtype))
                 shapes["p"] = ((B, dc.window), jnp.int32)               # slot positions + 1 (0 = empty)
             elif i == cfg.n_layers:
                 shapes = {k: (sh, M.cache_dtype(cfg, k, cfg.dtype)) for k, sh in M.mla_cache_shapes(cfg, B, self.max_len, True).items()}
@@ -1144,7 +1155,7 @@ class ResidentLayerEngine(Engine):
         The layer's attention cache + carried hidden state become cache entry n_layers (alloc_caches)."""
         col, row = P(None, AXIS), P(AXIS, None)
         attn = {"q_a": R, "q_a_norm": R, "q_b": col, "kv_a": R, "kv_a_norm": R, "kv_b": col, "o": row,
-                "indexer": {kk: R for kk in params["attn"]["indexer"]}}
+                "indexer": dict.fromkeys(params["attn"]["indexer"], R)}
         mlp = {"router_w": R, "router_bias": R, "shared": {"gate": col, "up": col, "down": row}}
         for kk in ("gate_q", "up_q", "down_q"):
             mlp[kk] = {pk: P(AXIS) for pk in params["mlp"][kk]}
@@ -1310,7 +1321,7 @@ class ResidentLayerEngine(Engine):
             def prog(norm, lm_head, streams, seq, cand, q, pos, temp, top_p, k):
                 h = M.rmsnorm(streams.mean(2).astype(self.lcfg.dtype), norm, self.cfg.eps)
                 k1, k2 = jax.random.split(k)
-                rows = lambda v: jnp.broadcast_to(jnp.reshape(v, (-1, 1)), (B, T)).reshape(-1)   # noqa: E731
+                rows = lambda v: jnp.broadcast_to(jnp.reshape(v, (-1, 1)), (B, T)).reshape(-1)
                 gidx, p = device_probs(self._logits_local(lm_head, h).reshape(B * T, -1), rows(temp), rows(top_p))
                 C = gidx.shape[-1]
                 d = seq[:, 1:].astype(jnp.int32)
@@ -1323,7 +1334,7 @@ class ResidentLayerEngine(Engine):
                             "pos_b": pos, "n_new_b": a + 1, "key": k2}
                 return {"emitted": emitted, "a": a, "bonus": bonus, "n_keep": a[0] + 1, "pos_next": pos + a[0] + 1,
                         "pos_b": jnp.broadcast_to(pos, (B,)), "n_new_b": a + 1, "key": k2}
-            outs = {k: R for k in ("emitted", "a", "bonus", "n_keep", "pos_next", "pos_b", "n_new_b", "key")}
+            outs = dict.fromkeys(("emitted", "a", "bonus", "n_keep", "pos_next", "pos_b", "n_new_b", "key"), R)
             in_specs = (R, self.specs["lm_head"], R, R, R, R, R, R, R, R)
             self._progs[key] = aot.jit(key, shard_map(prog, mesh=self.mesh, in_specs=in_specs, out_specs=outs,
                                                  check_vma=False))

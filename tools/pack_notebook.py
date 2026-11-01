@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Generate a model's run-all Kaggle notebook from its kernel script (and engine package, if it has one), so the
-notebook and the kernel always ship the same code.
+"""Generate a model's run-all Kaggle notebook from its kernel script (and engine package, if it has one).
+
+The notebook and the kernel always ship the same code.
 
     python tools/pack_notebook.py glm53-flash      # writes glm53-flash/notebook/glm53-tpu-serve.ipynb
 
@@ -33,7 +34,7 @@ Measured here: about **165 tok/s** for one stream, about **170 tok/s** aggregate
    - `rahim3/glm53-flash-serve-v3`: the rest of the weights, the vision tower, the tokenizer and the programs
 
 Then run all cells. The last cell is the server and keeps running on purpose; the endpoint URL and the API key
-appear in its `READY` banner after about 6–13 minutes (the weights are most of that). The draft model
+appear in its `READY` banner after about 6-13 minutes (the weights are most of that). The draft model
 (`incoai/GLM-5.3-Flash-DFlash2`, CC BY-NC-ND 4.0, research use) comes from Hugging Face when the server starts;
 set `dflash` to `""` in the config cell to run without it, at about 79 tok/s.
 
@@ -70,7 +71,7 @@ server. The endpoint URL + API key appear in a `READY` banner in its output.
 This notebook serves **Qwen3.8-27B (AWQ-INT4)** with stock vLLM on Kaggle's free GPU quota
 and gives you a public OpenAI-compatible endpoint. Measured on this exact shape:
 **READY in 5:29** with the compile-cache dataset (13:26 cold), **61 tok/s** at 4 streams,
-19.4–23.4 tok/s single-stream.
+19.4-23.4 tok/s single-stream.
 
 **This is a batch/regression lane, not the interactive one.** The concurrency-8 p99 was
 16.8 s (measured) — for chat and agents use the TPU notebook (`qwen38-tpu-serve.ipynb`)
@@ -152,7 +153,7 @@ The defaults above are the sweet spot from our benchmarks. Things you might chan
 """,
             "qwen38-27b-gpu": """### Configuration
 The defaults above are the measured T4x2 sweet spot. Things you might change:
-- `max_model_len` / `max_num_seqs`: 16384 × 4 is the measured fit (32k × 8 OOM'd both
+- `max_model_len` / `max_num_seqs`: 16384 x 4 is the measured fit (32k x 8 OOM'd both
   T4s: 14.56 GiB usable per card, ~9.8 GiB of AWQ pack per card with TP=2). Raise the
   context only if you drop the sequences to match.
 - `gpu_mem_util`: 0.88 leaves room for the AWQ `create_weights` overshoot.
@@ -176,7 +177,7 @@ The defaults above are the measured T4x2 sweet spot. Things you might change:
 LAUNCH_NOTES = {"glm53-flash": """### Launch (leave this cell running: it is the server)
 What you will see:
 1. **Runtime**: a pinned TPU runtime and a few packages (about a minute)
-2. **Weights**: the 3-bit experts and the int8 non-expert weights go straight onto the eight chips (3–10 minutes,
+2. **Weights**: the 3-bit experts and the int8 non-expert weights go straight onto the eight chips (3-10 minutes,
    depending on how fast the dataset mount reads)
 3. **Vision**: the vision tower (seconds), then the draft model from Hugging Face (about a minute)
 4. **Warm-up**: every program is loaded in its exported and compiled form from the serve dataset (under a minute);
@@ -226,12 +227,12 @@ curl <ENDPOINT>/chat/completions -H "Authorization: Bearer <API_KEY>" \\
            "qwen38-27b-gpu": """### Launch (leave this cell running: it IS the server)
 What you will see (times with cache + weights datasets attached; cold ≈ G1 column):
 1. **GPU check** — the granted cards and their compute capability are logged first
-2. **Runtime** — a venv with stock vLLM 0.29.0 via `uv` (CUDA torch wheels, ~2–4 min)
+2. **Runtime** — a venv with stock vLLM 0.29.0 via `uv` (CUDA torch wheels, ~2-4 min)
 3. **Weights + cache** — found on the mounted datasets, else the AWQ downloads (~16 GB)
 4. **Starting vLLM** — TP=2, then torch.compile (182 s warm cache / 665 s cold) and CUDA graphs
 5. **Public URL** — printed early; it answers 502 until…
 6. **READY banner** with `ENDPOINT` / `API KEY` / `MODEL qwen38-27b-awq`, then a self-test
-   (~19–23 tok/s single stream)
+   (~19-23 tok/s single stream)
 
 Use the endpoint from anywhere:
 ```bash
@@ -279,7 +280,7 @@ def engine_cell(engine_dir: Path, pkg: str):
         assert "'''" not in src, f"{p} contains ''' — the engine cell cannot embed it"
         assert not src.endswith("\\"), p
         parts.append(f'FILES["{pkg}/{p.name}"] = r\'\'\'{src}\'\'\'\n')
-    parts.append("for path, src in FILES.items():\n    open(path, \"w\").write(src)\n")
+    parts.append('for path, src in FILES.items():\n    open(path, "w").write(src)\n')
     parts.append(f'print(f"wrote {{len(FILES)}} files of the {pkg} package")\n')
     return "".join(parts)
 

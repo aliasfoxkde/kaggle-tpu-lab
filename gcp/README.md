@@ -67,7 +67,7 @@ tmux attach -t glm    # the server's log; detach with Ctrl-b d
 ```
 
 The kernel runs exactly as on Kaggle, minus the Cloudflare tunnel: weights onto the chips, the speculative-decoding
-drafter from Hugging Face, the warm-up (under a minute when the exported and compiled programs match the chip, ~27 minutes when every program is traced and compiled),
+drafter from Hugging Face, the warm-up (under a minute when the exported and compiled programs match the chip, ~28 minutes when every program is traced and compiled),
 then the `READY` banner with the endpoint, the API key and the model name. Reach it from your laptop through an SSH
 port forward:
 

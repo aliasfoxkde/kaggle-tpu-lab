@@ -1,14 +1,14 @@
 """Planar expert tables (glm53.planes) and the fused Pallas dequant-matvec kernel (glm53.pallas_moe, interpret mode)."""
 import json
 import os
+
+import jax.numpy as jnp
 import numpy as np
 import pytest
-import jax
-import jax.numpy as jnp
 
 from glm53 import iqquant as Q
-from glm53 import planes as PL
 from glm53 import pallas_moe as K
+from glm53 import planes as PL
 
 HERE = os.path.dirname(__file__)
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -29,8 +29,8 @@ def random_blocks(rng, E, R, nblk, qt, scale=0.02):
 @pytest.mark.parametrize("qt", ["Q2_K", "Q3_K"])
 def test_kquant_matches_gguf_py(qt):
     """The K-quant reference dequant and the planar XLA dequant are bit-exact vs gguf-py."""
-    from gguf.quants import dequantize
     from gguf.constants import GGMLQuantizationType as G
+    from gguf.quants import dequantize
     rng = np.random.default_rng(5)
     E, R, nblk = 2, 8, 3
     t = random_blocks(rng, E, R, nblk, qt, scale=0.05)

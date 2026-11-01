@@ -27,8 +27,8 @@ import os
 import sys
 import time
 
-import numpy as np
 import jax
+import numpy as np
 
 EXT = ".jaxexp"
 MODULES = ("model", "engine", "resident", "dflash", "pallas_moe", "pallas_mhc", "pallas_kda", "quant8", "planes",
@@ -70,7 +70,7 @@ def _stable(x):
         return repr(x)
     try:
         return "dtype:" + np.dtype(x).name
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     if callable(x):
         return f"{getattr(x, '__module__', '')}.{getattr(x, '__qualname__', type(x).__name__)}"
@@ -92,7 +92,7 @@ def engine_context(eng):
     """What `eng`'s programs close over besides their own key and arguments, as a string: the model and drafter
     configurations, the capacity, the layer grouping, the expert kernels' options and the modules' settings."""
     f, d = eng.expert_fetch, getattr(eng, "dflash", None)
-    simple = lambda o: {k: v for k, v in vars(o).items() if not k.startswith("_")}   # noqa: E731
+    simple = lambda o: {k: v for k, v in vars(o).items() if not k.startswith("_")}
     return _stable({
         "cfg": eng.cfg, "lcfg": eng.lcfg, "max_len": eng.max_len, "n": eng.n, "axes": tuple(eng.mesh.axis_names),
         "lpp": getattr(eng, "lpp", None), "piece": getattr(eng, "prefill_piece", None), "class": type(eng).__name__,
@@ -110,7 +110,7 @@ def configure(write_dir=None, read_dirs=(), context=None, log=None):
     if log is not None:
         STORE.log = log
     try:
-        import flatbuffers  # noqa: F401
+        import flatbuffers  # noqa: F401  (availability probe: export needs it at trace time)
     except ImportError:
         STORE.write_dir, STORE.read_dirs = None, ()
         STORE.log("   aot: no flatbuffers package (pip install flatbuffers) -> programs are traced as usual")
@@ -125,7 +125,7 @@ def configure(write_dir=None, read_dirs=(), context=None, log=None):
         # exported them (v6e 2026-10-06: 98 of 99 loaded, the first program after the import exported again).
         try:
             importlib.import_module("glm53." + m)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             STORE.log(f"   aot: glm53.{m} not importable ({type(e).__name__}: {str(e)[:120]}); its settings are left out")
     import jaxlib
     dev = jax.devices()[0]
@@ -187,7 +187,7 @@ class _Program:
             # while the call is traced (nothing ran, no donated buffer consumed): fall back to the plain program.
             try:
                 same = self._sig is None or _signature(args) == self._sig
-            except Exception:  # noqa: BLE001
+            except Exception:
                 same = True
             if same:
                 raise
@@ -207,7 +207,7 @@ class _Program:
         t = time.time()
         try:
             out = f(*args)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             if self.origin == "traced":
                 raise
             STORE.stats["failed"] += 1
@@ -242,7 +242,7 @@ class _Program:
                 st.stats["load_s"] += time.time() - t
                 self._sig, self.origin = sig, "loaded"
                 return f
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 st.log(f"   aot: {p} unreadable ({type(e).__name__}: {str(e)[:200]}) -> traced")
                 break
         jf = jax.jit(self._fn, **self._kw)
@@ -259,7 +259,7 @@ class _Program:
                 st.stats["export_s"] += time.time() - t
                 self._sig, self.origin = sig, "exported"
                 return f
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 st.stats["failed"] += 1
                 st.log(f"   aot: export of {name} failed ({type(e).__name__}: {str(e)[:400]}) -> traced")
         st.stats["traced"] += 1

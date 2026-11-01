@@ -5,10 +5,14 @@
 Runs N different prompts (1) one after the other and (2) all at once; prints per-request TTFT / tok/s and the
 aggregate tok/s of the concurrent round, plus the server's /health deltas (steps, step_tokens = batched rows).
 """
-import argparse, json, os, sys, threading, time, urllib.request
+import argparse
+import os
+import sys
+import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bench_endpoint import anthropic_stream, health  # noqa: E402
+from bench_endpoint import anthropic_stream, health
 
 PROMPTS = ["Explain how a hash map works and when you would not use one.",
            "Write a Python function that parses ISO-8601 dates without external libraries, with tests.",
@@ -24,7 +28,7 @@ def one(url, key, prompt, max_tokens, out, i):
     try:
         out[i] = anthropic_stream(url, key, {"model": "glm-5.3-flash", "max_tokens": max_tokens,
                                              "messages": [{"role": "user", "content": prompt}]})
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         out[i] = {"error": repr(e)[:120]}
 
 

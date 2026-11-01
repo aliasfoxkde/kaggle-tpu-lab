@@ -26,7 +26,27 @@ know it is the first to run that model on a TPU.
 
 A Kaggle account with TPU access (verify it under Settings: a phone number, and for some accounts an identity check through Persona before TPU sessions are handed out) and its free quota,
 around 20 TPU hours a week. Nothing to install for the notebook route. For the terminal
-route, Python 3.9+ and the Kaggle CLI.
+route you also need a Kaggle API token (kaggle.com → Settings → API → Create New Token,
+then put `kaggle.json` at `~/.kaggle/kaggle.json`) and, locally, Python 3.9+ with
+`pip install kaggle`.
+
+## Running the tests
+
+The GLM engine ships a pytest suite (`glm53-flash/engine/glm53/tests/`, ~100 tests)
+that runs on CPU only — no TPU needed:
+
+```bash
+pip install jax pytest
+cd glm53-flash/engine && python -m pytest glm53/tests
+```
+
+## Where the engine lives
+
+The GLM-5.3-Flash engine is a JAX package at `glm53-flash/engine/glm53/`: `model.py`
+(sharding + layer forward), `pallas_moe.py` / `pallas_mhc.py` (Pallas kernels for the
+MoE and multi-head conv), `planes.py` (3-bit IQ codebook math), `quant8.py` (int8
+non-expert weights), `dflash.py` + `scheduler.py` (speculative decoding and batching),
+`checkpoint.py` / `basestore.py` / `aot.py` / `resident.py` (weights, compile cache).
 
 ## How a session works
 
@@ -49,7 +69,9 @@ Each folder README has the exact lines for Claude Code, Codex CLI and opencode.
 ```bash
 git clone https://github.com/ARahim3/kaggle-tpu-lab
 cd kaggle-tpu-lab
-python launch.py serve            # Qwen3.8-27B today; --model picks another recipe once there is one
+python launch.py serve            # Qwen3.8-27B (the default)
+python launch.py serve --model glm53-flash       # GLM-5.3-Flash on our own JAX engine
+python launch.py serve --model qwen38-27b-gpu    # Qwen3.8-27B on the free GPU (T4 x2)
 ```
 
 `launch.py` pushes the kernel with the Kaggle CLI and follows its progress; `status`

@@ -23,8 +23,8 @@ import functools
 from typing import Any
 
 import jax
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 
 Params = dict[str, Any]
@@ -95,7 +95,7 @@ class Cfg:
         return y if self.tp_reduce is None else self.tp_reduce(y)
 
     @classmethod
-    def from_hf(cls, c, dtype=jnp.float32) -> "Cfg":
+    def from_hf(cls, c, dtype=jnp.float32) -> Cfg:
         return cls(
             hidden=c.hidden_size, vocab=c.vocab_size, n_layers=c.num_hidden_layers,
             layer_types=tuple(c.layer_types), mlp_types=tuple(c.mlp_layer_types), eps=c.rms_norm_eps,
@@ -730,7 +730,7 @@ def indexer_select(scores, pool_valid, qpos, cfg: Cfg, chip=None):
     # the local pools a query at position q can see are the first (q + 1) // (n * kp) + 1 (interleaved layout): the
     # sorts run over that bucket of the P_local scores, not all of them (a 262k cache scores 8,192 pools per chip at
     # any context; the TPU-v5e paper's "blocks sized for the max context" cost). Every chip takes the same branch.
-    Ls = [L for L in cfg.select_buckets if L < P_local] + [P_local]
+    Ls = [L for L in cfg.select_buckets if P_local > L] + [P_local]
     if len(Ls) == 1:
         vs, ss = select(P_local)
     else:
@@ -1032,9 +1032,9 @@ def mla_core_rows(p, proj, cfg: Cfg, caches, pos, sparse="auto", cap=None, hist=
     T = q_lat.shape[1]
     n = cfg.seq_shard
     S = caches[0]["c"].shape[1] * n
-    use_sparse = sparse == "always" or (sparse == "auto" and S > cfg.idx_topk)
+    use_sparse = sparse == "always" or (sparse == "auto" and cfg.idx_topk < S)
     if (B == 1 or not ROWS_SHARED_MIN or B * T < ROWS_SHARED_MIN
-            or not (use_sparse and "indexer" in p and T <= min(cfg.per_query_max, cfg.q_block))):
+            or not (use_sparse and "indexer" in p and min(cfg.per_query_max, cfg.q_block) >= T)):
         outs, new = [], []
         for b, (c, pb) in enumerate(zip(caches, pos)):
             o_b, nc = mla_core(p, {k: v[b:b + 1] for k, v in proj.items()}, cfg, c, pb, sparse, cap, None, hist)
@@ -1084,7 +1084,7 @@ def mla_core(p, proj, cfg: Cfg, cache=None, pos0=0, sparse=None, cap=None, lengt
     cs_all = new_cache.get("cs")                                                   # [B,S_local] scales under q8
     dtype = new_c.dtype
     qpos = pos0 + jnp.arange(T)
-    use_sparse = sparse == "always" or (sparse == "auto" and S > cfg.idx_topk)
+    use_sparse = sparse == "always" or (sparse == "auto" and cfg.idx_topk < S)
     if use_sparse:
         pool_keys = new_cache["pk"].astype(jnp.float32)                            # [B,P_local,ihd] cached pooled keys
         pool_valid = jnp.ones((pool_keys.shape[1],), bool)                         # only complete pools are written;
@@ -1211,7 +1211,7 @@ def moe_apply(x, gate_up_w, down_w, w, limit):
 
 def moe_apply_grouped(x, gu_w, dn_w, idx_local, w, limit, chunk=256):
     """Grouped experts: x [N,D]; gu_w [Eh,D,2mi]; dn_w [Eh,mi,D]; idx_local [N,k] (ids into Eh, -1 = none);
-    w [N,k]. Every token is run through every gathered expert (dense, masked) — Eh/k× extra FLOPs but no per-token
+    w [N,k]. Every token is run through every gathered expert (dense, masked) — Eh/k x extra FLOPs but no per-token
     weight copies, so prefill fits HBM. Token chunks of `chunk` bound the [N,Eh,mi] intermediate."""
     N, D = x.shape
     Eh = gu_w.shape[0]

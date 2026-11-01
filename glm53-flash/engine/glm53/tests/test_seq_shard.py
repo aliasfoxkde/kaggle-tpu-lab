@@ -5,13 +5,13 @@ import pytest
 import torch
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
-from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel  # noqa: E402
+import jax.numpy as jnp
+from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel
 
-from glm53 import model as M  # noqa: E402
-from glm53.engine import Engine  # noqa: E402
-from glm53.hf_convert import from_hf_module  # noqa: E402
-from glm53.tests.test_tiny_vs_hf import tiny_config  # noqa: E402
+from glm53 import model as M
+from glm53.engine import Engine
+from glm53.hf_convert import from_hf_module
+from glm53.tests.test_tiny_vs_hf import tiny_config
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
@@ -67,7 +67,7 @@ def test_sharded_cache_matches_replicated(q_block, index_topk, union, topk_local
     for i, (x, y) in enumerate(zip(a, b)):
         np.testing.assert_allclose(y, x, rtol=1e-4, atol=1e-4, err_msg=f"step {i}")
     # the sharded MLA cache really is split: each chip holds cap/8 slots
-    mla = [i for i in range(jcfg.n_layers) if jcfg.layer_types[i] != "linear_attention"][0]
+    mla = next(i for i in range(jcfg.n_layers) if jcfg.layer_types[i] != "linear_attention")
     assert cb[mla]["c"].shape[1] == cap and cb[mla]["c"].sharding.shard_shape(cb[mla]["c"].shape)[1] == cap // 8
     assert ca[mla]["c"].sharding.shard_shape(ca[mla]["c"].shape)[1] == cap
 
@@ -76,9 +76,8 @@ def test_sharded_cache_matches_replicated(q_block, index_topk, union, topk_local
 def test_chunked_prefill_and_continue(seq_shard):
     """ResidentLayerEngine pieces of 32 tokens (3 pieces for T=70, the last padded) == one-shot Engine prefill;
     prefill of 40 tokens then a 30-token continuation == the same."""
-    from glm53.resident import ResidentLayerEngine
+    from glm53.resident import ResidentFetch, ResidentLayerEngine
     from glm53.tests.test_resident_cpu import random_tables
-    from glm53.resident import ResidentFetch
     cfg, params, jcfg = build(16)
     # resident experts need 256-wide dims; rebuild the tiny model at the resident sizes
     torch.manual_seed(0)
@@ -126,7 +125,7 @@ def test_chunked_prefill_and_continue(seq_shard):
     # compact prefix snapshot (used cache rows only) restored into fresh full-capacity caches, continued twice
     _, caches, pos = eng.prefill(ids[:, :40])
     ps = eng.snapshot_prefix(caches, pos)
-    mla = [i for i in range(jcfg.n_layers) if jcfg.layer_types[i] != "linear_attention"][0]
+    mla = next(i for i in range(jcfg.n_layers) if jcfg.layer_types[i] != "linear_attention")
     assert ps["caches"][mla]["c"].shape[1] < caches[mla]["c"].shape[1]
     for _ in range(2):
         e, _, _ = run(eng, ids[:, 40:], n_dec=3, caches=eng.restore_prefix(ps), pos0=pos)

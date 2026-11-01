@@ -11,12 +11,12 @@ import pytest
 import torch
 
 jax = pytest.importorskip("jax")
-import jax.numpy as jnp  # noqa: E402
-from jax.sharding import Mesh  # noqa: E402
+import jax.numpy as jnp
+from jax.sharding import Mesh
 
-from glm53 import dflash as D  # noqa: E402
-from glm53.engine import AXIS  # noqa: E402
-from glm53.tests import dflash_ref as REF  # noqa: E402
+from glm53 import dflash as D
+from glm53.engine import AXIS
+from glm53.tests import dflash_ref as REF
 
 jax.config.update("jax_default_matmul_precision", "highest")
 
@@ -24,14 +24,14 @@ CODEBOOKS = ("candidate_selector.predecessor_codebook", "candidate_selector.succ
 
 
 def tiny_config():
-    return dict(architectures=["DFlash2DraftModel"], model_type="qwen3", hidden_size=64, num_attention_heads=16,
-                num_key_value_heads=8, head_dim=8, intermediate_size=128, num_hidden_layers=2, rms_norm_eps=1e-5,
-                vocab_size=512, use_sliding_window=True, sliding_window=16, max_window_layers=2, is_causal=False,
-                layer_types=["sliding_attention"] * 2, max_position_embeddings=4096, attention_bias=False,
-                rope_parameters={"rope_theta": 10000.0, "rope_type": "default"}, num_target_layers=6,
-                tie_word_embeddings=False,
-                dflash_config={"block_size": 8, "mask_token_id": 500, "target_layer_ids": [1, 3, 4],
-                               "selector_rank": 8, "selector_top_k": 4, "conv_kernel_size": 2, "conv_group_size": 4})
+    return {"architectures": ["DFlash2DraftModel"], "model_type": "qwen3", "hidden_size": 64, "num_attention_heads": 16,
+                "num_key_value_heads": 8, "head_dim": 8, "intermediate_size": 128, "num_hidden_layers": 2, "rms_norm_eps": 1e-5,
+                "vocab_size": 512, "use_sliding_window": True, "sliding_window": 16, "max_window_layers": 2, "is_causal": False,
+                "layer_types": ["sliding_attention"] * 2, "max_position_embeddings": 4096, "attention_bias": False,
+                "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}, "num_target_layers": 6,
+                "tie_word_embeddings": False,
+                "dflash_config": {"block_size": 8, "mask_token_id": 500, "target_layer_ids": [1, 3, 4],
+                               "selector_rank": 8, "selector_top_k": 4, "conv_kernel_size": 2, "conv_group_size": 4}}
 
 
 def ref_model(c):
@@ -192,7 +192,7 @@ def test_tiny_hidden_and_sampled_q(tiny):
     temp = 0.7
     mine = run_mine(drafter, cfg, embed, lm_head, [steps], temperature=temp, key=jax.random.PRNGKey(3))
     refs = ref_steps(m, E, W, steps, paths=[np.asarray(x[1][0]) for x in mine])
-    for (cand, path, scores, q), ref in zip(mine, refs):
+    for (cand, path, _, q), ref in zip(mine, refs):
         c0, q0 = by_id(np.asarray(cand[0]), np.asarray(q[0]))
         c1, s1 = by_id(ref[1], ref[3])
         np.testing.assert_array_equal(c0, c1)
@@ -242,7 +242,7 @@ def test_tiny_int8_plumbing(tiny):
     rng = np.random.default_rng(5)
     steps = make_steps(rng, cfg, [8, 3, 8], prompt=20)
     mesh = Mesh(np.array(jax.devices()), (AXIS,))
-    deq = lambda t: jax.tree.map(lambda x: np.asarray(Q8.dequant_tree(x, jnp.float32)) if Q8.is_q8(x) else x,  # noqa: E731
+    deq = lambda t: jax.tree.map(lambda x: np.asarray(Q8.dequant_tree(x, jnp.float32)) if Q8.is_q8(x) else x,
                                  t, is_leaf=Q8.is_q8)
     q8 = D.Drafter(cfg, params, mesh, int8=True)
     f32 = D.Drafter(cfg, {**params, "layers": deq(jax.device_get(q8.params["layers"])),

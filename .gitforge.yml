@@ -1,0 +1,27 @@
+name: kaggle-tpu-lab-ci
+version: "1.0"
+trigger_on:
+  - push
+  - tag
+environment: {}
+jobs:
+  - name: lint
+    image: ktl-ci-python:1
+    steps:
+      - name: Ruff check (whole repo, pyproject config)
+        run: ruff check .
+    timeout: 10m
+  - name: types
+    image: ktl-ci-python:1
+    needs: [lint]
+    steps:
+      - name: mypy (relaxed baseline, pyproject config)
+        run: mypy --config-file pyproject.toml glm53-flash/engine/glm53 glm53-flash/tools tools
+    timeout: 15m
+  - name: test
+    image: ktl-ci-python:1
+    needs: [types]
+    steps:
+      - name: CPU test suite
+        run: python3 -m pytest glm53-flash/engine/glm53/tests -q --no-header > /tmp/pytest.log 2>&1; s=$?; tail -40 /tmp/pytest.log; exit $s
+    timeout: 20m

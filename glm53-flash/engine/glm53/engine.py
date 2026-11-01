@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from glm53 import model as M
 
@@ -174,7 +174,7 @@ class DeviceSampler:
 def layer_specs(cfg: M.Cfg, i: int, p: dict) -> dict:
     col, row = P(None, AXIS), P(AXIS, None)
     s = {"ln1": R, "ln2": R,
-         "hc_attn": {k: R for k in p["hc_attn"]}, "hc_ffn": {k: R for k in p["hc_ffn"]}}   # fn / fnT, base, scale
+         "hc_attn": dict.fromkeys(p["hc_attn"], R), "hc_ffn": dict.fromkeys(p["hc_ffn"], R)}   # fn / fnT, base, scale
     if cfg.layer_types[i] == "linear_attention":
         s["attn"] = {"q": col, "k": col, "v": col, "conv_q": row, "conv_k": row, "conv_v": row,
                      "f_a": R, "f_b": col, "dt_bias": P(AXIS), "A_log": P(AXIS), "b": col,
@@ -182,7 +182,7 @@ def layer_specs(cfg: M.Cfg, i: int, p: dict) -> dict:
     else:
         s["attn"] = {"q_a": R, "q_a_norm": R, "q_b": col, "kv_a": R, "kv_a_norm": R, "kv_b": col, "o": row}
         if "indexer" in p["attn"]:
-            s["attn"]["indexer"] = {k: R for k in p["attn"]["indexer"]}
+            s["attn"]["indexer"] = dict.fromkeys(p["attn"]["indexer"], R)
     if cfg.mlp_types[i] == "sparse":
         s["mlp"] = {"router_w": R, "router_bias": R, "shared": {"gate": col, "up": col, "down": row}}
         if "gate_up" in p["mlp"]:            # on-device experts (tests only): [E, D, 2, mi] / [E, mi, D]
@@ -258,7 +258,7 @@ class HostExperts:
         """mode: "float" | "fp8" | "int4", or a dict {layer: mode} for mixed tables (e.g. fp8 until host RAM ran
         out, int4 after). int4 tables: (gu_packed [n,E,D,ml] u8, gu_scale, dn_packed [n,E,ml,D/2] u8, dn_scale)."""
         self.tables = tables
-        self.modes = dict(mode) if isinstance(mode, dict) else {L: mode for L in tables}
+        self.modes = dict(mode) if isinstance(mode, dict) else dict.fromkeys(tables, mode)
         assert all(m in ("float", "fp8", "int4") for m in self.modes.values())
         self.out_dtype = out_dtype
 
@@ -271,7 +271,7 @@ class HostExperts:
         return self.modes[layer]
 
     @classmethod
-    def from_dense(cls, params: dict, cfg: M.Cfg, n_dev: int, out_dtype=jnp.float32) -> "HostExperts":
+    def from_dense(cls, params: dict, cfg: M.Cfg, n_dev: int, out_dtype=jnp.float32) -> HostExperts:
         """Split on-device style tables gate_up [E,D,2mi], down [E,mi,D] into per-device slices (float mode)."""
         tables = {}
         ml = cfg.moe_inter // n_dev
@@ -465,7 +465,7 @@ class Engine:
 
     def prefill(self, tokens: np.ndarray):
         B, T = tokens.shape
-        assert T <= self.max_len
+        assert self.max_len >= T
         Tp = self._bucket(T)
         padded = np.zeros((B, Tp), np.int32)
         padded[:, :T] = tokens
@@ -573,7 +573,7 @@ class SegmentedEngine(Engine):
         key = ("post", i, B, T, Eh)
         if key not in self._progs:
             mt = self.cfg.mlp_types[i]
-            n_in = (2 if self.host_experts.mode_for(i) == "float" else 4) if mt == "sparse" else 0
+            # expert-table count only shapes in_specs below; the program takes them via *outs
             def prog(params, streams, h, post, comb, w, idx_local, *outs):
                 p = params["layers"][i]
                 if mt == "sparse":
