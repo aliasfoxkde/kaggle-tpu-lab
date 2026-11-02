@@ -22,6 +22,8 @@ jobs:
     image: ktl-ci-python:1
     needs: [types]
     steps:
+      # Stream output (no redirect): the runner kills jobs that produce no log
+      # output for ~1h, and the CPU suite is ~4.5h with long quiet stretches.
       - name: CPU test suite
-        run: python3 -m pytest glm53-flash/engine/glm53/tests -q --no-header > /tmp/pytest.log 2>&1; s=$?; tail -40 /tmp/pytest.log; exit $s
+        run: python3 -m pytest glm53-flash/engine/glm53/tests -q --no-header 2>&1 | tail -60; exit ${PIPESTATUS[0]}
     timeout: 8h
