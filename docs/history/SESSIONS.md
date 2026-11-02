@@ -33,6 +33,19 @@ remains, without mining Claude transcripts.
 - Re-run c4e7ea56 (commit 6dd6887) pushed to the gitforge remote: lint green,
   types running, test queued. Checkpoint 15:03 verifies the test job passes
   the 1h mark (proving the watchdog fix).
+- Follow-up on run c4e7ea56/faaed95a: the test job streamed output fine but
+  was killed at 59:37 — dmesg shows a Memory-cgroup OOM (task `tf_XLAEigen`
+  python3, anon-rss 12.27G vs the runner's 12 GiB sandbox cap
+  `GITFORGE_SANDBOX_MEMORY_MB=12288` in
+  /etc/systemd/system/gitforge@.service.d/platform-runtime.conf). Cap raised
+  to 24576 and gitforge@runner restarted (operator-approved). Also: steps run
+  under dash — `${PIPESTATUS[0]}` fails with "Bad substitution"; fixed by
+  wrapping the pytest pipeline in explicit `bash -c` (commit 07937bd). Debt
+  noted: runner should support per-job memory overrides; global cap is the
+  interim measure.
+- Run 0b7a58b0 (commit 07937bd) is the verification run: lint+types expected
+  green, test job must survive past the prior 59:37 OOM point (~1h) and reach
+  the ~4.5h summary.
 
 
 Context: the prior session (34d99e57, 2026-10-31 → 11-01) crashed repeatedly
