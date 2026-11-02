@@ -24,4 +24,4 @@ jobs:
     steps:
       - name: CPU test suite
         run: python3 -m pytest glm53-flash/engine/glm53/tests -q --no-header > /tmp/pytest.log 2>&1; s=$?; tail -40 /tmp/pytest.log; exit $s
-    timeout: 20m
+    timeout: 8h

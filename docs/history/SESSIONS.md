@@ -4,7 +4,20 @@ Running log of agent work sessions on this repo, newest first. Purpose: any
 future session (human or agent) can reconstruct what was done, why, and what
 remains, without mining Claude transcripts.
 
-## 2026-11-01 — lint/quality/hygiene sweep (session 2a546700, resumed)
+## 2026-11-02 — issue18 worktree: type fixes, CI bring-up (session 10dbe6a4, in progress)
+
+- mypy/ruff type fixes across 21 engine files (branch `ci/fix-types`, uncommitted
+  pending the full local pytest validation).
+- Full CPU suite run started in docker (container 25d3687c6e98, image ktl-ci-python:1).
+  Measured pace: ~47 tests/65 min — the full 198-test suite is ~4.5 h on CPU
+  (JAX compile dominates). A first duplicate run was killed; the harness also
+  reaped the background wrapper on low memory (host swap pressure), container survived.
+- `.gitforge.yml` test-job timeout raised 20m → 8h: the 20m figure was never
+  measured against the real suite and would have failed the first push.
+- docs/UPSTREAM_AUDIT.md: PR #22 corrected to CLOSED-unmerged, superseded by #24.
+- Upstream evidence for #17/#18/#20 verified posted (PRs 23/24/21 linked);
+  issue closure is the maintainer's call on merge.
+
 
 Context: the prior session (34d99e57, 2026-10-31 → 11-01) crashed repeatedly
 with "automatic compaction failed" and left ~60 modified + 8 untracked files.
