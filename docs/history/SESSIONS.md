@@ -17,6 +17,22 @@ remains, without mining Claude transcripts.
 - docs/UPSTREAM_AUDIT.md: PR #22 corrected to CLOSED-unmerged, superseded by #24.
 - Upstream evidence for #17/#18/#20 verified posted (PRs 23/24/21 linked);
   issue closure is the maintainer's call on merge.
+- GitForge CI findings (run 4a7d2be5, commit e1b6423): lint and types both
+  green on the CI image — first fully passing lint+mypy in CI. The test job
+  was killed at exactly 60:09 with exit 137. Not OOM (`State.OOMKilled=false`,
+  12 GiB container limit untouched): the runner's ~1h no-output watchdog did
+  it, because the step redirected all pytest output to /tmp/pytest.log,
+  leaving the streamed job log empty (0 bytes). Fix in 6dd6887: stream pytest
+  output with `| tail -60` and `exit ${PIPESTATUS[0]}`.
+- Push routing: `origin` is GitHub; GitForge CI only triggers on pushes to
+  the `gitforge` remote (http://127.0.0.1:42782/bigdata-ci/kaggle-tpu-lab).
+  Pushes to GitHub alone never create pipeline_trigger_requests.
+- Stored API tokens (operator/ci-trigger/admin) are expired/invalid against
+  the pipeline API; user+password basic auth is also rejected on
+  /api/pipelines. Pipeline triggering relies on the push hook path.
+- Re-run c4e7ea56 (commit 6dd6887) pushed to the gitforge remote: lint green,
+  types running, test queued. Checkpoint 15:03 verifies the test job passes
+  the 1h mark (proving the watchdog fix).
 
 
 Context: the prior session (34d99e57, 2026-10-31 → 11-01) crashed repeatedly
