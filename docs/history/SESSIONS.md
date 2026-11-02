@@ -46,6 +46,15 @@ remains, without mining Claude transcripts.
 - Run 0b7a58b0 (commit 07937bd) is the verification run: lint+types expected
   green, test job must survive past the prior 59:37 OOM point (~1h) and reach
   the ~4.5h summary.
+- Run 3dfdf283's test job died at 14m as `infrastructure_failure` ("container
+  lost before exec reported its exit code"). Cause: at 15:13:50 local, dockerd
+  + containerd + cloudflared + control-center-browser were simultaneously
+  SIGKILLed by an unattributed host-level actor — no kernel OOM record, no
+  oomd (inactive), no userspace guard found in cron or services; precursor was
+  journald "Under memory pressure" + load 83. Host incident, outside repo
+  scope. docker.service auto-restarted (restart counter 11); local
+  ktl-pytest-local container restarted and the suite relaunched (fresh log).
+  CI retriggered with empty commit 1ee36ed → run 60e96427.
 
 
 Context: the prior session (34d99e57, 2026-10-31 → 11-01) crashed repeatedly
