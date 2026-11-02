@@ -23,9 +23,9 @@ jobs:
     needs: [types]
     steps:
       # Stream output (no redirect): the runner kills jobs that produce no log
-      # output for ~1h. tail preserves the pytest exit code via the shell's
-      # pipeline-status expansion; the runner's step shell is dash (sh), so
-      # bash-only ${PIPESTATUS} is unavailable.
+      # output for ~1h, and the CPU suite is ~4.5h with long quiet stretches.
+      # The step shell is dash (no PIPESTATUS), so run the pipeline under
+      # bash explicitly to preserve pytest's exit code.
       - name: CPU test suite
-        run: python3 -m pytest glm53-flash/engine/glm53/tests -q --no-header 2>&1 | tail -60; exit $?
+        run: bash -c 'python3 -m pytest glm53-flash/engine/glm53/tests -q --no-header 2>&1 | tail -60; exit ${PIPESTATUS[0]}'
     timeout: 8h
