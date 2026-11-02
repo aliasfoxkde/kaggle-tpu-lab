@@ -851,7 +851,7 @@ log("#      -d '{\"model\": \"" + CFG["served_model_name"] + "\", \"messages\": 
     "\"content\": \"Hello!\"}], \"chat_template_kwargs\": {\"reasoning_effort\": \"low\"}}'")
 log(f"#  Serving for up to {CFG['keepalive_min']} min, then this cell exits on its own.")
 log("#" * 70)
-publish("ready", endpoint=(f"{url}/v1" if url else None), api_key=CFG["api_key"],
+publish("ready", endpoint=(f"{url}/v1" if url else None),        # no api_key: ntfy topics are public
         model=CFG["served_model_name"], max_model_len=CFG["max_model_len"],
         keepalive_min=CFG["keepalive_min"], startup_secs=startup)
 

@@ -22,7 +22,7 @@ A cold run leaves `jax_cache/` (everything it compiled), `exported/` (every prog
 FP8 checkpoint, `base/` (the non-expert weights, vision tower and tokenizer, ~11 GB) in /kaggle/working, so its output
 can be turned into the serve dataset ("New dataset" from the kernel output) that later runs attach.
 """
-import base64, collections, glob, hashlib, io, json, os, queue, re, secrets, shutil, subprocess, sys, tarfile, threading, time, urllib.request, uuid
+import base64, collections, glob, hashlib, hmac, io, json, os, queue, re, secrets, shutil, subprocess, sys, tarfile, threading, time, urllib.request, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -99,6 +99,7 @@ DEFAULTS = {
     "served_model_name": "glm-5.3-flash",
     "tunnel": True,                  # False: no cloudflared (local testing)
     "skip_runtime": False,           # True: no pip installs (local testing)
+    "bind": "0.0.0.0",               # "127.0.0.1" when the endpoint is reached through an SSH forward only (gcp/run.sh sets this)
     "port": 8000,
 }
 CFG = {**DEFAULTS, **(CFG or {}), **globals().get("CFG_PRESET", {})}
@@ -1045,7 +1046,7 @@ class H(BaseHTTPRequestHandler):
         if not API_KEY:
             return True
         h = self.headers.get("Authorization", ""); k = self.headers.get("x-api-key", "")
-        return h == f"Bearer {API_KEY}" or k == API_KEY
+        return hmac.compare_digest(h, f"Bearer {API_KEY}") or hmac.compare_digest(k, API_KEY)
 
     def _sse(self, obj, event=None):
         self._raw((f"event: {event}\n" if event else "") + f"data: {json.dumps(obj)}\n\n")
@@ -1298,7 +1299,7 @@ if CFG["aot"]:
 publish("warmed", minutes=round((time.time() - t_warm) / 60, 1), hbm_gb=round(use, 2))
 
 SCHED.start()
-srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
+srv = ThreadingHTTPServer((CFG.get("bind", "0.0.0.0"), PORT), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 log(f"   HTTP server on :{PORT}")
 
@@ -1407,7 +1408,7 @@ log(f"#    ANTHROPIC_SMALL_FAST_MODEL={MODEL} CLAUDE_CODE_MAX_CONTEXT_TOKENS={CF
 log("#  OpenAI-compatible clients: base URL " + endpoint + "/v1, model " + MODEL)
 log(f"#  Serving for up to {CFG['keepalive_min']} min, then this cell exits on its own.")
 log("#" * 70)
-publish("ready", endpoint=endpoint, api_key=API_KEY, model=MODEL, max_model_len=CFG["max_len"],
+publish("ready", endpoint=endpoint, model=MODEL, max_model_len=CFG["max_len"],   # no api_key: ntfy topics are public
         keepalive_min=CFG["keepalive_min"], startup_secs=int(time.time() - T0))
 
 if globals().get("SERVE_FOREVER", True):
