@@ -1,4 +1,6 @@
 """Tiny random Glm5Next: JAX (glm53.model) vs transformers reference, CPU fp32."""
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
@@ -16,6 +18,15 @@ jax.config.update("jax_default_matmul_precision", "highest")
 
 
 def tiny_config(index_topk=64):
+    # The GLM5-next-specific knobs below are not in every transformers release's
+    # Glm5NextTextConfig signature, but PretrainedConfig accepts them as extra
+    # attributes; the type stubs reject them by name, so they go through **kwargs.
+    extra: dict[str, Any] = {
+        "scoring_func": "sigmoid", "topk_method": "noaux_tc",
+        "mla_use_nope": True, "index_kpool_compress": True,
+        "linear_attn_config": {"num_heads": 4, "head_dim": 16, "short_conv_kernel_size": 4, "gate_lower_bound": -5.0},
+        "mhc": True, "first_k_dense_replace": 1, "moe_router_dtype": "float32",
+    }
     return Glm5NextTextConfig(
         vocab_size=512, hidden_size=64, intermediate_size=96, moe_intermediate_size=32,
         num_hidden_layers=6,
@@ -24,15 +35,15 @@ def tiny_config(index_topk=64):
         mlp_layer_types=["dense", "sparse", "sparse", "sparse", "sparse", "sparse"],
         indexer_types=["full"] * 6,
         n_routed_experts=8, num_experts_per_tok=2, n_shared_experts=1, n_group=1, topk_group=1,
-        norm_topk_prob=True, routed_scaling_factor=2.5, scoring_func="sigmoid", topk_method="noaux_tc",
+        norm_topk_prob=True, routed_scaling_factor=2.5,
         num_attention_heads=4, num_key_value_heads=4, q_lora_rank=48, kv_lora_rank=32,
-        qk_nope_head_dim=16, qk_rope_head_dim=0, v_head_dim=16, head_dim=0, mla_use_nope=True,
+        qk_nope_head_dim=16, qk_rope_head_dim=0, v_head_dim=16, head_dim=0,
         index_n_heads=2, index_head_dim=16, index_topk=index_topk, index_kpool=4,
-        index_kpool_always_select_tail=True, index_kpool_compress=True,
-        linear_attn_config={"num_heads": 4, "head_dim": 16, "short_conv_kernel_size": 4, "gate_lower_bound": -5.0},
-        hc_mult=4, hc_sinkhorn_iters=20, hc_eps=1e-6, mhc=True,
-        rms_norm_eps=1e-5, swiglu_limit=10.0, max_position_embeddings=4096, first_k_dense_replace=1,
-        dtype=torch.float32, tie_word_embeddings=False, moe_router_dtype="float32", pad_token_id=0,
+        index_kpool_always_select_tail=True,
+        hc_mult=4, hc_sinkhorn_iters=20, hc_eps=1e-6,
+        rms_norm_eps=1e-5, swiglu_limit=10.0, max_position_embeddings=4096,
+        dtype=torch.float32, tie_word_embeddings=False, pad_token_id=0,
+        **extra,
     )
 
 
@@ -137,7 +148,8 @@ def test_sparse_indexer_matches_hf(setup):
     # small query blocks (ragged last block) and a union budget of 1 pool (every block overflows -> per-query gathers)
     import dataclasses
     for kw in ({"q_block": 7}, {"union_pools": 1}, {"q_block": 16, "union_pools": 1}):
-        out2, _ = M.forward(params2, jnp.asarray(ids), dataclasses.replace(jcfg2, **kw), sparse="always")
+        overrides: dict[str, Any] = dict(kw)
+        out2, _ = M.forward(params2, jnp.asarray(ids), dataclasses.replace(jcfg2, **overrides), sparse="always")
         rel = np.abs(np.asarray(out2) - ref).max() / np.abs(ref).max()
         assert rel < 2e-3, (kw, rel)
     # sanity: dense attention must NOT match (otherwise the test isn't exercising sparsity)

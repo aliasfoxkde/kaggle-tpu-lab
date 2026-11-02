@@ -17,6 +17,7 @@ Activations are permuted to the planes' "pm" input order (planes.pm_x / pm_flat)
 import dataclasses
 import queue
 import threading
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -310,7 +311,7 @@ class _Reaper(threading.Thread):
 
     def __init__(self):
         super().__init__(daemon=True, name="glm53-reaper")
-        self.q = queue.SimpleQueue()
+        self.q: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self.start()
 
     def run(self):
@@ -353,12 +354,12 @@ class ResidentLayerEngine(Engine):
     `copy_caches` for snapshots)."""
 
     def __init__(self, cfg, params, expert_fetch, devices=None, max_len: int = 4096, layers_per_program: int = 1,
-                 layers_per_program_prefill: int = 1, int8_nonexpert: bool = False, seq_shard: bool = False,
+                 layers_per_program_prefill: int = 1, int8_nonexpert: bool | str = False, seq_shard: bool = False,
                  q_block: int = 128, prefill_piece: int = 2048, cache_q8: bool = False):
         super().__init__(cfg, params, None, devices, max_len, expert_fetch=expert_fetch, int8_nonexpert=int8_nonexpert,
                          seq_shard=seq_shard, q_block=q_block, cache_q8=cache_q8)
-        self._progs = {}
-        self._allocs = {}
+        self._progs: dict[Any, Any] = {}
+        self._allocs: dict[Any, Any] = {}
         self.launches = 0
         assert prefill_piece in self.PREFILL_BUCKETS, prefill_piece
         self.prefill_piece = min(prefill_piece, max_len)
@@ -421,7 +422,7 @@ class ResidentLayerEngine(Engine):
         """How a group program returns the per-token histories of a verify: {hist key: positions j in the group that
         have it}, one array stacked over those layers per key (not one per layer: every array a program allocates for
         its outputs costs ~17.5 us of host time per dispatch on the 8-chip mesh, j101 2026-10-04)."""
-        lay = {}
+        lay: dict[str, list[int]] = {}
         for j, i in enumerate(layers):
             for k in (self._hist_spec(i, kin) or {}):
                 lay.setdefault(k, []).append(j)
@@ -472,7 +473,7 @@ class ResidentLayerEngine(Engine):
                     new.append(nc); hs.append(h)
                     if j in capture:
                         feats.append(self._stream_mean(streams))
-                out = (streams, new)
+                out: tuple[Any, ...] = (streams, new)
                 if hist:
                     out += ({k: jnp.stack([hs[j][k] for j in js]) for k, js in lay.items()},)
                 return out + ((jnp.stack(feats),) if capture else ())
@@ -607,10 +608,11 @@ class ResidentLayerEngine(Engine):
         layer's entry, index n_layers, when an MTP layer is installed: its attention cache and the carried final
         hidden state "h" [B,1,D] of the last processed position; or the DFlash drafter's context ring there)."""
         cfg = self.cfg
-        out = []
+        out: list[dict[str, Any]] = []
         n_entries = cfg.n_layers + (1 if self.mtp is not None or self.dflash is not None else 0)
         for i in range(n_entries):
             spec = self._cache_spec(i)
+            shapes: dict[str, tuple[tuple[Any, ...], Any]]
             if i == cfg.n_layers and self.dflash is not None:
                 dc = self.dflash.cfg
                 shapes = dict.fromkeys(("k", "v"), ((dc.n_layers, B, dc.window, dc.kv_heads, dc.hd), dc.dtype))
@@ -624,7 +626,7 @@ class ResidentLayerEngine(Engine):
             else:
                 has_ix = "indexer" in self.params["layers"][i]["attn"]
                 shapes = {k: (sh, M.cache_dtype(cfg, k, cfg.dtype)) for k, sh in M.mla_cache_shapes(cfg, B, self.max_len, has_ix).items()}
-            c = {}
+            c: dict[str, Any] = {}
             for k, (shape, dtype) in shapes.items():
                 key = (shape, jnp.dtype(dtype), spec[k])
                 if key not in self._allocs:
@@ -734,7 +736,8 @@ class ResidentLayerEngine(Engine):
         else:
             streams = self._prog_embed(B, T, True)(self.params["embed"], jnp.asarray(tokens), jnp.asarray(override[0]),
                                                    jnp.asarray(override[1]))
-        new_caches, feats = [], []
+        new_caches: list[Any] = []
+        feats: list[Any] = []
         has_cache = caches is not None
         pos0, length = self.scalar(pos0), self.scalar(length)
         for g in self.groups["decode" if use_recurrent else "prefill"]:
@@ -1004,7 +1007,7 @@ class ResidentLayerEngine(Engine):
         (histories per group, n_keep [B], T) of the previous verify, whose rollback the groups apply first."""
         B, T = tokens.shape
         streams = (self.params["embed"], jnp.asarray(tokens))       # the first group program embeds
-        new_sets = [[] for _ in range(B)]
+        new_sets: list[list[Any]] = [[] for _ in range(B)]
         hists, feats, fidx = [], [], []
         tl = self.dflash.cfg.target_layers
         for gi, g in enumerate(self.groups["decode"]):
@@ -1043,7 +1046,7 @@ class ResidentLayerEngine(Engine):
             tokens = jnp.asarray(np.asarray(tokens, np.int32).reshape(B))   # (a device array from the last step passes through)
         streams, pos_next = self._prog_embed_rows(B)(self.params["embed"], tokens, pos)
         cap = self.dflash is not None and all(len(c) > n for c in cache_sets)
-        new_sets = [[] for _ in range(B)]
+        new_sets: list[list[Any]] = [[] for _ in range(B)]
         feats, fidx = [], []
         for g in self.groups["decode"]:
             prog = self._prog_group_rows(g, B, cap)

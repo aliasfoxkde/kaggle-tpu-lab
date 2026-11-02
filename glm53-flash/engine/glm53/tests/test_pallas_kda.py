@@ -104,9 +104,9 @@ def test_rows_match_xla(monkeypatch):
     x = jnp.asarray(rng.standard_normal((B, T, D)), jnp.float32)
     monkeypatch.setattr(M, "KDA_INTERPRET", True)
     monkeypatch.setattr(M, "KDA_KERNEL", True)
-    y, new = M.kda_attention_rows(p, x, cfg, caches, hist="kin")
+    y, new = M.kda_attention_rows(p, x, cfg, caches, hist="kin")  # type: ignore[arg-type]
     monkeypatch.setattr(M, "KDA_KERNEL", False)
-    ry, rnew = M.kda_attention_rows(p, x, cfg, caches, hist="kin")
+    ry, rnew = M.kda_attention_rows(p, x, cfg, caches, hist="kin")  # type: ignore[arg-type]
     assert _rel(y, ry) < 1e-5
     for a, b in zip(new, rnew):
         for k in a:

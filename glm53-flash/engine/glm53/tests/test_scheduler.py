@@ -27,7 +27,7 @@ def reference(eng, prompt, max_new):
 
 
 def make_sched(eng, max_streams, max_sets, log):
-    state = {}
+    state: dict = {}
     snaps = SnapStore(eng, int(50e9), rows_bucket=8, log=log, state=state)
     sched = Scheduler(eng, {STOP}, max_streams=max_streams, max_sets=max_sets, snaps=snaps, log=log, state=state,
                       base_min=10 ** 9, snap_min=1, piece=32)

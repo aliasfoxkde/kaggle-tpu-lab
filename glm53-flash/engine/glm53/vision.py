@@ -85,10 +85,10 @@ def position_ids(grids):
     """[N, 2] (h, w) patch positions in the block-major order, for all images concatenated."""
     out = []
     for t, gh, gw in grids:
-        hh, ww = np.meshgrid(np.arange(gh), np.arange(gw), indexing="ij")
+        hh0, ww0 = np.meshgrid(np.arange(gh), np.arange(gw), indexing="ij")
         shp = (gh // MERGE, MERGE, gw // MERGE, MERGE)
-        hh = hh.reshape(shp).transpose(0, 2, 1, 3).reshape(-1)
-        ww = ww.reshape(shp).transpose(0, 2, 1, 3).reshape(-1)
+        hh = hh0.reshape(shp).transpose(0, 2, 1, 3).reshape(-1)
+        ww = ww0.reshape(shp).transpose(0, 2, 1, 3).reshape(-1)
         out.append(np.tile(np.stack([hh, ww], -1), (t, 1)))
     return np.concatenate(out, 0).astype(np.int32)
 

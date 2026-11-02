@@ -9,6 +9,7 @@ arrays are stored as uint16 bit patterns with the dtype recorded; non-array leav
 import json
 import os
 import shutil
+from typing import Any
 
 import jax
 import numpy as np
@@ -34,7 +35,7 @@ def flatten(tree, prefix=""):
 
 def unflatten(flat):
     """Inverse of `flatten`: a container whose keys are all integers becomes a list (in index order)."""
-    root = {}
+    root: dict[str, Any] = {}
     for key, leaf in flat.items():
         parts = key.split("/")
         d = root

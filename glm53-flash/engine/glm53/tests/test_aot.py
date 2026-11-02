@@ -3,6 +3,8 @@ interpret-mode Pallas): a first engine traces, exports and runs every program th
 the same build finds every file and traces nothing; both produce what the plain `jax.jit` engine produces (prefill
 logits, batched plain decode, speculative steps for one stream and for two, the settle, a snapshot round trip). A
 changed setting or program key is a different file."""
+import types
+
 import numpy as np
 import pytest
 
@@ -28,7 +30,7 @@ def make():
 
 def sequence(eng, ids):
     """Every kind of program the kernel's warm-up builds, on fixed inputs -> host values to compare."""
-    out = {}
+    out: dict = {}
     logits, caches, pos = eng.prefill(ids)
     out["prefill"] = np.asarray(logits)
     first = int(jnp.argmax(logits[0]))
@@ -122,7 +124,7 @@ def test_names_do_not_depend_on_import_order(store):
     """A module first imported while a program is traced (pallas_mhc on the TPU) must not change the names of the
     programs resolved after it: `configure` imports every module whose settings are part of a name."""
     import sys
-    saved = {m: sys.modules.pop(m) for m in ("glm53.pallas_mhc", "glm53.pallas_kda") if m in sys.modules}
+    saved: dict[str, types.ModuleType] = {m: sys.modules.pop(m) for m in ("glm53.pallas_mhc", "glm53.pallas_kda") if m in sys.modules}
     try:
         aot.configure(store, log=lambda *a: None)
         assert all(m in sys.modules for m in ("glm53.pallas_mhc", "glm53.pallas_kda"))

@@ -25,7 +25,7 @@
 
 import time
 from types import SimpleNamespace
-from typing import ClassVar
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -128,7 +128,7 @@ def _rejection_sample(
         q = draft_probs.gather(-1, draft_tokens[..., None])[..., 0]
     else:
         q = (draft_probs * (draft_indices == draft_tokens[..., None])).sum(-1)
-    accepted = (
+    accepted = int(
         (torch.rand_like(q) * q < p).to(torch.int32).cumprod(-1).sum(-1)[0].item()
     )
     if accepted == gamma:
@@ -146,7 +146,7 @@ def _rejection_sample(
         residual / total.clamp_min(torch.finfo(residual.dtype).tiny),
         target_probs[0, accepted],
     )
-    return accepted, _sample_probs(residual[None])[0]
+    return int(accepted), _sample_probs(residual[None])[0]
 
 
 def _draft_config(config):
@@ -160,16 +160,24 @@ def _draft_value(config, name, default=None):
 def _raw_input_embeddings(
     target: nn.Module, input_ids: torch.Tensor, scale: float = 1.0
 ) -> torch.Tensor:
-    return F.embedding(input_ids, target.get_input_embeddings().weight) * scale
+    emb = cast(Any, target).get_input_embeddings()
+    assert isinstance(emb, nn.Embedding)
+    return F.embedding(input_ids, emb.weight) * scale
 
 
 def _output_head(target: nn.Module) -> nn.Module:
     head = getattr(target, "lm_head", None)
-    return head if head is not None else target.get_output_embeddings()
+    if head is not None:
+        assert isinstance(head, nn.Module)
+        return head
+    out = cast(Any, target).get_output_embeddings()
+    assert isinstance(out, nn.Module)
+    return out
 
 
 def _make_cache(config):
     cache = DynamicCache(config=config)
+    # crop() over a full sliding window needs the layer to retain past states.
     cache.activate_past_recording()
     return cache
 
@@ -219,10 +227,13 @@ def dflash_generate(
     max_length = num_input_tokens + max_new_tokens
     block_size = model.block_size if block_size is None else block_size
 
+    device = cast(Any, target).device
     output_ids = torch.full(
-        (1, max_length + 1), model.mask_token_id, dtype=torch.long, device=target.device,
+        (1, max_length + 1), model.mask_token_id, dtype=torch.long, device=device,
     )
-    position_ids = torch.arange(output_ids.shape[1], device=target.device).unsqueeze(0)
+    position_ids = torch.arange(
+        int(output_ids.shape[1]), device=device
+    ).unsqueeze(0)
     past_key_values_target = _make_cache(target.config)
     past_key_values_draft = _make_cache(model.config)
 
@@ -254,7 +265,9 @@ def dflash_generate(
         else None
     )
 
-    stopped = stop_tokens is not None and torch.isin(output_ids[:, start], stop_tokens).any()
+    stopped: bool = stop_tokens is not None and bool(
+        torch.isin(output_ids[:, start], stop_tokens).any()
+    )
     while start + 1 < max_length and not stopped:
         verify_size = min(block_size, max_length - start)
         block_output_ids = output_ids[:, start : start + verify_size].clone()
@@ -313,7 +326,9 @@ def dflash_generate(
                 bonus = _sample_probs(target_probs[:, -1])[0]
         else:
             posterior = torch.argmax(output.logits, dim=-1)
-            acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+            acceptance_length = int(
+                (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+            )
             bonus = posterior[:, acceptance_length][0]
         output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
         output_ids[:, start + acceptance_length + 1] = bonus
@@ -323,7 +338,7 @@ def dflash_generate(
                 output_ids[0, start + 1 : start + produced + 1], stop_tokens
             ).nonzero(as_tuple=True)[0]
             if stop_indices.numel() > 0:
-                produced = stop_indices[0].item() + 1
+                produced = int(stop_indices[0].item()) + 1
                 stopped = True
         start += produced
         _crop_to(past_key_values_target, start)
@@ -574,7 +589,9 @@ class CandidateSelector(nn.Module):
 
 class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
-    _no_split_modules: ClassVar[list[str]] = ["Qwen3DFlashDecoderLayer"]
+    # transformers declares `_no_split_modules` as an instance variable on the base class,
+    # so a ClassVar here is an invalid override; the list must stay class-level.
+    _no_split_modules = ["Qwen3DFlashDecoderLayer"]  # noqa: RUF012
 
     def __init__(self, config) -> None:
         super().__init__(config)

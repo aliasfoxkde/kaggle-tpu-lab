@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench_endpoint import health, post
@@ -158,7 +159,7 @@ def main():
     check("kept alive while the call was generated", pings >= 1 and gap < 45, f"{pings} pings, {gap:.1f}s silence")
     if a.queue:
         n = h["max_streams"] + h["max_queue"] + 1
-        codes = [None] * n
+        codes: list[Any] = [None] * n
         def fire(i):
             try:
                 post(url, "/v1/chat/completions", {"max_tokens": 64, "messages": [{"role": "user", "content": f"Write a limerick number {i}."}]}, key).read(); codes[i] = 200

@@ -22,7 +22,7 @@ def eng():
 
 
 def run_sched(eng, policy, reqs, max_streams=2):
-    state = {}
+    state: dict = {}
     snaps = SnapStore(eng, int(50e9), rows_bucket=8, log=lambda *a: None, state=state)
     sched = Scheduler(eng, {STOP}, max_streams=max_streams, max_sets=3, snaps=snaps, log=lambda *a: None, state=state,
                       base_min=10 ** 9, snap_min=1, piece=32, spec=policy)
@@ -62,7 +62,7 @@ def test_policy_picks_the_cheaper_block():
     pol = DFlashPolicy({4: 21.2, 8: 27.3}, prior={4: 2.8, 8: 3.3}, probe=1000)
 
     class S:
-        pass
+        tau: dict
     s = S()
     pol.start(s)
     assert pol.pick(s) == 4                                   # 7.6 vs 8.3 ms per token

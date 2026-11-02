@@ -1,6 +1,8 @@
 """The base store (`glm53.basestore`): a tiny resident engine built with int8 non-expert weights is dumped (expert
 tables left out) and rebuilt from the store next to the same tables — identical logits; plus the tree round trip
 (bf16 as uint16, lists, non-array leaves)."""
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
@@ -22,11 +24,11 @@ jax.config.update("jax_default_matmul_precision", "highest")
 def test_tree_round_trip(tmp_path):
     import ml_dtypes
     rng = np.random.default_rng(0)
-    tree = {"a": rng.standard_normal((4, 6)).astype(ml_dtypes.bfloat16), "b": {"q": rng.integers(-127, 127, (8, 8)).astype(np.int8),
+    tree: dict[str, Any] = {"a": rng.standard_normal((4, 6)).astype(ml_dtypes.bfloat16), "b": {"q": rng.integers(-127, 127, (8, 8)).astype(np.int8),
             "s": rng.random((1, 8)).astype(np.float32)}, "blocks": [{"w": np.arange(3, dtype=np.int32)}, {"w": np.arange(5, dtype=np.int32)}],
             "n_heads": 16, "name": "x"}
     BS.save_tree(tmp_path / "t.npz", tree)
-    back = BS.load_tree(tmp_path / "t.npz")
+    back: Any = BS.load_tree(tmp_path / "t.npz")
     assert back["a"].dtype == ml_dtypes.bfloat16 and np.array_equal(back["a"].view(np.uint16), tree["a"].view(np.uint16))
     assert np.array_equal(back["b"]["q"], tree["b"]["q"]) and np.array_equal(back["b"]["s"], tree["b"]["s"])
     assert isinstance(back["blocks"], list) and len(back["blocks"]) == 2 and np.array_equal(back["blocks"][1]["w"], np.arange(5))
@@ -55,7 +57,7 @@ def test_engine_rebuilt_from_store(tmp_path):
         else:
             packed["layers"].append(L)
     fetch = ResidentFetch(qtypes, D, mi // 8, out_dtype=jnp.float32, gather_max_rows=64, chunk=4, interpret=True)
-    kw = {"max_len": 128, "layers_per_program": 3, "prefill_piece": 32, "seq_shard": True}
+    kw: dict[str, Any] = {"max_len": 128, "layers_per_program": 3, "prefill_piece": 32, "seq_shard": True}
     eng1 = ResidentLayerEngine(jcfg, packed, fetch, int8_nonexpert="all", **kw)
     # dump the engine's own parameters (device arrays, int8 nodes included; expert tables skipped)
     BS.dump(str(tmp_path), eng1.params, vision=None, hf_dir=None, meta={"test": True}, log=lambda *a: None)

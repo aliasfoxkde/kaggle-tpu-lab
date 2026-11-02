@@ -37,8 +37,8 @@ MODULES = ("model", "engine", "resident", "dflash", "pallas_moe", "pallas_mhc", 
 
 class _Store:
     def __init__(self):
-        self.write_dir = None          # traced programs are exported here (None: never export)
-        self.read_dirs = ()            # searched in order for a program's file
+        self.write_dir: str | None = None   # traced programs are exported here (None: never export)
+        self.read_dirs: tuple[str, ...] = ()  # searched in order for a program's file
         self.tag = ""                  # code + versions + device kind
         self.context = None            # () -> str: the configuration the programs close over
         self.log = print

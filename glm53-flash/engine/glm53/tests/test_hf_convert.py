@@ -5,11 +5,25 @@ in `glm53.model`: torch Linear weights are [out, in] and must be transposed to J
 conv1d weight [3C, 1, K] must be split into the q/k/v thirds; the MoE expert stacks must be transposed to
 [experts, D, ...].  The fp8 dequantizer must apply a per-128x128-block scale.
 """
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
 
 from glm53 import hf_convert
+
+
+class _Stub:
+    """Duck-typed stand-in for a torch submodule: any attribute may be set, and reading an unset
+    attribute raises AttributeError so `hasattr`/`getattr` probes behave like the real thing."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # explicit so mypy permits arbitrary attribute writes on the stub
+        object.__setattr__(self, name, value)
 
 
 def _lin(out, inp):
@@ -41,10 +55,7 @@ def test_np_keeps_float32():
 
 # ----------------------------------------------------------------------------- convert_hc
 def test_convert_hc_returns_fn_base_scale():
-    class HC:
-        pass
-
-    mod = HC()
+    mod = _Stub()
     mod.fn = _lin(4, 6).weight
     mod.base = torch.arange(4, dtype=torch.float32)
     mod.scale = torch.arange(4, dtype=torch.float32) + 1
@@ -62,10 +73,7 @@ class _Conv1d:
 
 
 def _kda(C=4, K=3, D=8):
-    class Mod:
-        pass
-
-    m = Mod()
+    m = _Stub()
     m.qkv_dim = C
     # torch conv1d weight: [3C, 1, K]; rows 0..C-1 = q, C..2C-1 = k, 2C.. = v
     w = torch.arange(3 * C * K, dtype=torch.float32).reshape(3 * C, 1, K)
@@ -73,7 +81,7 @@ def _kda(C=4, K=3, D=8):
     m.q_proj = _lin(D, C)
     m.k_proj = _lin(D, C)
     m.v_proj = _lin(D, C)
-    m.forget_gate = Mod()
+    m.forget_gate = _Stub()
     m.forget_gate.f_a_proj = _lin(D, C)
     m.forget_gate.f_b_proj = _lin(D, C)
     m.forget_gate.dt_bias = torch.arange(C, dtype=torch.float32)
@@ -81,7 +89,7 @@ def _kda(C=4, K=3, D=8):
     m.b_proj = _lin(D, C)
     m.g_a_proj = _lin(D, C)
     m.g_b_proj = _lin(D, C)
-    m.o_norm = Mod()
+    m.o_norm = _Stub()
     m.o_norm.weight = torch.ones(C, dtype=torch.float32)
     m.o_proj = _lin(D, D)
     return m
@@ -110,24 +118,21 @@ def test_convert_kda_shapes_and_gate_vectors():
 
 # ----------------------------------------------------------------------------- convert_mla
 def _mla(has_indexer=True):
-    class Mod:
-        pass
-
-    m = Mod()
+    m = _Stub()
     m.q_a_proj = _lin(8, 6)
-    m.q_a_layernorm = Mod()
+    m.q_a_layernorm = _Stub()
     m.q_a_layernorm.weight = torch.ones(6, dtype=torch.float32)
     m.q_b_proj = _lin(8, 4)
     m.kv_a_proj_with_mqa = _lin(3, 6)
-    m.kv_a_layernorm = Mod()
+    m.kv_a_layernorm = _Stub()
     m.kv_a_layernorm.weight = torch.ones(3, dtype=torch.float32)
     m.kv_b_proj = _lin(8, 8)
     m.o_proj = _lin(8, 8)
     if has_indexer:
-        ix = Mod()
+        ix = _Stub()
         ix.wq_b = _lin(8, 6)
         ix.wk = _lin(8, 8)
-        ix.k_norm = Mod()
+        ix.k_norm = _Stub()
         ix.k_norm.weight = torch.ones(8, dtype=torch.float32)
         ix.k_norm.bias = torch.zeros(8, dtype=torch.float32)
         ix.weights_proj = _lin(1, 8)
@@ -160,10 +165,7 @@ def test_convert_mla_with_indexer_carries_all_indexer_fields():
 
 # ----------------------------------------------------------------------------- convert_mlp
 def test_convert_mlp_transposes_gate_up_down():
-    class Mod:
-        pass
-
-    m = Mod()
+    m = _Stub()
     m.gate_proj = _lin(4, 6)
     m.up_proj = _lin(4, 6)
     m.down_proj = _lin(6, 4)
@@ -176,18 +178,15 @@ def test_convert_mlp_transposes_gate_up_down():
 
 # ----------------------------------------------------------------------------- convert_moe
 def test_convert_moe_transposes_the_expert_stacks():
-    class Mod:
-        pass
-
     E, D, mi = 2, 4, 3
-    m = Mod()
-    m.experts = Mod()
+    m = _Stub()
+    m.experts = _Stub()
     # torch layout: gate_up_proj [E, 2mi, D], down_proj [E, D, mi]
     m.experts.gate_up_proj = torch.arange(E * 2 * mi * D, dtype=torch.float32).reshape(E, 2 * mi, D)
     m.experts.down_proj = torch.arange(E * D * mi, dtype=torch.float32).reshape(E, D, mi)
     m.gate = _lin(E, D)
     m.gate.e_score_correction_bias = torch.arange(E, dtype=torch.float32)
-    m.shared_experts = Mod()
+    m.shared_experts = _Stub()
     m.shared_experts.gate_proj = _lin(4, D)
     m.shared_experts.up_proj = _lin(4, D)
     m.shared_experts.down_proj = _lin(D, 4)

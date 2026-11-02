@@ -237,7 +237,7 @@ def test_dequant_tree_default_dtype_is_bfloat16():
 
 
 def test_dequant_tree_does_not_mutate_the_input():
-    q8 = {"q": np.array([[1]], np.int8), "s": np.array([[2.0]], np.float32)}
+    q8: dict[str, np.ndarray] = {"q": np.array([[1]], np.int8), "s": np.array([[2.0]], np.float32)}
     quant8.dequant_tree(q8)
     assert quant8.is_q8(q8)
     assert q8["q"].dtype == np.int8

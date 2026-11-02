@@ -12,7 +12,9 @@ Everything runs on CPU with `XLA_FLAGS=--xla_force_host_platform_device_count=8`
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import time
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -25,8 +27,8 @@ from glm53 import model as M
 
 try:
     from jax import shard_map
-except ImportError:  # older jax
-    from jax.experimental.shard_map import shard_map
+except ImportError:  # older jax: the module holds the function, so import it by path
+    shard_map = importlib.import_module("jax.experimental.shard_map").shard_map
 
 AXIS = "x"
 R = P()  # replicated
@@ -173,7 +175,7 @@ class DeviceSampler:
 # ----------------------------------------------------------------------------- specs
 def layer_specs(cfg: M.Cfg, i: int, p: dict) -> dict:
     col, row = P(None, AXIS), P(AXIS, None)
-    s = {"ln1": R, "ln2": R,
+    s: dict[str, Any] = {"ln1": R, "ln2": R,
          "hc_attn": dict.fromkeys(p["hc_attn"], R), "hc_ffn": dict.fromkeys(p["hc_ffn"], R)}   # fn / fnT, base, scale
     if cfg.layer_types[i] == "linear_attention":
         s["attn"] = {"q": col, "k": col, "v": col, "conv_q": row, "conv_k": row, "conv_v": row,
@@ -344,7 +346,7 @@ def chip_major(t: np.ndarray) -> np.ndarray:
 # ----------------------------------------------------------------------------- engine
 class Engine:
     def __init__(self, cfg: M.Cfg, params: dict, host_experts: HostExperts | None = None, devices=None,
-                 max_len: int = 4096, expert_fetch=None, int8_nonexpert: bool = False, seq_shard: bool = False,
+                 max_len: int = 4096, expert_fetch=None, int8_nonexpert: bool | str = False, seq_shard: bool = False,
                  q_block: int = 128, cache_q8: bool = False):
         devices = devices if devices is not None else jax.devices()
         cfg = dataclasses.replace(cfg, cache_q8=cache_q8 or cfg.cache_q8)     # int8 latent cache (half the HBM per set)
@@ -386,8 +388,8 @@ class Engine:
         self.specs = Q8.expand_specs(params, self.specs)   # params already holding q8 nodes (hot-swapped on device)
         self.params = jax.tree.map(lambda a, s: jax.device_put(a, NamedSharding(self.mesh, s)), params, self.specs,
                                    is_leaf=lambda x: isinstance(x, P))
-        self._prefill = {}
-        self._decode = {}
+        self._prefill: dict[Any, Any] = {}
+        self._decode: dict[Any, Any] = {}
 
     def _cache_spec(self, i):
         if self.cfg.layer_types[i] == "linear_attention":
@@ -509,7 +511,7 @@ class SegmentedEngine(Engine):
         assert host_experts is not None
         super().__init__(cfg, params, host_experts, devices, max_len)
         self.transport = transport or self._default_transport
-        self._progs = {}
+        self._progs: dict[Any, Any] = {}
         from concurrent.futures import ThreadPoolExecutor
         self._pool = ThreadPoolExecutor(max_workers=32)
         from glm53.checkpoint import BLOCK

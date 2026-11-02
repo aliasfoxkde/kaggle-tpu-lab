@@ -402,7 +402,7 @@ class Drafter:
                                    is_leaf=lambda x: isinstance(x, P))
         self.embed_spec, self.lm_head_spec = embed_spec, lm_head_spec
         self.temp_scale = float(temp_scale)      # the sampled path is drawn at temp_scale x the given temperature
-        self._progs = {}
+        self._progs: dict[Any, Any] = {}
 
     def nbytes_per_chip(self):
         return sum(s.data.nbytes for a in jax.tree.leaves(self.params) for s in a.addressable_shards[:1])
@@ -463,8 +463,8 @@ class Drafter:
         target positions to take from each (the engine's per-group capture)."""
         B, N = _rows(feats) if feat_index is None else feats[0].shape[1:3]
         T = self.cfg.block if T is None else T
-        args = (self.params, ring, feats, jnp.asarray(pos0, jnp.int32), jnp.asarray(n_new, jnp.int32),
-                jnp.asarray(anchor, jnp.int32), embed, lm_head)
+        args: tuple[Any, ...] = (self.params, ring, feats, jnp.asarray(pos0, jnp.int32), jnp.asarray(n_new, jnp.int32),
+                                 jnp.asarray(anchor, jnp.int32), embed, lm_head)
         if temperature is not None:              # (a device scalar, e.g. DeviceSampler.bind's, passes through)
             args += (temperature if isinstance(temperature, jax.Array) else jnp.float32(temperature), key)
         return self._prog_draft(B, N, T, temperature is not None, feat_index)(*args)
@@ -476,8 +476,8 @@ class Drafter:
         B = len(rings)
         N = (_rows(feats) if feat_index is None else feats[0].shape[1:3])[1]
         T = self.cfg.block if T is None else T
-        args = (self.params, list(rings), feats, jnp.asarray(pos0, jnp.int32), jnp.asarray(n_new, jnp.int32),
-                jnp.asarray(anchor, jnp.int32), embed, lm_head)
+        args: tuple[Any, ...] = (self.params, list(rings), feats, jnp.asarray(pos0, jnp.int32), jnp.asarray(n_new, jnp.int32),
+                                 jnp.asarray(anchor, jnp.int32), embed, lm_head)
         if temperature is not None:
             args += (temperature if isinstance(temperature, jax.Array) else jnp.float32(temperature), key)
         return self._prog_draft(B, N, T, temperature is not None, feat_index, rows=True)(*args)

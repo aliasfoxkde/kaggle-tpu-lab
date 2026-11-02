@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench_endpoint import anthropic_stream, health
@@ -50,7 +51,7 @@ def main():
     for rnd in range(a.rounds):
         print(f"--- concurrent round {rnd + 1}: {a.streams} requests at once")
         h0 = health(a.url, a.key)
-        out = {}
+        out: dict[int, Any] = {}
         ths = [threading.Thread(target=one, args=(a.url, a.key, p, a.max_tokens, out, i)) for i, p in enumerate(prompts)]
         t0 = time.time(); [t.start() for t in ths]; [t.join() for t in ths]; dt = time.time() - t0
         h1 = health(a.url, a.key)

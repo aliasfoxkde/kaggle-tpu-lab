@@ -539,7 +539,7 @@ def mla_cache_shapes(cfg: Cfg, B, S, has_indexer, n=1):
     pooled indexer keys [B,S/kp,ihd] (one row per complete k-pool) and the raw keys/gates of the incomplete tail
     pool "tk"/"tg" [B,kp,ihd] (replicated, tiny). Dtypes: `cache_dtype`."""
     kp = cfg.idx_kpool
-    out = {"c": (B, S // n, cfg.kv_lora // 4 if cfg.cache_q8 else cfg.kv_lora)}
+    out: dict[str, tuple[Any, ...]] = {"c": (B, S // n, cfg.kv_lora // 4 if cfg.cache_q8 else cfg.kv_lora)}
     if cfg.cache_q8:
         out["cs"] = (B, S // n)
     if has_indexer:
@@ -1043,14 +1043,14 @@ def mla_core_rows(p, proj, cfg: Cfg, caches, pos, sparse="auto", cap=None, hist=
     chip = lax.axis_index(cfg.tp_axis) if n > 1 else None
     cfg = dataclasses.replace(cfg, cache_cap=S)
     dtype = proj["new_c"].dtype
-    new, scores, qpos = [], [], []
+    new, scores, qpos_list = [], [], []
     for b, (c, pb) in enumerate(zip(caches, pos)):
         pr = {k: v[b:b + 1] for k, v in proj.items()}
         nc = _mla_write(p, pr, cfg, c, pb, chip, T, hist)
         new.append(nc)
         scores.append(_indexer_scores(pr["qi"], pr["wts"], nc["pk"].astype(jnp.float32), cfg))
-        qpos.append(pb + jnp.arange(T))
-    qpos = jnp.stack(qpos)                                                          # [B,T]
+        qpos_list.append(pb + jnp.arange(T))
+    qpos = jnp.stack(qpos_list)                                                      # [B,T]
     pools, pvalid = indexer_select(jnp.concatenate(scores, 0), jnp.ones((new[0]["pk"].shape[1],), bool), qpos, cfg,
                                    chip)                                            # [B,T,K]
     kv = [_query_keys(nc["c"], nc.get("cs"), pools[b:b + 1], pvalid[b:b + 1], qpos[b], cfg, chip, dtype)
@@ -1374,11 +1374,11 @@ def rollback_states(hists, n_keep, dtypes, cur=None):
     0..T; 0 undoes the whole verify) tokens (the positional cache rows beyond are overwritten later). `dtypes`: per
     layer {key: dtype} of the cache entries. A "kin_hist" (the KDA tokens' update inputs, T entries) replays the
     accepted tokens from cur[layer]["state"] (the state the verify left unchanged)."""
-    out = []
+    out: list[Any] = []
     for i, (h, dt) in enumerate(zip(hists, dtypes)):
         if not h:
             out.append(None); continue
-        o = {}
+        o: dict[str, Any] = {}
         for hk, k in HIST_KEYS.items():
             if hk not in h:
                 continue

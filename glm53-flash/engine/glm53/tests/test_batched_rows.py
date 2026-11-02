@@ -2,6 +2,8 @@
 different positions, decoded together for several steps, with a stream admitted and one removed mid-way — every
 row must equal its own single-stream decode (sharded and replicated caches, tiny random resident model, 8 virtual
 CPU devices, fp32)."""
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
@@ -103,19 +105,19 @@ def test_decode_rows_device_sampler_and_device_state():
     prompts = [rng.integers(0, V, size=(1, n)) for n in (20, 33)]
     N = 4
     ref = [single_stream(eng, p, N) for p in prompts]
-    sets, pos, toks = [], [], []
+    sets, pos, first = [], [], []
     for p in prompts:
         lg, cc, pp = eng.prefill(p)
-        sets.append(cc); pos.append(pp); toks.append(int(jnp.argmax(lg[0])))
+        sets.append(cc); pos.append(pp); first.append(int(jnp.argmax(lg[0])))
     pos = eng.device_positions(pos)
-    toks = jnp.asarray(toks, jnp.int32)
+    toks = jnp.asarray(first, jnp.int32)
     samp = DeviceSampler(0.0, 1.0, seed=0)
-    got = [np.asarray(toks)]
+    got: list[Any] = [np.asarray(toks)]
     for _ in range(N):
         toks, logits, sets, pos = eng.decode_rows(toks, sets, pos, samp)
         assert isinstance(toks, jax.Array) and isinstance(pos, jax.Array)
         got.append(np.asarray(toks))
-    got = np.stack(got, 1)                                    # [2, N+1]
+    stacked = np.stack(got, 1)                                    # [2, N+1]
     for r in range(2):
-        assert got[r].tolist() == ref[r][1], (r, got[r].tolist(), ref[r][1])
+        assert stacked[r].tolist() == ref[r][1], (r, stacked[r].tolist(), ref[r][1])
     assert np.asarray(pos).tolist() == [20 + N, 33 + N]

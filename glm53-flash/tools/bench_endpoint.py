@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import urllib.request
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -82,8 +83,8 @@ def image_steps(url, key):
     """6. vision: an Anthropic base64 image (two turns: the second reuses the image's context), an OpenAI data URL."""
     import base64
     b64 = base64.b64encode(test_png()).decode()
-    msgs = [{"role": "user", "content": [{"type": "text", "text": "What shapes and colours are in this image? One sentence."},
-                                         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}]}]
+    msgs: list[dict[str, Any]] = [{"role": "user", "content": [{"type": "text", "text": "What shapes and colours are in this image? One sentence."},
+                                                                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}]}]
     body = {"model": "glm-5.3-flash", "max_tokens": 120, "temperature": 0, "messages": msgs}
     n_in = json.loads(post(url, "/v1/messages/count_tokens", body, key).read())["input_tokens"]
     show = lambda r: {k: v for k, v in r.items() if not k.startswith("_")}
@@ -124,7 +125,7 @@ def main():
     tools = [{"name": "read_file", "description": "Read a text file from disk.",
               "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "max_lines": {"type": "integer"}},
                                "required": ["path"]}}]
-    msgs = [{"role": "user", "content": "Use the read_file tool to read /etc/hostname (at most 5 lines), then tell me the hostname."}]
+    msgs: list[dict[str, Any]] = [{"role": "user", "content": "Use the read_file tool to read /etc/hostname (at most 5 lines), then tell me the hostname."}]
     r = json.loads(post(url, "/v1/messages", {"model": "glm-5.3-flash", "max_tokens": 300, "temperature": 0, "messages": msgs, "tools": tools}, key).read())
     uses = [b for b in r["content"] if b["type"] == "tool_use"]
     print("tool call:", r["stop_reason"], json.dumps(uses)[:200])
