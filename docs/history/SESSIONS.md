@@ -4,58 +4,77 @@ Running log of agent work sessions on this repo, newest first. Purpose: any
 future session (human or agent) can reconstruct what was done, why, and what
 remains, without mining Claude transcripts.
 
-## 2026-11-02 — issue18 worktree: type fixes, CI bring-up (session 10dbe6a4, in progress)
+## 2026-11-02 → 03 — CI test-job OOM root cause and per-file fix (session a004d908, continued)
 
-- mypy/ruff type fixes across 21 engine files (branch `ci/fix-types`, uncommitted
-  pending the full local pytest validation).
-- Full CPU suite run started in docker (container 25d3687c6e98, image ktl-ci-python:1).
-  Measured pace: ~47 tests/65 min — the full 198-test suite is ~4.5 h on CPU
-  (JAX compile dominates). A first duplicate run was killed; the harness also
-  reaped the background wrapper on low memory (host swap pressure), container survived.
-- `.gitforge.yml` test-job timeout raised 20m → 8h: the 20m figure was never
-  measured against the real suite and would have failed the first push.
-- docs/UPSTREAM_AUDIT.md: PR #22 corrected to CLOSED-unmerged, superseded by #24.
-- Upstream evidence for #17/#18/#20 verified posted (PRs 23/24/21 linked);
-  issue closure is the maintainer's call on merge.
-- GitForge CI findings (run 4a7d2be5, commit e1b6423): lint and types both
-  green on the CI image — first fully passing lint+mypy in CI. The test job
-  was killed at exactly 60:09 with exit 137. Not OOM (`State.OOMKilled=false`,
-  12 GiB container limit untouched): the runner's ~1h no-output watchdog did
-  it, because the step redirected all pytest output to /tmp/pytest.log,
-  leaving the streamed job log empty (0 bytes). Fix in 6dd6887: stream pytest
-  output with `| tail -60` and `exit ${PIPESTATUS[0]}`.
-- Push routing: `origin` is GitHub; GitForge CI only triggers on pushes to
-  the `gitforge` remote (http://127.0.0.1:42782/bigdata-ci/kaggle-tpu-lab).
-  Pushes to GitHub alone never create pipeline_trigger_requests.
-- Stored API tokens (operator/ci-trigger/admin) are expired/invalid against
-  the pipeline API; user+password basic auth is also rejected on
-  /api/pipelines. Pipeline triggering relies on the push hook path.
-- Re-run c4e7ea56 (commit 6dd6887) pushed to the gitforge remote: lint green,
-  types running, test queued. Checkpoint 15:03 verifies the test job passes
-  the 1h mark (proving the watchdog fix).
-- Follow-up on run c4e7ea56/faaed95a: the test job streamed output fine but
-  was killed at 59:37 — dmesg shows a Memory-cgroup OOM (task `tf_XLAEigen`
-  python3, anon-rss 12.27G vs the runner's 12 GiB sandbox cap
-  `GITFORGE_SANDBOX_MEMORY_MB=12288` in
-  /etc/systemd/system/gitforge@.service.d/platform-runtime.conf). Cap raised
-  to 24576 and gitforge@runner restarted (operator-approved). Also: steps run
-  under dash — `${PIPESTATUS[0]}` fails with "Bad substitution"; fixed by
-  wrapping the pytest pipeline in explicit `bash -c` (commit 07937bd). Debt
-  noted: runner should support per-job memory overrides; global cap is the
-  interim measure.
-- Run 0b7a58b0 (commit 07937bd) is the verification run: lint+types expected
-  green, test job must survive past the prior 59:37 OOM point (~1h) and reach
-  the ~4.5h summary.
-- Run 3dfdf283's test job died at 14m as `infrastructure_failure` ("container
-  lost before exec reported its exit code"). Cause: at 15:13:50 local, dockerd
-  + containerd + cloudflared + control-center-browser were simultaneously
-  SIGKILLed by an unattributed host-level actor — no kernel OOM record, no
-  oomd (inactive), no userspace guard found in cron or services; precursor was
-  journald "Under memory pressure" + load 83. Host incident, outside repo
-  scope. docker.service auto-restarted (restart counter 11); local
-  ktl-pytest-local container restarted and the suite relaunched (fresh log).
-  CI retriggered with empty commit 1ee36ed → run 60e96427.
+Root cause of every `test` job failure (exit 137) found by faithful local
+reproduction under the runner's own sandbox cap (12GiB, from
+`GITFORGE_SANDBOX_MEMORY_MB=12288` in the runner unit override — NOT the
+4GiB code default):
 
+- **Single pytest process OOM-kills at ~45% through the suite** (cgroup
+  `oom_kill 1`, SIGKILL). XLA/JAX retains compiled executables for the
+  life of the process; resident RSS grows monotonically (1.7G → 12G).
+  Reproduced twice at 12G (2026-11-03 run b: killed at 44% in
+  test_pallas_mhc).
+- **pytest-xdist also OOM-kills** (workers retain memory across their
+  file assignments; two runs, `oom_kill` 1-2 each, worker "node down").
+- **Fix: one pytest process per test file** — zero OOM kills over the
+  whole suite (2h10m), 91% coverage via `--cov-append`.
+- Two silent coverage holes surfaced once tests could actually run:
+  - `test_vision.py::test_preprocess_layout` needed pillow (now in image);
+  - `test_aot.py` collected ZERO tests (rc=5) without flatbuffers — the
+    AOT export path was never exercised. Both added to the image (v3).
+- `Image.BICUBIC` → `Image.Resampling.BICUBIC` (removed in Pillow 10).
+- GitForge ops findings (recorded for the GitForge repo, not this one):
+  runner redeployments from other sessions' work killed in-flight CI jobs
+  with no retry (12:07/14:54/15:42 on Nov 2); the standalone
+  `gitforge@scheduler.service` crash-looped on a missing release binary
+  until masked (CI's in-process assigner is the real scheduler — matches
+  `gitforge-release-verify`'s `scheduler-owner=ci` contract).
+- Push-trigger pipeline YAML gotcha: `FAILED: ` (colon-space) inside a
+  plain scalar `run:` breaks the GitForge parser at trigger time with
+  "mapping values are not allowed" — the run then never even starts.
+  Folded scalar + `FAILED_TEST` fixes it; runs now start on eef0d89
+  (run 4e2fc9c3, 2026-11-03T12:14Z).
+
+Image: `ktl-ci-python:3` (adds pillow 12.0.0, flatbuffers 25.9.23;
+pytest-xdist intentionally absent). Pipeline: `.gitforge.yml` test step
+runs the per-file loop; timeout 8h retained.
+
+## 2026-11-01 — mypy baseline push + full task-list restoration (session 637a1e85)
+
+Context: GitForge run 475e2f07 — lint green, **types red (~154 mypy errors
+across 26 files: 55 attr-defined in test stub classes, 20 in tools/, 33 in
+engine/production)**, test job cancelled. Prior sessions 2a546700 and
+34d99e57 both died on context compaction; their task lists were mined from
+the JSONL transcripts and reconciled against repo/git/Kaggle/GitForge state.
+
+Done:
+- Recovered the full 22-task list from 4 sessions' transcripts; statuses
+  reconciled against evidence (PRs merged, runs in the GitForge store,
+  Kaggle kernel status). Chat-only promises flagged.
+- mypy fixes in flight (three parallel lanes: tests/, tools/, engine/).
+- Local baseline established: lint green; test suite has at least one real
+  failure independent of mypy — `test_basestore.py::test_engine_rebuilt_from_store`
+  hits transformers 5.22.1 `validate_architecture` ("Expecting NoPE for the
+  DSA attention layers, got qk_rope_head_dim=16") from `tiny_config()` in
+  test_tiny_vs_hf.py — the fixture needs `qk_rope_head_dim=0` (or an
+  upstream-compatible head-dim shape) under the pinned transformers.
+
+Known open items (with evidence):
+- GitForge CI green (types job = the mypy work above; test job not yet run
+  to completion in CI).
+- Full local pytest suite: run started, results pending (prior attempts
+  timed out at 120 s — suite needs ~10+ min; first test takes ~48 s).
+- Kaggle kernel `qwen38-pr21-uvfix` (upstream PR #21 TPU validation): still
+  QUEUED as of 2026-11-01 16:4x UTC.
+- No GitHub release/tag exists (only `clean-2026-10-30`); release task open.
+- Backlog from 34d99e57, unstarted: upstream re-audit, cold-start
+  improvements for existing notebooks, additional notebooks,
+  GLM-5.3/Qwen3.8-Flash-Next follow-through (amortyx-stack-extraction.md
+  already covers the assessment — verify before re-doing it).
+
+## 2026-11-01 — lint/quality/hygiene sweep (session 2a546700, resumed)
 
 Context: the prior session (34d99e57, 2026-10-31 → 11-01) crashed repeatedly
 with "automatic compaction failed" and left ~60 modified + 8 untracked files.
