@@ -12,7 +12,6 @@ Everything runs on CPU with `XLA_FLAGS=--xla_force_host_platform_device_count=8`
 from __future__ import annotations
 
 import dataclasses
-import importlib
 import time
 from typing import Any
 
@@ -27,8 +26,8 @@ from glm53 import model as M
 
 try:
     from jax import shard_map
-except ImportError:  # older jax: the module holds the function, so import it by path
-    shard_map = importlib.import_module("jax.experimental.shard_map").shard_map
+except ImportError:  # older jax
+    from jax.experimental.shard_map import shard_map  # type: ignore[no-redef]
 
 AXIS = "x"
 R = P()  # replicated
@@ -176,7 +175,7 @@ class DeviceSampler:
 def layer_specs(cfg: M.Cfg, i: int, p: dict) -> dict:
     col, row = P(None, AXIS), P(AXIS, None)
     s: dict[str, Any] = {"ln1": R, "ln2": R,
-         "hc_attn": dict.fromkeys(p["hc_attn"], R), "hc_ffn": dict.fromkeys(p["hc_ffn"], R)}   # fn / fnT, base, scale
+                          "hc_attn": dict.fromkeys(p["hc_attn"], R), "hc_ffn": dict.fromkeys(p["hc_ffn"], R)}   # fn / fnT, base, scale
     if cfg.layer_types[i] == "linear_attention":
         s["attn"] = {"q": col, "k": col, "v": col, "conv_q": row, "conv_k": row, "conv_v": row,
                      "f_a": R, "f_b": col, "dt_bias": P(AXIS), "A_log": P(AXIS), "b": col,

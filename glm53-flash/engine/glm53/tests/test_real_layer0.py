@@ -5,7 +5,6 @@ model-00002-of-00062.safetensors (hf_hub_download into the same snapshot dir).  
 """
 import glob
 import os
-from typing import cast
 
 import numpy as np
 import pytest
@@ -13,7 +12,6 @@ import torch
 
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp
-from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
 
 from glm53 import checkpoint as C
 from glm53 import model as M
@@ -68,7 +66,8 @@ def hf_layer0(text_cfg, r: C.ShardReader):
 def test_layer0_real_weights():
     from transformers.models.glm5_next.configuration_glm5_next import Glm5NextConfig
     cfg = Glm5NextConfig.from_pretrained(MODEL_DIR)
-    tc = cast(Glm5NextTextConfig, cfg.text_config)
+    tc = cfg.text_config
+    assert not isinstance(tc, dict)
     tc.dtype = torch.float32
     r = C.ShardReader(MODEL_DIR)
     hf = hf_layer0(tc, r)

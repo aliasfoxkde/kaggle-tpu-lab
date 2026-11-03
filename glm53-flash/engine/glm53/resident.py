@@ -311,7 +311,7 @@ class _Reaper(threading.Thread):
 
     def __init__(self):
         super().__init__(daemon=True, name="glm53-reaper")
-        self.q: queue.SimpleQueue[Any] = queue.SimpleQueue()
+        self.q: queue.SimpleQueue = queue.SimpleQueue()
         self.start()
 
     def run(self):
@@ -608,11 +608,11 @@ class ResidentLayerEngine(Engine):
         layer's entry, index n_layers, when an MTP layer is installed: its attention cache and the carried final
         hidden state "h" [B,1,D] of the last processed position; or the DFlash drafter's context ring there)."""
         cfg = self.cfg
-        out: list[dict[str, Any]] = []
+        out = []
         n_entries = cfg.n_layers + (1 if self.mtp is not None or self.dflash is not None else 0)
         for i in range(n_entries):
             spec = self._cache_spec(i)
-            shapes: dict[str, tuple[tuple[Any, ...], Any]]
+            shapes: dict[str, tuple[Any, Any]]
             if i == cfg.n_layers and self.dflash is not None:
                 dc = self.dflash.cfg
                 shapes = dict.fromkeys(("k", "v"), ((dc.n_layers, B, dc.window, dc.kv_heads, dc.hd), dc.dtype))
@@ -626,7 +626,7 @@ class ResidentLayerEngine(Engine):
             else:
                 has_ix = "indexer" in self.params["layers"][i]["attn"]
                 shapes = {k: (sh, M.cache_dtype(cfg, k, cfg.dtype)) for k, sh in M.mla_cache_shapes(cfg, B, self.max_len, has_ix).items()}
-            c: dict[str, Any] = {}
+            c = {}
             for k, (shape, dtype) in shapes.items():
                 key = (shape, jnp.dtype(dtype), spec[k])
                 if key not in self._allocs:

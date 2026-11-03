@@ -13,7 +13,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any
 
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -158,12 +157,12 @@ try:
     with post("/v1/messages", {"max_tokens": 64, "stream": True, "messages": [{"role": "user", "content": "Read /etc/hostname."}], "tools": tools_a}) as r:
         lines = [line.decode().rstrip() for line in r]
     pings = sum(1 for l in lines if l == "event: ping")
-    sevs = [json.loads(l[6:]) for l in lines if l.startswith("data: ")]
-    types = [e["type"] for e in sevs]
+    sse_evs = [json.loads(l[6:]) for l in lines if l.startswith("data: ")]
+    types = [e["type"] for e in sse_evs]
     log("anthropic: pings", pings, "| events", types)
-    assert pings >= 2 and types[-1] == "message_stop" and all(e["type"] == "ping" for e in sevs if "ping" in e.get("type", "")), lines
-    assert any(e["type"] == "content_block_start" and e["content_block"]["type"] == "tool_use" and e["content_block"]["name"] == "read_file" for e in sevs), sevs
-    assert next(e for e in sevs if e["type"] == "message_delta")["delta"]["stop_reason"] == "tool_use"
+    assert pings >= 2 and types[-1] == "message_stop" and all(e["type"] == "ping" for e in sse_evs if "ping" in e.get("type", "")), lines
+    assert any(e["type"] == "content_block_start" and e["content_block"]["type"] == "tool_use" and e["content_block"]["name"] == "read_file" for e in sse_evs), sse_evs
+    assert next(e for e in sse_evs if e["type"] == "message_delta")["delta"]["stop_reason"] == "tool_use"
     with post("/v1/chat/completions", {"stream": True, "max_tokens": 64, "messages": [{"role": "user", "content": "Read /etc/hostname."}],
                                        "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]}) as r:
         lines = [line.decode().rstrip() for line in r]
@@ -196,7 +195,7 @@ assert r2["usage"]["completion_tokens"] < r1["usage"]["completion_tokens"]
 time.sleep(1)
 assert len(SCHED.active) == 0
 log("=== bounded queue: 2 streams + 1 waiting -> the 4th concurrent request gets 429")
-codes: list[Any] = [None] * 4
+codes: list[int | None] = [None] * 4
 def fire(i):
     try:
         post("/v1/chat/completions", {"messages": [{"role": "user", "content": f"Story {i}, please."}], "max_tokens": 24}).read(); codes[i] = 200
@@ -208,7 +207,7 @@ ths = [threading.Thread(target=fire, args=(i,)) for i in range(4)]
 log("codes ->", codes, "| rejected", STATE.get("rejected"))
 assert sorted(codes) == [200, 200, 200, 429], codes
 log("=== saturated OpenAI streaming request returns an SSE error, not a second HTTP response")
-stream_payloads: list[Any] = [None] * 4
+stream_payloads: list[str | None] = [None] * 4
 def fire_openai_stream(i):
     with post("/v1/chat/completions", {"stream": True, "max_tokens": 24,
                                         "messages": [{"role": "user", "content": f"Stream {i}, please."}]}) as response:
@@ -216,12 +215,13 @@ def fire_openai_stream(i):
 assert SCHED.pause(30)
 ths = [threading.Thread(target=fire_openai_stream, args=(i,)) for i in range(4)]
 [t.start() for t in ths]; time.sleep(1.0); SCHED.resume(); [t.join() for t in ths]
-openai_errors = [p for p in stream_payloads if '"error"' in p]
+assert all(p is not None for p in stream_payloads), stream_payloads       # every request answered
+openai_errors = [p for p in stream_payloads if p is not None and '"error"' in p]
 log("OpenAI error events", len(openai_errors))
 assert len(openai_errors) == 1 and "data: [DONE]" in openai_errors[0], stream_payloads
-assert all("HTTP/1." not in p for p in stream_payloads), stream_payloads
+assert all("HTTP/1." not in p for p in stream_payloads if p is not None), stream_payloads
 log("=== saturated Anthropic streaming request returns an error event")
-anthropic_payloads: list[Any] = [None] * 4
+anthropic_payloads: list[str | None] = [None] * 4
 def fire_anthropic_stream(i):
     with post("/v1/messages", {"stream": True, "max_tokens": 24,
                                 "messages": [{"role": "user", "content": f"Stream {i}, please."}]}) as response:
@@ -229,10 +229,11 @@ def fire_anthropic_stream(i):
 assert SCHED.pause(30)
 ths = [threading.Thread(target=fire_anthropic_stream, args=(i,)) for i in range(4)]
 [t.start() for t in ths]; time.sleep(1.0); SCHED.resume(); [t.join() for t in ths]
-anthropic_errors = [p for p in anthropic_payloads if "event: error" in p]
+assert all(p is not None for p in anthropic_payloads), anthropic_payloads  # every request answered
+anthropic_errors = [p for p in anthropic_payloads if p is not None and "event: error" in p]
 log("Anthropic error events", len(anthropic_errors))
 assert len(anthropic_errors) == 1 and '"type": "rate_limit_error"' in anthropic_errors[0], anthropic_payloads
-assert all("HTTP/1." not in p for p in anthropic_payloads), anthropic_payloads
+assert all("HTTP/1." not in p for p in anthropic_payloads if p is not None), anthropic_payloads
 for path in ("/health", "/v1/models"):
     try:
         urllib.request.urlopen(URL + path, timeout=10)

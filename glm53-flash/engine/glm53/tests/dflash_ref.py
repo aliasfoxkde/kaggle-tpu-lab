@@ -24,8 +24,9 @@
 # SOFTWARE.
 
 import time
+from collections.abc import Callable
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import cast
 
 import torch
 from torch import nn
@@ -146,7 +147,7 @@ def _rejection_sample(
         residual / total.clamp_min(torch.finfo(residual.dtype).tiny),
         target_probs[0, accepted],
     )
-    return int(accepted), _sample_probs(residual[None])[0]
+    return accepted, _sample_probs(residual[None])[0]
 
 
 def _draft_config(config):
@@ -160,24 +161,21 @@ def _draft_value(config, name, default=None):
 def _raw_input_embeddings(
     target: nn.Module, input_ids: torch.Tensor, scale: float = 1.0
 ) -> torch.Tensor:
-    emb = cast(Any, target).get_input_embeddings()
-    assert isinstance(emb, nn.Embedding)
-    return F.embedding(input_ids, emb.weight) * scale
+    # torch types `nn.Module.__getattr__` as Tensor | Module, so the embedding
+    # modules of a HF model have to be narrowed back to nn.Module here.
+    embeddings = cast("Callable[[], nn.Module]", target.get_input_embeddings)()
+    return F.embedding(input_ids, cast(torch.Tensor, embeddings.weight)) * scale
 
 
 def _output_head(target: nn.Module) -> nn.Module:
     head = getattr(target, "lm_head", None)
     if head is not None:
-        assert isinstance(head, nn.Module)
-        return head
-    out = cast(Any, target).get_output_embeddings()
-    assert isinstance(out, nn.Module)
-    return out
+        return cast(nn.Module, head)
+    return cast("Callable[[], nn.Module]", target.get_output_embeddings)()
 
 
 def _make_cache(config):
     cache = DynamicCache(config=config)
-    # crop() over a full sliding window needs the layer to retain past states.
     cache.activate_past_recording()
     return cache
 
@@ -227,13 +225,11 @@ def dflash_generate(
     max_length = num_input_tokens + max_new_tokens
     block_size = model.block_size if block_size is None else block_size
 
-    device = cast(Any, target).device
     output_ids = torch.full(
-        (1, max_length + 1), model.mask_token_id, dtype=torch.long, device=device,
+        (1, max_length + 1), model.mask_token_id, dtype=torch.long,
+        device=cast(torch.device, target.device),
     )
-    position_ids = torch.arange(
-        int(output_ids.shape[1]), device=device
-    ).unsqueeze(0)
+    position_ids = torch.arange(output_ids.shape[1], device=cast(torch.device, target.device)).unsqueeze(0)
     past_key_values_target = _make_cache(target.config)
     past_key_values_draft = _make_cache(model.config)
 
@@ -265,9 +261,7 @@ def dflash_generate(
         else None
     )
 
-    stopped: bool = stop_tokens is not None and bool(
-        torch.isin(output_ids[:, start], stop_tokens).any()
-    )
+    stopped = bool(stop_tokens is not None and torch.isin(output_ids[:, start], stop_tokens).any())
     while start + 1 < max_length and not stopped:
         verify_size = min(block_size, max_length - start)
         block_output_ids = output_ids[:, start : start + verify_size].clone()
@@ -589,9 +583,10 @@ class CandidateSelector(nn.Module):
 
 class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
-    # transformers declares `_no_split_modules` as an instance variable on the base class,
-    # so a ClassVar here is an invalid override; the list must stay class-level.
-    _no_split_modules = ["Qwen3DFlashDecoderLayer"]  # noqa: RUF012
+    # transformers declares `_no_split_modules` as an instance variable, so it
+    # must not be re-declared as a ClassVar here.
+    _no_split_modules = ["Qwen3DFlashDecoderLayer"]  # noqa: RUF012  (transformers' own contract: instance variable)
+    mask_token_id: int
 
     def __init__(self, config) -> None:
         super().__init__(config)

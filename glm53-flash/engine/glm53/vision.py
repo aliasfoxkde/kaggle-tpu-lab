@@ -64,7 +64,7 @@ def preprocess(img, min_tokens=16, max_tokens=8000):
         s = min(1.0, s)
     ch, cw = max(1, min(H, math.floor(h * s))), max(1, min(W, math.floor(w * s)))
     if (ch, cw) != (h, w):
-        img = img.resize((cw, ch), Image.BICUBIC)
+        img = img.resize((cw, ch), Image.Resampling.BICUBIC)
     x = np.zeros((H, W, 3), np.uint8)
     x[:ch, :cw] = np.asarray(img, np.uint8)
     x = ((x.astype(np.float32) / 255.0 - MEAN) / STD).transpose(2, 0, 1)             # [3, H, W]
@@ -85,11 +85,11 @@ def position_ids(grids):
     """[N, 2] (h, w) patch positions in the block-major order, for all images concatenated."""
     out = []
     for t, gh, gw in grids:
-        hh0, ww0 = np.meshgrid(np.arange(gh), np.arange(gw), indexing="ij")
+        hh, ww = np.meshgrid(np.arange(gh), np.arange(gw), indexing="ij")
         shp = (gh // MERGE, MERGE, gw // MERGE, MERGE)
-        hh = hh0.reshape(shp).transpose(0, 2, 1, 3).reshape(-1)
-        ww = ww0.reshape(shp).transpose(0, 2, 1, 3).reshape(-1)
-        out.append(np.tile(np.stack([hh, ww], -1), (t, 1)))
+        hh_f = hh.reshape(shp).transpose(0, 2, 1, 3).reshape(-1)
+        ww_f = ww.reshape(shp).transpose(0, 2, 1, 3).reshape(-1)
+        out.append(np.tile(np.stack([hh_f, ww_f], -1), (t, 1)))
     return np.concatenate(out, 0).astype(np.int32)
 
 

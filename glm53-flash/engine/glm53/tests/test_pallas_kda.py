@@ -16,6 +16,8 @@ jax.config.update("jax_default_matmul_precision", "highest")
 
 @dataclasses.dataclass(frozen=True)
 class _Cfg:
+    """Structural stand-in for M.Cfg: kda_attention_rows only reads the KDA fields. The fields live on the
+    dataclass itself — a plain base's annotations are not inherited as dataclass fields."""
     kda_heads: int = 2
     kda_hd: int = 128
     conv_k: int = 4

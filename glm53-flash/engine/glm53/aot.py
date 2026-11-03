@@ -26,6 +26,7 @@ import importlib
 import os
 import sys
 import time
+from typing import Callable
 
 import jax
 import numpy as np
@@ -37,10 +38,10 @@ MODULES = ("model", "engine", "resident", "dflash", "pallas_moe", "pallas_mhc", 
 
 class _Store:
     def __init__(self):
-        self.write_dir: str | None = None   # traced programs are exported here (None: never export)
+        self.write_dir: str | None = None     # traced programs are exported here (None: never export)
         self.read_dirs: tuple[str, ...] = ()  # searched in order for a program's file
         self.tag = ""                  # code + versions + device kind
-        self.context = None            # () -> str: the configuration the programs close over
+        self.context: Callable[[], str] | None = None   # () -> str: the configuration the programs close over
         self.log = print
         self.stats = {"loaded": 0, "exported": 0, "traced": 0, "failed": 0, "load_s": 0.0, "export_s": 0.0,
                       "first_loaded_s": 0.0, "first_exported_s": 0.0, "first_traced_s": 0.0}   # first calls, by origin

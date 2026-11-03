@@ -149,7 +149,7 @@ def _decode_iq2_s(b, rows, tb):
     dw = rows("d", b // 2, 1) >> (16 * (b % 2))                             # block b for all 8 words
     dv = jnp.broadcast_to(_f16_bits_to_f32(dw), (SUB, LANES))
     scale = [dv * (0.5 + ((scw >> (4 * h)) & 15).astype(jnp.int32).astype(jnp.float32)) * 0.25 for h in range(2)]
-    groups: list[tuple[Any, list[Any]]] = [(scale[0], []), (scale[1], [])]
+    groups: list[tuple[Any, list[tuple[int, Any]]]] = [(scale[0], []), (scale[1], [])]
     base, step = IQ2S_F32
     for j in range(4):
         code = _lookup(tb, q, j, qhw, 2 * j)

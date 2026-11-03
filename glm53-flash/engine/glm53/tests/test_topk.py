@@ -67,11 +67,11 @@ def test_indexer_select_buckets(Tq):
 
     for q0 in (3, 2000, 16000, 17000, 70000, 300000):
         qpos = jnp.asarray(np.arange(q0, q0 + Tq, dtype=np.int32))
-        raw = rng.standard_normal((n, Tq, P_local)).astype(np.float32)
-        raw = np.round(raw, 2)                                   # ties
-        scores = jnp.asarray(raw.reshape(n, Tq, P_local)).reshape(n * 1, Tq, P_local)   # [n*B, Tq, P] over chips
-        pa, va = run(dataclasses.replace(cfg0, select_buckets=(512, 2048)), scores, qpos)
-        pb, vb = run(cfg0, scores, qpos)
+        scores = rng.standard_normal((n, Tq, P_local)).astype(np.float32)
+        scores = np.round(scores, 2)                                   # ties
+        sc = jnp.asarray(scores.reshape(n, Tq, P_local)).reshape(n * 1, Tq, P_local)   # [n*B, Tq, P] over chips
+        pa, va = run(dataclasses.replace(cfg0, select_buckets=(512, 2048)), sc, qpos)
+        pb, vb = run(cfg0, sc, qpos)
         np.testing.assert_array_equal(va, vb)
         # the selected pool SETS per query are equal (ties may order equal scores differently across the paths)
         for t in range(Tq):

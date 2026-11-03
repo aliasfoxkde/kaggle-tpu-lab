@@ -18,14 +18,19 @@ jax.config.update("jax_default_matmul_precision", "highest")
 
 
 def tiny_config(index_topk=64):
-    # The GLM5-next-specific knobs below are not in every transformers release's
-    # Glm5NextTextConfig signature, but PretrainedConfig accepts them as extra
-    # attributes; the type stubs reject them by name, so they go through **kwargs.
+    # The config fields below are not dataclass fields of `Glm5NextTextConfig`
+    # (they reach `__post_init__` as extra kwargs and become attributes), so
+    # they are passed as a mapping rather than as named arguments.
     extra: dict[str, Any] = {
-        "scoring_func": "sigmoid", "topk_method": "noaux_tc",
-        "mla_use_nope": True, "index_kpool_compress": True,
-        "linear_attn_config": {"num_heads": 4, "head_dim": 16, "short_conv_kernel_size": 4, "gate_lower_bound": -5.0},
-        "mhc": True, "first_k_dense_replace": 1, "moe_router_dtype": "float32",
+        "scoring_func": "sigmoid",
+        "topk_method": "noaux_tc",
+        "mla_use_nope": True,
+        "index_kpool_compress": True,
+        "linear_attn_config": {"num_heads": 4, "head_dim": 16, "short_conv_kernel_size": 4,
+                               "gate_lower_bound": -5.0},
+        "mhc": True,
+        "first_k_dense_replace": 1,
+        "moe_router_dtype": "float32",
     }
     return Glm5NextTextConfig(
         vocab_size=512, hidden_size=64, intermediate_size=96, moe_intermediate_size=32,
@@ -147,9 +152,9 @@ def test_sparse_indexer_matches_hf(setup):
     assert rel < 2e-3
     # small query blocks (ragged last block) and a union budget of 1 pool (every block overflows -> per-query gathers)
     import dataclasses
-    for kw in ({"q_block": 7}, {"union_pools": 1}, {"q_block": 16, "union_pools": 1}):
-        overrides: dict[str, Any] = dict(kw)
-        out2, _ = M.forward(params2, jnp.asarray(ids), dataclasses.replace(jcfg2, **overrides), sparse="always")
+    variants: list[dict[str, Any]] = [{"q_block": 7}, {"union_pools": 1}, {"q_block": 16, "union_pools": 1}]
+    for kw in variants:
+        out2, _ = M.forward(params2, jnp.asarray(ids), dataclasses.replace(jcfg2, **kw), sparse="always")
         rel = np.abs(np.asarray(out2) - ref).max() / np.abs(ref).max()
         assert rel < 2e-3, (kw, rel)
     # sanity: dense attention must NOT match (otherwise the test isn't exercising sparsity)

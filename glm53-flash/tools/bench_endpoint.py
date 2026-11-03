@@ -83,8 +83,8 @@ def image_steps(url, key):
     """6. vision: an Anthropic base64 image (two turns: the second reuses the image's context), an OpenAI data URL."""
     import base64
     b64 = base64.b64encode(test_png()).decode()
-    msgs: list[dict[str, Any]] = [{"role": "user", "content": [{"type": "text", "text": "What shapes and colours are in this image? One sentence."},
-                                                                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}]}]
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "What shapes and colours are in this image? One sentence."},
+                                         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}}]}]
     body = {"model": "glm-5.3-flash", "max_tokens": 120, "temperature": 0, "messages": msgs}
     n_in = json.loads(post(url, "/v1/messages/count_tokens", body, key).read())["input_tokens"]
     show = lambda r: {k: v for k, v in r.items() if not k.startswith("_")}
@@ -145,7 +145,7 @@ def main():
     at = len(doc) // 3
     doc = doc[:at] + " The secret passcode for the vault is 7391-XRAY. " + doc[at:]
     msgs = [{"role": "user", "content": f"Here is a document:\n\n{doc}\n\nWhat is the secret passcode for the vault? Answer with just the passcode."}]
-    body = {"model": "glm-5.3-flash", "max_tokens": 40, "temperature": 0, "messages": msgs}
+    body: dict[str, Any] = {"model": "glm-5.3-flash", "max_tokens": 40, "temperature": 0, "messages": msgs}
     n_in = json.loads(post(url, "/v1/messages/count_tokens", body, key).read())["input_tokens"]
     print(f"long doc: {n_in} input tokens")
     show = lambda r: {k: v for k, v in r.items() if not k.startswith("_")}

@@ -22,7 +22,6 @@ import collections
 import contextlib
 import threading
 import time
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -239,7 +238,7 @@ class Scheduler:
         self.live = collections.OrderedDict()            # finished contexts on the chips (LRU): key -> ctx dict
         self._live_n = 0
         self.active = []
-        self.pending: collections.deque[Any] = collections.deque()
+        self.pending: collections.deque = collections.deque()
         self.cond = threading.Condition()
         self.sampler = DeviceSampler(1.0, 1.0, seed=seed)
         self._members = None                             # ids of the streams the device state below belongs to

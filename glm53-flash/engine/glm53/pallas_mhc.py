@@ -55,9 +55,8 @@ def _kernel(*refs, hc, D, iters, eps, hc_eps, with_post, prec, with_pre=True, op
     projection weight DMA'd by hand, overlapped with the residual update; timing stubs: "empty", "it1", "nodot"."""
     f32 = jnp.float32
     if "fnany" in opts:
-        refs = tuple(refs)
-        fn_vmem, sem = refs[-2], refs[-1]
-        refs = refs[:-2]
+        *fnany_refs, fn_vmem, sem = refs
+        refs = tuple(fnany_refs)
     if not with_pre:
         pin_ref, cin_ref, y_ref, s_ref, ns_ref = refs
     elif with_post:

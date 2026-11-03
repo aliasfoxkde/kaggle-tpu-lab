@@ -6,26 +6,32 @@ trigger_on:
 environment: {}
 jobs:
   - name: lint
-    image: ktl-ci-python:1
+    image: ktl-ci-python:3
     steps:
       - name: Ruff check (whole repo, pyproject config)
         run: ruff check .
     timeout: 10m
   - name: types
-    image: ktl-ci-python:1
+    image: ktl-ci-python:3
     needs: [lint]
     steps:
       - name: mypy (relaxed baseline, pyproject config)
         run: mypy --config-file pyproject.toml glm53-flash/engine/glm53 glm53-flash/tools tools
     timeout: 15m
   - name: test
-    image: ktl-ci-python:1
+    image: ktl-ci-python:3
     needs: [types]
     steps:
-      # Stream output (no redirect): the runner kills jobs that produce no log
-      # output for ~1h, and the CPU suite is ~4.5h with long quiet stretches.
-      # The step shell is dash (no PIPESTATUS), so run the pipeline under
-      # bash explicitly to preserve pytest's exit code.
-      - name: CPU test suite
-        run: bash -c 'python3 -m pytest glm53-flash/engine/glm53/tests -q --no-header 2>&1 | tail -60; exit ${PIPESTATUS[0]}'
+      # One pytest process per test file. A single process for the whole
+      # suite OOM-kills at the runner's 12GiB sandbox ceiling (~45% through,
+      # 2026-11-03 repro, exit 137): XLA compiled executables are retained
+      # for the life of the process, so RSS grows monotonically. A fresh
+      # interpreter per file releases that memory. pytest-xdist was tried
+      # first and also OOM-kills: workers keep every file they ran.
+      # Coverage accumulates with --cov-append across the loop. The step
+      # shell is dash, so the loop runs under bash explicitly. The first
+      # pass streams one progress line per file; the second re-runs any
+      # file whose exit code is non-zero to name it, and fails the job.
+      - name: CPU test suite (per-file)
+        run: bash -c 'overall=0; for f in glm53-flash/engine/glm53/tests/test_*.py; do python3 -m pytest "$f" -q --no-header --cov=glm53-flash --cov-append > /tmp/one.log 2>&1 || { echo "FAILED: $f"; tail -5 /tmp/one.log; overall=1; }; echo "$f done"; done; python3 -m coverage report | tail -3; exit $overall'
     timeout: 8h
