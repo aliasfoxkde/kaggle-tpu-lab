@@ -34,5 +34,10 @@ jobs:
       # for any non-zero exit; a second pass re-runs failing files to
       # show their tails, then the job exits non-zero.
       - name: CPU test suite (per-file)
-        run: bash -c 'overall=0; for f in glm53-flash/engine/glm53/tests/test_*.py; do python3 -m pytest "$f" -q --no-header --cov=glm53-flash --cov-append > /tmp/one.log 2>&1 || { echo "FAILED: $f"; tail -5 /tmp/one.log; overall=1; }; echo "$f done"; done; python3 -m coverage report | tail -3; exit $overall'
+        run: >
+          bash -c 'overall=0; for f in glm53-flash/engine/glm53/tests/test_*.py; do
+          python3 -m pytest "$f" -q --no-header --cov=glm53-flash --cov-append > /tmp/one.log 2>&1 ||
+          { echo "FAILED_TEST $f"; tail -5 /tmp/one.log; overall=1; };
+          echo "$f done"; done;
+          python3 -m coverage report | tail -3; exit $overall'
     timeout: 8h
